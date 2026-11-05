@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2017 The Kubernetes Authors.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,17 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -o errexit
+set -o nounset
+set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../../../../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../../../../..
 source "${KUBE_ROOT}/hack/lib/util.sh"
 
 # Register function to be called on EXIT to remove generated binary.
 function cleanup {
-  rm "${KUBE_ROOT}/vendor/k8s.io/apiextensions-apiserver/artifacts/simple-image/apiextensions-apiserver"
+  rm "${KUBE_ROOT}/staging/src/k8s.io/apiextensions-apiserver/artifacts/simple-image/apiextensions-apiserver"
 }
 trap cleanup EXIT
 
-pushd "${KUBE_ROOT}/vendor/k8s.io/apiextensions-apiserver"
+pushd "${KUBE_ROOT}/staging/src/k8s.io/apiextensions-apiserver"
 cp -v ../../../../_output/local/bin/linux/amd64/apiextensions-apiserver ./artifacts/simple-image/apiextensions-apiserver
 docker build -t apiextensions-apiserver:latest ./artifacts/simple-image
 popd

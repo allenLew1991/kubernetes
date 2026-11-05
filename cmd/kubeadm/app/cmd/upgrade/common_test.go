@@ -18,138 +18,173 @@ package upgrade
 
 import (
 	"bytes"
+	_ "embed"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
+	"github.com/spf13/pflag"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
+	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/output"
 )
+
+//go:embed testdata/config-token.yaml
+var testConfigToken string
+
+func TestEnforceRequirements(t *testing.T) {
+	tmpDir := t.TempDir()
+	fullPath := filepath.Join(tmpDir, "test-config-file")
+	f, err := os.Create(fullPath)
+	if err != nil {
+		t.Errorf("Unable to create test file %q: %v", fullPath, err)
+	}
+	defer f.Close()
+	if _, err = f.WriteString(testConfigToken); err != nil {
+		t.Errorf("Unable to write test file %q: %v", fullPath, err)
+	}
+	tcases := []struct {
+		name               string
+		newK8sVersion      string
+		flags              applyPlanFlags
+		expectedErr        string
+		expectedErrNonRoot string
+	}{
+		{
+			// The root check runs first. A root user passes it and then fails to fetch the
+			// cluster config, which is needed for the CoreDNS migration check.
+			name: "Fail pre-flight check",
+			flags: applyPlanFlags{
+				kubeConfigPath: fullPath,
+			},
+			expectedErr:        "[upgrade/init config] FATAL",
+			expectedErrNonRoot: "preflight checks failed",
+		},
+		{
+			name: "Bogus preflight check specify all with individual check",
+			flags: applyPlanFlags{
+				ignorePreflightErrors: []string{"bogusvalue", "all"},
+				kubeConfigPath:        fullPath,
+			},
+			expectedErr: "don't specify individual checks if 'all' is used",
+		},
+		{
+			name: "Fail to create client",
+			flags: applyPlanFlags{
+				ignorePreflightErrors: []string{"all"},
+			},
+			expectedErr: "couldn't create a Kubernetes client from file",
+		},
+	}
+	for _, tt := range tcases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, err := enforceRequirements(&pflag.FlagSet{}, &tt.flags, nil, &output.TextPrinter{})
+			if err == nil && len(tt.expectedErr) != 0 {
+				t.Error("Expected error, but got success")
+			}
+
+			expErr := tt.expectedErr
+			// pre-flight check expects the user to be root, so the root and non-root should hit different errors
+			isPrivileged := preflight.IsPrivilegedUserCheck{}
+			// this will return an array of errors if we're not running as a privileged user.
+			_, errors := isPrivileged.Check()
+			if len(errors) != 0 && len(tt.expectedErrNonRoot) != 0 {
+				expErr = tt.expectedErrNonRoot
+			}
+			if err != nil && !strings.Contains(err.Error(), expErr) {
+				t.Fatalf("enforceRequirements returned unexpected error, expected: %s, got %v", expErr, err)
+			}
+		})
+	}
+}
 
 func TestPrintConfiguration(t *testing.T) {
 	var tests = []struct {
-		cfg           *kubeadmapiext.MasterConfiguration
+		name          string
+		cfg           *kubeadmapi.ClusterConfiguration
 		buf           *bytes.Buffer
 		expectedBytes []byte
 	}{
 		{
+			name:          "config is nil",
 			cfg:           nil,
 			expectedBytes: []byte(""),
 		},
 		{
-			cfg: &kubeadmapiext.MasterConfiguration{
+			name: "cluster config with local Etcd",
+			cfg: &kubeadmapi.ClusterConfiguration{
 				KubernetesVersion: "v1.7.1",
-			},
-			expectedBytes: []byte(`[upgrade/config] Configuration used:
-	api:
-	  advertiseAddress: ""
-	  bindPort: 0
-	certificatesDir: ""
-	cloudProvider: ""
-	etcd:
-	  caFile: ""
-	  certFile: ""
-	  dataDir: ""
-	  endpoints: null
-	  image: ""
-	  keyFile: ""
-	imageRepository: ""
-	kubeProxy: {}
-	kubeletConfiguration: {}
-	kubernetesVersion: v1.7.1
-	networking:
-	  dnsDomain: ""
-	  podSubnet: ""
-	  serviceSubnet: ""
-	nodeName: ""
-	token: ""
-	unifiedControlPlaneImage: ""
-`),
-		},
-		{
-			cfg: &kubeadmapiext.MasterConfiguration{
-				KubernetesVersion: "v1.7.1",
-				Networking: kubeadmapiext.Networking{
-					ServiceSubnet: "10.96.0.1/12",
+				Etcd: kubeadmapi.Etcd{
+					Local: &kubeadmapi.LocalEtcd{
+						DataDir: "/some/path",
+					},
 				},
 			},
-			expectedBytes: []byte(`[upgrade/config] Configuration used:
-	api:
-	  advertiseAddress: ""
-	  bindPort: 0
-	certificatesDir: ""
-	cloudProvider: ""
+			expectedBytes: []byte(fmt.Sprintf(`[upgrade/config] Configuration used:
+	apiServer: {}
+	apiVersion: %s
+	controllerManager: {}
+	dns: {}
 	etcd:
-	  caFile: ""
-	  certFile: ""
-	  dataDir: ""
-	  endpoints: null
-	  image: ""
-	  keyFile: ""
-	imageRepository: ""
-	kubeProxy: {}
-	kubeletConfiguration: {}
+	  local:
+	    dataDir: /some/path
+	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
-	networking:
-	  dnsDomain: ""
-	  podSubnet: ""
-	  serviceSubnet: 10.96.0.1/12
-	nodeName: ""
-	token: ""
-	unifiedControlPlaneImage: ""
-`),
+	networking: {}
+	proxy: {}
+	scheduler: {}
+`, kubeadmapiv1.SchemeGroupVersion.String())),
 		},
 		{
-			cfg: &kubeadmapiext.MasterConfiguration{
+			name: "cluster config with ServiceSubnet and external Etcd",
+			cfg: &kubeadmapi.ClusterConfiguration{
 				KubernetesVersion: "v1.7.1",
-				Etcd: kubeadmapiext.Etcd{
-					SelfHosted: &kubeadmapiext.SelfHostedEtcd{
-						CertificatesDir:    "/var/foo",
-						ClusterServiceName: "foo",
-						EtcdVersion:        "v0.1.0",
-						OperatorVersion:    "v0.1.0",
+				Networking: kubeadmapi.Networking{
+					ServiceSubnet: "10.96.0.1/12",
+				},
+				Etcd: kubeadmapi.Etcd{
+					External: &kubeadmapi.ExternalEtcd{
+						Endpoints: []string{"https://one-etcd-instance:2379"},
 					},
 				},
 			},
 			expectedBytes: []byte(`[upgrade/config] Configuration used:
-	api:
-	  advertiseAddress: ""
-	  bindPort: 0
-	certificatesDir: ""
-	cloudProvider: ""
+	apiServer: {}
+	apiVersion: ` + kubeadmapiv1.SchemeGroupVersion.String() + `
+	controllerManager: {}
+	dns: {}
 	etcd:
-	  caFile: ""
-	  certFile: ""
-	  dataDir: ""
-	  endpoints: null
-	  image: ""
-	  keyFile: ""
-	  selfHosted:
-	    certificatesDir: /var/foo
-	    clusterServiceName: foo
-	    etcdVersion: v0.1.0
-	    operatorVersion: v0.1.0
-	imageRepository: ""
-	kubeProxy: {}
-	kubeletConfiguration: {}
+	  external:
+	    caFile: ""
+	    certFile: ""
+	    endpoints:
+	    - https://one-etcd-instance:2379
+	    keyFile: ""
+	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
 	networking:
-	  dnsDomain: ""
-	  podSubnet: ""
-	  serviceSubnet: ""
-	nodeName: ""
-	token: ""
-	unifiedControlPlaneImage: ""
+	  serviceSubnet: 10.96.0.1/12
+	proxy: {}
+	scheduler: {}
 `),
 		},
 	}
 	for _, rt := range tests {
-		rt.buf = bytes.NewBufferString("")
-		printConfiguration(rt.cfg, rt.buf)
-		actualBytes := rt.buf.Bytes()
-		if !bytes.Equal(actualBytes, rt.expectedBytes) {
-			t.Errorf(
-				"failed PrintConfiguration:\n\texpected: %q\n\t  actual: %q",
-				string(rt.expectedBytes),
-				string(actualBytes),
-			)
-		}
+		t.Run(rt.name, func(t *testing.T) {
+			rt.buf = bytes.NewBufferString("")
+			printConfiguration(rt.cfg, rt.buf, &output.TextPrinter{})
+			actualBytes := rt.buf.Bytes()
+			if !bytes.Equal(actualBytes, rt.expectedBytes) {
+				t.Errorf(
+					"failed PrintConfiguration:\n\texpected: %q\n\t  actual: %q",
+					string(rt.expectedBytes),
+					string(actualBytes),
+				)
+			}
+		})
 	}
 }

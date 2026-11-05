@@ -14,65 +14,84 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Common logic used by both http and file channels.
 package config
 
 import (
-	"crypto/md5"
+	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/apiserver/pkg/registry/rest"
+	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
+	schedulingapi "k8s.io/kubernetes/pkg/apis/scheduling"
+
 	// TODO: remove this import if
 	// api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() is changed
 	// to "v1"?
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	// Ensure that core apis are installed
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util/hash"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+)
+
+const (
+	maxConfigLength             = 10 * 1 << 20 // 10MB
+	nodeCriticalPriority        = schedulingapi.SystemCriticalPriority + 1000
+	maxStaticPodWarningMessages = 1000
+)
+
+var (
+	// staticPodWarningCache is used to deduplicate static pod priority warning messages
+	staticPodWarningCache = newWarningCache(maxStaticPodWarningMessages)
 )
 
 // Generate a pod name that is unique among nodes by appending the nodeName.
 func generatePodName(name string, nodeName types.NodeName) string {
-	return fmt.Sprintf("%s-%s", name, nodeName)
+	return fmt.Sprintf("%s-%s", name, strings.ToLower(string(nodeName)))
 }
 
-func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.NodeName) error {
+func applyDefaults(logger klog.Logger, pod *api.Pod, source string, isFile bool, nodeName types.NodeName) error {
 	if len(pod.UID) == 0 {
-		hasher := md5.New()
+		hasher := fnv.New128a()
+		hash.DeepHashObject(hasher, pod)
+		// DeepHashObject resets the hash, so we should write the pod source
+		// information AFTER it.
 		if isFile {
 			fmt.Fprintf(hasher, "host:%s", nodeName)
 			fmt.Fprintf(hasher, "file:%s", source)
 		} else {
 			fmt.Fprintf(hasher, "url:%s", source)
 		}
-		hash.DeepHashObject(hasher, pod)
 		pod.UID = types.UID(hex.EncodeToString(hasher.Sum(nil)[0:]))
-		glog.V(5).Infof("Generated UID %q pod %q from %s", pod.UID, pod.Name, source)
+		logger.V(5).Info("Generated UID", "pod", klog.KObj(pod), "podUID", pod.UID, "source", source)
 	}
 
 	pod.Name = generatePodName(pod.Name, nodeName)
-	glog.V(5).Infof("Generated Name %q for UID %q from URL %s", pod.Name, pod.UID, source)
+	logger.V(5).Info("Generated pod name", "pod", klog.KObj(pod), "podUID", pod.UID, "source", source)
 
 	if pod.Namespace == "" {
 		pod.Namespace = metav1.NamespaceDefault
 	}
-	glog.V(5).Infof("Using namespace %q for pod %q from %s", pod.Namespace, pod.Name, source)
+	logger.V(5).Info("Set namespace for pod", "pod", klog.KObj(pod), "source", source)
 
 	// Set the Host field to indicate this pod is scheduled on the current node.
 	pod.Spec.NodeName = string(nodeName)
-
-	pod.ObjectMeta.SelfLink = getSelfLink(pod.Name, pod.Namespace)
 
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
@@ -94,18 +113,28 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.Node
 	return nil
 }
 
-func getSelfLink(name, namespace string) string {
-	var selfLink string
-	if len(namespace) == 0 {
-		namespace = metav1.NamespaceDefault
-	}
-	selfLink = fmt.Sprintf("/api/"+legacyscheme.Registry.GroupOrDie(api.GroupName).GroupVersion.Version+"/namespaces/%s/pods/%s", namespace, name)
-	return selfLink
+type defaultFunc func(logger klog.Logger, pod *api.Pod) error
+
+// A static pod tried to use a ClusterTrustBundle projected volume source.
+var ErrStaticPodTriedToUseClusterTrustBundle = errors.New("static pods may not use ClusterTrustBundle projected volume sources")
+
+// A static pod tried to use a resource claim.
+var ErrStaticPodTriedToUseResourceClaims = errors.New("static pods may not use ResourceClaims")
+
+// validateStaticPod applies the API server's create validation, handwritten and declarative,
+// because a rejected mirror pod does not stop the static pod from running. Unlike the API server,
+// it validates fields of disabled features instead of dropping them, since static pods must match
+// the kubelet's feature gates.
+func validateStaticPod(logger klog.Logger, pod *api.Pod) field.ErrorList {
+	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
+	errs := validation.ValidatePodCreate(pod, opts)
+	ctx := klog.NewContext(context.Background(), logger)
+	// The pod strategy uses the default config; if it gains options, pass the same ones here.
+	return rest.ValidateDeclarativelyForManifest(ctx, legacyscheme.Scheme, v1.SchemeGroupVersion, pod, errs, rest.DeclarativeValidationConfig{})
 }
 
-type defaultFunc func(pod *api.Pod) error
-
-func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v1.Pod, err error) {
+// tryDecodeSinglePod takes data and tries to extract valid Pod config information from it.
+func tryDecodeSinglePod(logger klog.Logger, data []byte, defaultFn defaultFunc) (parsed bool, pod *v1.Pod, err error) {
 	// JSON is valid YAML, so this should work for everything.
 	json, err := utilyaml.ToJSON(data)
 	if err != nil {
@@ -122,22 +151,41 @@ func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v
 		return false, pod, fmt.Errorf("invalid pod: %#v", obj)
 	}
 
+	if newPod.Name == "" {
+		return true, pod, fmt.Errorf("invalid pod: name is needed for the pod")
+	}
+
 	// Apply default values and validate the pod.
-	if err = defaultFn(newPod); err != nil {
+	if err = defaultFn(logger, newPod); err != nil {
 		return true, pod, err
 	}
-	if errs := validation.ValidatePod(newPod); len(errs) > 0 {
+	if errs := validateStaticPod(logger, newPod); len(errs) > 0 {
 		return true, pod, fmt.Errorf("invalid pod: %v", errs)
 	}
 	v1Pod := &v1.Pod{}
 	if err := k8s_api_v1.Convert_core_Pod_To_v1_Pod(newPod, v1Pod, nil); err != nil {
-		glog.Errorf("Pod %q failed to convert to v1", newPod.Name)
+		logger.Error(err, "Pod failed to convert to v1", "pod", klog.KObj(newPod))
 		return true, nil, err
 	}
+
+	// Check if pod has references to API objects
+	_, resource, err := podutil.HasAPIObjectReference(newPod)
+	if err != nil {
+		return true, nil, err
+	}
+	if resource != "" {
+		return true, nil, fmt.Errorf("static pods may not reference %s", resource)
+	}
+
+	warning := getStaticPodPriorityWarning(newPod)
+	if warning != "" && staticPodWarningCache.addIfAbsent(warning) {
+		logger.Info(warning, "pod", klog.KObj(newPod))
+	}
+
 	return true, v1Pod, nil
 }
 
-func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.PodList, err error) {
+func tryDecodePodList(logger klog.Logger, data []byte, defaultFn defaultFunc) (parsed bool, pods v1.PodList, err error) {
 	obj, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), data)
 	if err != nil {
 		return false, pods, err
@@ -153,12 +201,23 @@ func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.
 	// Apply default values and validate pods.
 	for i := range newPods.Items {
 		newPod := &newPods.Items[i]
-		if err = defaultFn(newPod); err != nil {
+		if newPod.Name == "" {
+			return true, pods, fmt.Errorf("invalid pod: name is needed for the pod")
+		}
+		if err = defaultFn(logger, newPod); err != nil {
 			return true, pods, err
 		}
-		if errs := validation.ValidatePod(newPod); len(errs) > 0 {
+		if errs := validateStaticPod(logger, newPod); len(errs) > 0 {
 			err = fmt.Errorf("invalid pod: %v", errs)
 			return true, pods, err
+		}
+		// Check if pod has references to API objects
+		_, resource, err := podutil.HasAPIObjectReference(newPod)
+		if err != nil {
+			return true, pods, err
+		}
+		if resource != "" {
+			return true, pods, fmt.Errorf("static pods may not reference %s", resource)
 		}
 	}
 	v1Pods := &v1.PodList{}
@@ -166,4 +225,21 @@ func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.
 		return true, pods, err
 	}
 	return true, *v1Pods, err
+}
+
+func getStaticPodPriorityWarning(pod *api.Pod) string {
+	podSpec := pod.Spec
+
+	switch {
+	case podSpec.Priority == nil && len(podSpec.PriorityClassName) > 0:
+		return "Static pod has priorityClassName and nil priority. Kubelet will not use priorityClassName, and mirror pod creation may fail."
+
+	case podSpec.Priority != nil && len(podSpec.PriorityClassName) == 0:
+		return "Static pod has priority without priorityClassName. Mirror pod creation may fail if the default priority class doesn't match the given priority."
+
+	case podSpec.Priority != nil && (*podSpec.Priority != nodeCriticalPriority || podSpec.PriorityClassName != schedulingapi.SystemNodeCritical):
+		return fmt.Sprintf("Static pod has a priority other than %d or a priorityClassName other than %s. Mirror pod may be attempted to be evicted from the node ineffectively.", nodeCriticalPriority, schedulingapi.SystemNodeCritical)
+	}
+
+	return ""
 }

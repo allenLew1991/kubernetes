@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 // +k8s:openapi-gen=true
+
 package v1beta1
 
 import (
@@ -25,7 +26,7 @@ import (
 
 // Policy contains a single ABAC policy rule
 type Policy struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// Spec describes the policy rule
 	Spec PolicySpec `json:"spec"`

@@ -13,9 +13,9 @@
 # limitations under the License.
 
 SRCS = consumer consume-cpu/consume-cpu
+OS ?= linux
 ARCH ?= amd64
 TARGET ?= $(CURDIR)
-GOLANG_VERSION ?= latest
 SRC_DIR = $(notdir $(shell pwd))
 export
 

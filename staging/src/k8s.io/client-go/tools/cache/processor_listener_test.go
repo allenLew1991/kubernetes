@@ -17,16 +17,37 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 )
 
 const (
 	concurrencyLevel = 5
 )
+
+type mockSynced struct {
+	context.Context
+	cancel func()
+}
+
+func newMockSynced(tb testing.TB, synced bool) *mockSynced {
+	m := &mockSynced{}
+	m.Context, m.cancel = context.WithCancel(context.Background())
+	if synced {
+		m.cancel()
+	}
+	tb.Cleanup(m.cancel)
+	return m
+}
+
+func (m *mockSynced) Name() string {
+	return "mock"
+}
 
 func BenchmarkListener(b *testing.B) {
 	var notification addNotification
@@ -35,11 +56,11 @@ func BenchmarkListener(b *testing.B) {
 	swg.Add(b.N)
 	b.SetParallelism(concurrencyLevel)
 	// Preallocate enough space so that benchmark does not run out of it
-	pl := newProcessListener(&ResourceEventHandlerFuncs{
+	pl := newProcessListener(klog.Background(), &ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			swg.Done()
 		},
-	}, 0, 0, time.Now(), 1024*1024)
+	}, 0, 0, time.Now(), 1024*1024, newMockSynced(b, true))
 	var wg wait.Group
 	defer wg.Wait()       // Wait for .run and .pop to stop
 	defer close(pl.addCh) // Tell .run and .pop to stop

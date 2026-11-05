@@ -18,15 +18,17 @@ package persistentvolume
 
 import (
 	"fmt"
-	"net"
 
-	"k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+
+	authenticationv1 "k8s.io/api/authentication/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/cloudprovider"
-	"k8s.io/kubernetes/pkg/util/io"
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/client-go/tools/record"
 	vol "k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
 )
 
 // VolumeHost interface implementation for PersistentVolumeController.
@@ -38,6 +40,10 @@ func (ctrl *PersistentVolumeController) GetPluginDir(pluginName string) string {
 }
 
 func (ctrl *PersistentVolumeController) GetVolumeDevicePluginDir(pluginName string) string {
+	return ""
+}
+
+func (ctrl *PersistentVolumeController) GetPodsDir() string {
 	return ""
 }
 
@@ -57,7 +63,7 @@ func (ctrl *PersistentVolumeController) GetKubeClient() clientset.Interface {
 	return ctrl.kubeClient
 }
 
-func (ctrl *PersistentVolumeController) NewWrapperMounter(volName string, spec vol.Spec, pod *v1.Pod, opts vol.VolumeOptions) (vol.Mounter, error) {
+func (ctrl *PersistentVolumeController) NewWrapperMounter(volName string, spec vol.Spec, pod *v1.Pod) (vol.Mounter, error) {
 	return nil, fmt.Errorf("PersistentVolumeController.NewWrapperMounter is not implemented")
 }
 
@@ -65,44 +71,41 @@ func (ctrl *PersistentVolumeController) NewWrapperUnmounter(volName string, spec
 	return nil, fmt.Errorf("PersistentVolumeController.NewWrapperMounter is not implemented")
 }
 
-func (ctrl *PersistentVolumeController) GetCloudProvider() cloudprovider.Interface {
-	return ctrl.cloud
-}
-
-func (ctrl *PersistentVolumeController) GetMounter(pluginName string) mount.Interface {
+func (ctrl *PersistentVolumeController) GetMounter() mount.Interface {
 	return nil
-}
-
-func (ctrl *PersistentVolumeController) GetWriter() io.Writer {
-	return nil
-}
-
-func (ctrl *PersistentVolumeController) GetHostName() string {
-	return ""
-}
-
-func (ctrl *PersistentVolumeController) GetHostIP() (net.IP, error) {
-	return nil, fmt.Errorf("PersistentVolumeController.GetHostIP() is not implemented")
 }
 
 func (ctrl *PersistentVolumeController) GetNodeAllocatable() (v1.ResourceList, error) {
 	return v1.ResourceList{}, nil
 }
 
-func (adc *PersistentVolumeController) GetSecretFunc() func(namespace, name string) (*v1.Secret, error) {
+func (ctrl *PersistentVolumeController) GetAttachedVolumesFromNodeStatus() (map[v1.UniqueVolumeName]string, error) {
+	return map[v1.UniqueVolumeName]string{}, nil
+}
+
+func (ctrl *PersistentVolumeController) GetSecretFunc() func(namespace, name string) (*v1.Secret, error) {
 	return func(_, _ string) (*v1.Secret, error) {
 		return nil, fmt.Errorf("GetSecret unsupported in PersistentVolumeController")
 	}
 }
 
-func (adc *PersistentVolumeController) GetConfigMapFunc() func(namespace, name string) (*v1.ConfigMap, error) {
+func (ctrl *PersistentVolumeController) GetConfigMapFunc() func(namespace, name string) (*v1.ConfigMap, error) {
 	return func(_, _ string) (*v1.ConfigMap, error) {
 		return nil, fmt.Errorf("GetConfigMap unsupported in PersistentVolumeController")
 	}
 }
 
-func (adc *PersistentVolumeController) GetExec(pluginName string) mount.Exec {
-	return mount.NewOsExec()
+func (ctrl *PersistentVolumeController) GetServiceAccountTokenFunc() func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	return func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		return nil, fmt.Errorf("GetServiceAccountToken unsupported in PersistentVolumeController")
+	}
+}
+
+func (ctrl *PersistentVolumeController) DeleteServiceAccountTokenFunc() func(types.UID) {
+	return func(types.UID) {
+		//nolint:logcheck
+		klog.ErrorS(nil, "DeleteServiceAccountToken unsupported in PersistentVolumeController")
+	}
 }
 
 func (ctrl *PersistentVolumeController) GetNodeLabels() (map[string]string, error) {
@@ -111,4 +114,13 @@ func (ctrl *PersistentVolumeController) GetNodeLabels() (map[string]string, erro
 
 func (ctrl *PersistentVolumeController) GetNodeName() types.NodeName {
 	return ""
+}
+
+func (ctrl *PersistentVolumeController) GetEventRecorder() record.EventRecorder {
+	return ctrl.eventRecorder
+}
+
+func (ctrl *PersistentVolumeController) GetSubpather() subpath.Interface {
+	// No volume plugin needs Subpaths in PV controller.
+	return nil
 }

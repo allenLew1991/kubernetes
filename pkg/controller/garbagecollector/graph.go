@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/go-logr/logr"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -30,9 +32,28 @@ type objectReference struct {
 	Namespace string
 }
 
+// String is used when logging an objectReference in text format.
 func (s objectReference) String() string {
 	return fmt.Sprintf("[%s/%s, namespace: %s, name: %s, uid: %s]", s.APIVersion, s.Kind, s.Namespace, s.Name, s.UID)
 }
+
+// MarshalLog is used when logging an objectReference in JSON format.
+func (s objectReference) MarshalLog() interface{} {
+	return struct {
+		Name       string    `json:"name"`
+		Namespace  string    `json:"namespace"`
+		APIVersion string    `json:"apiVersion"`
+		UID        types.UID `json:"uid"`
+	}{
+		Namespace:  s.Namespace,
+		Name:       s.Name,
+		APIVersion: s.APIVersion,
+		UID:        s.UID,
+	}
+}
+
+var _ fmt.Stringer = objectReference{}
+var _ logr.Marshaler = objectReference{}
 
 // The single-threaded GraphBuilder.processGraphChanges() is the sole writer of the
 // nodes. The multi-threaded GarbageCollector.attemptToDeleteItem() reads the nodes.
@@ -58,7 +79,27 @@ type node struct {
 	virtualLock sync.RWMutex
 	// when processing an Update event, we need to compare the updated
 	// ownerReferences with the owners recorded in the graph.
-	owners []metav1.OwnerReference
+	owners     []metav1.OwnerReference
+	ownersLock sync.RWMutex
+}
+
+// clone() must only be called from the single-threaded GraphBuilder.processGraphChanges()
+func (n *node) clone() *node {
+	c := &node{
+		identity:           n.identity,
+		dependents:         make(map[*node]struct{}, len(n.dependents)),
+		deletingDependents: n.deletingDependents,
+		beingDeleted:       n.beingDeleted,
+		virtual:            n.virtual,
+		owners:             make([]metav1.OwnerReference, 0, len(n.owners)),
+	}
+	for dep := range n.dependents {
+		c.dependents[dep] = struct{}{}
+	}
+	for _, owner := range n.owners {
+		c.owners = append(c.owners, owner)
+	}
+	return c
 }
 
 // An object is on a one way trip to its final deletion if it starts being
@@ -83,7 +124,7 @@ func (n *node) markObserved() {
 func (n *node) isObserved() bool {
 	n.virtualLock.RLock()
 	defer n.virtualLock.RUnlock()
-	return n.virtual == false
+	return !n.virtual
 }
 
 func (n *node) markDeletingDependents() {
@@ -98,32 +139,44 @@ func (n *node) isDeletingDependents() bool {
 	return n.deletingDependents
 }
 
-func (ownerNode *node) addDependent(dependent *node) {
-	ownerNode.dependentsLock.Lock()
-	defer ownerNode.dependentsLock.Unlock()
-	ownerNode.dependents[dependent] = struct{}{}
+func (n *node) setOwners(owners []metav1.OwnerReference) {
+	n.ownersLock.Lock()
+	defer n.ownersLock.Unlock()
+	n.owners = owners
 }
 
-func (ownerNode *node) deleteDependent(dependent *node) {
-	ownerNode.dependentsLock.Lock()
-	defer ownerNode.dependentsLock.Unlock()
-	delete(ownerNode.dependents, dependent)
+func (n *node) getOwners() []metav1.OwnerReference {
+	n.ownersLock.RLock()
+	defer n.ownersLock.RUnlock()
+	return n.owners
 }
 
-func (ownerNode *node) dependentsLength() int {
-	ownerNode.dependentsLock.RLock()
-	defer ownerNode.dependentsLock.RUnlock()
-	return len(ownerNode.dependents)
+func (n *node) addDependent(dependent *node) {
+	n.dependentsLock.Lock()
+	defer n.dependentsLock.Unlock()
+	n.dependents[dependent] = struct{}{}
+}
+
+func (n *node) deleteDependent(dependent *node) {
+	n.dependentsLock.Lock()
+	defer n.dependentsLock.Unlock()
+	delete(n.dependents, dependent)
+}
+
+func (n *node) dependentsLength() int {
+	n.dependentsLock.RLock()
+	defer n.dependentsLock.RUnlock()
+	return len(n.dependents)
 }
 
 // Note that this function does not provide any synchronization guarantees;
 // items could be added to or removed from ownerNode.dependents the moment this
 // function returns.
-func (ownerNode *node) getDependents() []*node {
-	ownerNode.dependentsLock.RLock()
-	defer ownerNode.dependentsLock.RUnlock()
+func (n *node) getDependents() []*node {
+	n.dependentsLock.RLock()
+	defer n.dependentsLock.RUnlock()
 	var ret []*node
-	for dep := range ownerNode.dependents {
+	for dep := range n.dependents {
 		ret = append(ret, dep)
 	}
 	return ret
@@ -139,7 +192,7 @@ func (n *node) blockingDependents() []*node {
 	dependents := n.getDependents()
 	var ret []*node
 	for _, dep := range dependents {
-		for _, owner := range dep.owners {
+		for _, owner := range dep.getOwners() {
 			if owner.UID == n.identity.UID && owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion {
 				ret = append(ret, dep)
 			}
@@ -148,11 +201,38 @@ func (n *node) blockingDependents() []*node {
 	return ret
 }
 
+// ownerReferenceCoordinates returns an owner reference containing only the coordinate fields
+// from the input reference (uid, name, kind, apiVersion)
+func ownerReferenceCoordinates(ref metav1.OwnerReference) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		UID:        ref.UID,
+		Name:       ref.Name,
+		Kind:       ref.Kind,
+		APIVersion: ref.APIVersion,
+	}
+}
+
+// ownerReferenceMatchesCoordinates returns true if all of the coordinate fields match
+// between the two references (uid, name, kind, apiVersion)
+func ownerReferenceMatchesCoordinates(a, b metav1.OwnerReference) bool {
+	return a.UID == b.UID && a.Name == b.Name && a.Kind == b.Kind && a.APIVersion == b.APIVersion
+}
+
 // String renders node as a string using fmt. Acquires a read lock to ensure the
-// reflective dump of dependents doesn't race with any concurrent writes.
+// reflective dump of fields doesn't race with any concurrent writes.
 func (n *node) String() string {
+	n.beingDeletedLock.RLock()
+	defer n.beingDeletedLock.RUnlock()
+
+	n.virtualLock.RLock()
+	defer n.virtualLock.RUnlock()
+
 	n.dependentsLock.RLock()
 	defer n.dependentsLock.RUnlock()
+
+	n.ownersLock.RLock()
+	defer n.ownersLock.RUnlock()
+
 	return fmt.Sprintf("%#v", n)
 }
 

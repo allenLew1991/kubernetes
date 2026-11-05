@@ -19,29 +19,33 @@ package defaulttolerationseconds
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm"
+	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/plugin/pkg/admission/defaulttolerationseconds"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 func TestAdmission(t *testing.T) {
-	masterConfig := framework.NewMasterConfig()
-	masterConfig.GenericConfig.EnableProfiling = true
-	masterConfig.GenericConfig.EnableMetrics = true
-	masterConfig.GenericConfig.AdmissionControl = defaulttolerationseconds.NewDefaultTolerationSeconds()
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	handler, err := newHandlerForTest()
+	if err != nil {
+		t.Errorf("unexpected error initializing handler: %v", err)
+	}
+	client, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerConfig: func(cfg *controlplane.Config) {
+			cfg.ControlPlane.Generic.EnableProfiling = true
+			cfg.ControlPlane.Generic.AdmissionControl = handler
+		},
+	})
+	defer tearDownFn()
 
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Groups[v1.GroupName].GroupVersion()}})
-
-	ns := framework.CreateTestingNamespace("default-toleration-seconds", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(client, "default-toleration-seconds", t)
+	defer framework.DeleteNamespaceOrDie(client, ns, t)
 
 	pod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -58,21 +62,21 @@ func TestAdmission(t *testing.T) {
 		},
 	}
 
-	updatedPod, err := client.Core().Pods(pod.Namespace).Create(&pod)
+	updatedPod, err := client.CoreV1().Pods(pod.Namespace).Create(tCtx, &pod, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("error creating pod: %v", err)
 	}
 
 	var defaultSeconds int64 = 300
 	nodeNotReady := v1.Toleration{
-		Key:               algorithm.TaintNodeNotReady,
+		Key:               v1.TaintNodeNotReady,
 		Operator:          v1.TolerationOpExists,
 		Effect:            v1.TaintEffectNoExecute,
 		TolerationSeconds: &defaultSeconds,
 	}
 
 	nodeUnreachable := v1.Toleration{
-		Key:               algorithm.TaintNodeUnreachable,
+		Key:               v1.TaintNodeUnreachable,
 		Operator:          v1.TolerationOpExists,
 		Effect:            v1.TaintEffectNoExecute,
 		TolerationSeconds: &defaultSeconds,
@@ -101,4 +105,12 @@ func TestAdmission(t *testing.T) {
 	if found != 2 {
 		t.Fatalf("unexpected tolerations: %v\n", updatedPod.Spec.Tolerations)
 	}
+}
+
+// newHandlerForTest returns a handler configured for testing.
+func newHandlerForTest() (*defaulttolerationseconds.Plugin, error) {
+	handler := defaulttolerationseconds.NewDefaultTolerationSeconds()
+	pluginInitializer := initializer.New(nil, nil, nil, nil, nil, nil, nil, nil)
+	pluginInitializer.Initialize(handler)
+	return handler, admission.ValidateInitialization(handler)
 }

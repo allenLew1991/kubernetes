@@ -4,7 +4,7 @@ This document will take you through setting up and trying the sample apiserver o
 
 ## Pre requisites
 
-- Go 1.7.x or later installed and setup. More infomration can be found at [go installation](https://golang.org/doc/install)
+- Go 1.7.x or later installed and setup. More information can be found at [go installation](https://go.dev/doc/install)
 - Dockerhub account to push the image to [Dockerhub](https://hub.docker.com/)
 
 ## Install Minikube
@@ -46,9 +46,9 @@ docker build -t <YOUR_DOCKERHUB_USER>/kube-sample-apiserver:latest ./artifacts/s
 docker push <YOUR_DOCKERHUB_USER>/kube-sample-apiserver
 ```
 
-## Modify the the replication controller
+## Modify the replication controller
 
-You need to modify the [artifacts/example/rc.yaml](/artifacts/example/rc.yaml) file to change the ```imagePullPolicy``` to ```Always``` or ```IfNotPresent```.
+You need to modify the [artifacts/example/deployment.yaml](/artifacts/example/deployment.yaml) file to change the ```imagePullPolicy``` to ```Always``` or ```IfNotPresent```.
 
 You also need to change the image from ```kube-sample-apiserver:latest``` to ```<YOUR_DOCKERHUB_USER>/kube-sample-apiserver:latest```. For example:
 
@@ -78,8 +78,12 @@ kubectl create -f artifacts/example/sa.yaml -n wardle
 kubectl create -f artifacts/example/auth-delegator.yaml -n kube-system
 kubectl create -f artifacts/example/auth-reader.yaml -n kube-system
 
+# create rbac roles and clusterrolebinding that allow the service account user to use admission webhooks
+kubectl create -f artifacts/example/rbac.yaml
+kubectl create -f artifacts/example/rbac-bind.yaml
+
 # create the service and replication controller
-kubectl create -f artifacts/example/rc.yaml -n wardle
+kubectl create -f artifacts/example/deployment.yaml -n wardle
 kubectl create -f artifacts/example/service.yaml -n wardle
 
 # create the apiservice object that tells kubernetes about your api extension and where in the cluster the server is located
@@ -102,5 +106,5 @@ kubectl get flunder my-first-flunder
 
 #outputs
 # NAME               KIND
-# my-first-flunder   Flunder.v1alpha1.wardle.k8s.io
+# my-first-flunder   Flunder.v1alpha1.wardle.example.com
 ```

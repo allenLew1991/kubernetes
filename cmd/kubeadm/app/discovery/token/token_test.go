@@ -17,99 +17,301 @@ limitations under the License.
 package token
 
 import (
-	"strconv"
+	_ "embed"
 	"testing"
 	"time"
 
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+	"github.com/pmezard/go-difflib/difflib"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	fakeclient "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/clientcmd"
+	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	tokenjws "k8s.io/cluster-bootstrap/token/jws"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 )
 
-// testCertPEM is a simple self-signed test certificate issued with the openssl CLI:
-// openssl req -new -newkey rsa:2048 -days 36500 -nodes -x509 -keyout /dev/null -out test.crt
-const testCertPEM = `
------BEGIN CERTIFICATE-----
-MIIDRDCCAiygAwIBAgIJAJgVaCXvC6HkMA0GCSqGSIb3DQEBBQUAMB8xHTAbBgNV
-BAMTFGt1YmVhZG0ta2V5cGlucy10ZXN0MCAXDTE3MDcwNTE3NDMxMFoYDzIxMTcw
-NjExMTc0MzEwWjAfMR0wGwYDVQQDExRrdWJlYWRtLWtleXBpbnMtdGVzdDCCASIw
-DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK0ba8mHU9UtYlzM1Own2Fk/XGjR
-J4uJQvSeGLtz1hID1IA0dLwruvgLCPadXEOw/f/IWIWcmT+ZmvIHZKa/woq2iHi5
-+HLhXs7aG4tjKGLYhag1hLjBI7icqV7ovkjdGAt9pWkxEzhIYClFMXDjKpMSynu+
-YX6nZ9tic1cOkHmx2yiZdMkuriRQnpTOa7bb03OC1VfGl7gHlOAIYaj4539WCOr8
-+ACTUMJUFEHcRZ2o8a/v6F9GMK+7SC8SJUI+GuroXqlMAdhEv4lX5Co52enYaClN
-+D9FJLRpBv2YfiCQdJRaiTvCBSxEFz6BN+PtP5l2Hs703ZWEkOqCByM6HV8CAwEA
-AaOBgDB+MB0GA1UdDgQWBBRQgUX8MhK2rWBWQiPHWcKzoWDH5DBPBgNVHSMESDBG
-gBRQgUX8MhK2rWBWQiPHWcKzoWDH5KEjpCEwHzEdMBsGA1UEAxMUa3ViZWFkbS1r
-ZXlwaW5zLXRlc3SCCQCYFWgl7wuh5DAMBgNVHRMEBTADAQH/MA0GCSqGSIb3DQEB
-BQUAA4IBAQCaAUif7Pfx3X0F08cxhx8/Hdx4jcJw6MCq6iq6rsXM32ge43t8OHKC
-pJW08dk58a3O1YQSMMvD6GJDAiAfXzfwcwY6j258b1ZlI9Ag0VokvhMl/XfdCsdh
-AWImnL1t4hvU5jLaImUUMlYxMcSfHBGAm7WJIZ2LdEfg6YWfZh+WGbg1W7uxLxk6
-y4h5rWdNnzBHWAGf7zJ0oEDV6W6RSwNXtC0JNnLaeIUm/6xdSddJlQPwUv8YH4jX
-c1vuFqTnJBPcb7W//R/GI2Paicm1cmns9NLnPR35exHxFTy+D1yxmGokpoPMdife
-aH+sfuxT8xeTPb3kjzF9eJTlnEquUDLM
------END CERTIFICATE-----`
+var (
+	//go:embed testdata/ca-cert.pem
+	caCert string
 
-func TestRunForEndpointsAndReturnFirst(t *testing.T) {
+	//go:embed testdata/expected-kubeconfig.yaml
+	expectedKubeconfig string
+)
+
+func TestRetrieveValidatedConfigInfo(t *testing.T) {
+	const caCertHash = "sha256:98be2e6d4d8a89aa308fb15de0c07e2531ce549c68dec1687cdd5c06f0826658"
+
 	tests := []struct {
-		endpoints        []string
-		expectedEndpoint string
+		name                     string
+		tokenID                  string
+		tokenSecret              string
+		currentContextCluster    string
+		cfg                      *kubeadmapi.Discovery
+		configMap                *fakeConfigMap
+		delayedJWSSignaturePatch bool
+		expectedError            bool
+		expectedErrorString      string
 	}{
 		{
-			endpoints:        []string{"1", "2", "3"},
-			expectedEndpoint: "1",
+			// This is the default behavior. The JWS signature is patched after the cluster-info ConfigMap is created
+			name:        "valid: retrieve a valid kubeconfig with CA verification and delayed JWS signature",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token:        "123456.abcdef1234567890",
+					CACertHashes: []string{caCertHash},
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: map[string]string{},
+			},
+			delayedJWSSignaturePatch: true,
 		},
 		{
-			endpoints:        []string{"6", "5"},
-			expectedEndpoint: "5",
+			// Same as above expect this test creates the ConfigMap with the JWS signature
+			name:        "valid: retrieve a valid kubeconfig with CA verification",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token:        "123456.abcdef1234567890",
+					CACertHashes: []string{caCertHash},
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: nil,
+			},
 		},
 		{
-			endpoints:        []string{"10", "4"},
-			expectedEndpoint: "4",
+			// Skipping CA verification is also supported
+			name:        "valid: retrieve a valid kubeconfig without CA verification",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token: "123456.abcdef1234567890",
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: nil,
+			},
+		},
+		{
+			name:        "invalid: the kubeconfig in the configmap has the wrong current context",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token:        "123456.abcdef1234567890",
+					CACertHashes: []string{caCertHash},
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: nil,
+			},
+			currentContextCluster: "foo",
+			expectedError:         true,
+			expectedErrorString:   `malformed kubeconfig in the cluster-info ConfigMap: no matching cluster for the current context: token-bootstrap-client@somecluster`,
+		},
+		{
+			name:        "invalid: token format is invalid",
+			tokenID:     "foo",
+			tokenSecret: "bar",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token: "foo.bar",
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: nil,
+			},
+			expectedError: true,
+		},
+		{
+			name:        "invalid: missing cluster-info ConfigMap",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token: "123456.abcdef1234567890",
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: "baz",
+				data: nil,
+			},
+			expectedError: true,
+		},
+		{
+			name:        "invalid: wrong JWS signature",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token: "123456.abcdef1234567890",
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: map[string]string{
+					bootstrapapi.KubeConfigKey:                    "foo",
+					bootstrapapi.JWSSignatureKeyPrefix + "123456": "bar",
+				},
+			},
+			expectedError: true,
+		},
+		{
+			name:        "invalid: missing key for JWSSignatureKeyPrefix",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token: "123456.abcdef1234567890",
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: map[string]string{
+					bootstrapapi.KubeConfigKey: "foo",
+				},
+			},
+			expectedError: true,
+		},
+		{
+			name:        "invalid: wrong CA cert hash",
+			tokenID:     "123456",
+			tokenSecret: "abcdef1234567890",
+			cfg: &kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+					Token:        "123456.abcdef1234567890",
+					CACertHashes: []string{"foo"},
+				},
+			},
+			configMap: &fakeConfigMap{
+				name: bootstrapapi.ConfigMapClusterInfo,
+				data: nil,
+			},
+			expectedError: true,
 		},
 	}
-	for _, rt := range tests {
-		returnKubeConfig := runForEndpointsAndReturnFirst(rt.endpoints, func(endpoint string) (*clientcmdapi.Config, error) {
-			timeout, _ := strconv.Atoi(endpoint)
-			time.Sleep(time.Second * time.Duration(timeout))
-			return kubeconfigutil.CreateBasic(endpoint, "foo", "foo", []byte{}), nil
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			kubeconfig := buildSecureBootstrapKubeConfig("127.0.0.1", []byte(caCert), "somecluster")
+			if len(test.currentContextCluster) > 0 {
+				currentContext := kubeconfig.Contexts[kubeconfig.CurrentContext]
+				if currentContext == nil {
+					t.Fatal("unexpected nil current context")
+				}
+				currentContext.Cluster = test.currentContextCluster
+			}
+			kubeconfigBytes, err := clientcmd.Write(*kubeconfig)
+			if err != nil {
+				t.Fatalf("cannot marshal kubeconfig %v", err)
+			}
+
+			// Generate signature of the insecure kubeconfig
+			sig, err := tokenjws.ComputeDetachedSignature(string(kubeconfigBytes), test.tokenID, test.tokenSecret)
+			if err != nil {
+				t.Fatalf("cannot compute detached JWS signature: %v", err)
+			}
+
+			// If the JWS signature is delayed, only add the kubeconfig
+			if test.delayedJWSSignaturePatch {
+				test.configMap.data = map[string]string{}
+				test.configMap.data[bootstrapapi.KubeConfigKey] = string(kubeconfigBytes)
+			}
+
+			// Populate the default cluster-info data
+			if test.configMap.data == nil {
+				test.configMap.data = map[string]string{}
+				test.configMap.data[bootstrapapi.KubeConfigKey] = string(kubeconfigBytes)
+				test.configMap.data[bootstrapapi.JWSSignatureKeyPrefix+test.tokenID] = sig
+			}
+
+			// Create a fake client and create the cluster-info ConfigMap
+			client := fakeclient.NewSimpleClientset()
+			if err = test.configMap.createOrUpdate(client); err != nil {
+				t.Fatalf("could not create ConfigMap: %v", err)
+			}
+
+			// Set arbitrary discovery timeout and retry interval
+			timeout := time.Millisecond * 500
+			interval := time.Millisecond * 20
+
+			// Patch the JWS signature after a short delay
+			if test.delayedJWSSignaturePatch {
+				test.configMap.data[bootstrapapi.JWSSignatureKeyPrefix+test.tokenID] = sig
+				go func() {
+					time.Sleep(time.Millisecond * 60)
+					if err := test.configMap.createOrUpdate(client); err != nil {
+						t.Errorf("could not update the cluster-info ConfigMap with a JWS signature: %v", err)
+					}
+				}()
+			}
+
+			// Retrieve validated configuration
+			kubeconfig, err = retrieveValidatedConfigInfo(client, test.cfg, interval, timeout, false, true)
+			if (err != nil) != test.expectedError {
+				t.Errorf("expected error %v, got %v, error: %v", test.expectedError, err != nil, err)
+			}
+
+			if err != nil {
+				if len(test.expectedErrorString) > 0 && test.expectedErrorString != err.Error() {
+					t.Fatalf("expected error string: %s, got: %s",
+						test.expectedErrorString, err.Error())
+				}
+
+				// Return if an error is expected
+				return
+			}
+
+			// Validate the resulted kubeconfig
+			kubeconfigBytes, err = clientcmd.Write(*kubeconfig)
+			if err != nil {
+				t.Fatalf("cannot marshal resulted kubeconfig %v", err)
+			}
+			if string(kubeconfigBytes) != expectedKubeconfig {
+				t.Error("unexpected kubeconfig")
+				diff := difflib.UnifiedDiff{
+					A:        difflib.SplitLines(expectedKubeconfig),
+					B:        difflib.SplitLines(string(kubeconfigBytes)),
+					FromFile: "expected",
+					ToFile:   "got",
+					Context:  10,
+				}
+				diffstr, err := difflib.GetUnifiedDiffString(diff)
+				if err != nil {
+					t.Fatalf("error generating unified diff string: %v", err)
+				}
+				t.Errorf("\n%s", diffstr)
+			}
 		})
-		endpoint := returnKubeConfig.Clusters[returnKubeConfig.Contexts[returnKubeConfig.CurrentContext].Cluster].Server
-		if endpoint != rt.expectedEndpoint {
-			t.Errorf(
-				"failed TestRunForEndpointsAndReturnFirst:\n\texpected: %s\n\t  actual: %s",
-				endpoint,
-				rt.expectedEndpoint,
-			)
-		}
 	}
 }
 
-func TestParsePEMCert(t *testing.T) {
-	for _, testCase := range []struct {
-		name        string
-		input       []byte
-		expectValid bool
-	}{
-		{"invalid certificate data", []byte{0}, false},
-		{"certificate with junk appended", []byte(testCertPEM + "\nABC"), false},
-		{"multiple certificates", []byte(testCertPEM + "\n" + testCertPEM), false},
-		{"valid", []byte(testCertPEM), true},
-	} {
-		cert, err := parsePEMCert(testCase.input)
-		if testCase.expectValid {
-			if err != nil {
-				t.Errorf("failed TestParsePEMCert(%s): unexpected error %v", testCase.name, err)
-			}
-			if cert == nil {
-				t.Errorf("failed TestParsePEMCert(%s): returned nil", testCase.name)
-			}
-		} else {
-			if err == nil {
-				t.Errorf("failed TestParsePEMCert(%s): expected an error", testCase.name)
-			}
-			if cert != nil {
-				t.Errorf("failed TestParsePEMCert(%s): expected not to get a certificate back, but got one", testCase.name)
-			}
-		}
-	}
+type fakeConfigMap struct {
+	name string
+	data map[string]string
+}
+
+func (c *fakeConfigMap) createOrUpdate(client clientset.Interface) error {
+	return apiclient.CreateOrUpdate(client.CoreV1().ConfigMaps(metav1.NamespacePublic), &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.name,
+			Namespace: metav1.NamespacePublic,
+		},
+		Data: c.data,
+	})
 }

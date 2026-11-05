@@ -17,21 +17,18 @@ limitations under the License.
 package apps
 
 import (
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
+// NOTE(claudiub): These constants should NOT be used as Pod Container Images.
 const (
-	NginxImageName = "nginx"
-	RedisImageName = "redis"
+	AgnhostImageName = "agnhost"
 )
 
 var (
-	CronJobGroupVersionResourceAlpha = schema.GroupVersionResource{Group: "batch", Version: "v2alpha1", Resource: "cronjobs"}
-	CronJobGroupVersionResourceBeta  = schema.GroupVersionResource{Group: "batch", Version: "v1beta1", Resource: "cronjobs"}
-	NautilusImage                    = imageutils.GetE2EImage(imageutils.Nautilus)
-	KittenImage                      = imageutils.GetE2EImage(imageutils.Kitten)
-	NginxImage                       = imageutils.GetE2EImage(imageutils.NginxSlim)
-	NewNginxImage                    = imageutils.GetE2EImage(imageutils.NginxSlimNew)
-	RedisImage                       = imageutils.GetE2EImage(imageutils.Redis)
+	// PrevAgnhostImage is the fully qualified URI to the AgnhostPrev image
+	PrevAgnhostImage = imageutils.GetE2EImage(imageutils.AgnhostPrev)
+
+	// AgnhostImage is the fully qualified URI to the Agnhost image
+	AgnhostImage = imageutils.GetE2EImage(imageutils.Agnhost)
 )

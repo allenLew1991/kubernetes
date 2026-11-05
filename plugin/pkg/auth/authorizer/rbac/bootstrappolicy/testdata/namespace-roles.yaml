@@ -5,7 +5,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:bootstrap-signer
@@ -29,6 +28,7 @@ items:
     - update
   - apiGroups:
     - ""
+    - events.k8s.io
     resources:
     - events
     verbs:
@@ -40,7 +40,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: extension-apiserver-authentication-reader
@@ -54,64 +53,73 @@ items:
     - configmaps
     verbs:
     - get
+    - list
+    - watch
 - apiVersion: rbac.authorization.k8s.io/v1
   kind: Role
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system::leader-locking-kube-controller-manager
     namespace: kube-system
   rules:
   - apiGroups:
-    - ""
+    - coordination.k8s.io
     resources:
-    - configmaps
+    - leases
     verbs:
+    - create
+    - get
+    - list
+    - update
     - watch
   - apiGroups:
-    - ""
-    resourceNames:
-    - kube-controller-manager
+    - coordination.k8s.io
     resources:
-    - configmaps
+    - leasecandidates
     verbs:
+    - create
     - get
+    - list
     - update
+    - watch
 - apiVersion: rbac.authorization.k8s.io/v1
   kind: Role
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system::leader-locking-kube-scheduler
     namespace: kube-system
   rules:
   - apiGroups:
-    - ""
+    - coordination.k8s.io
     resources:
-    - configmaps
+    - leases
     verbs:
+    - create
+    - get
+    - list
+    - update
     - watch
   - apiGroups:
-    - ""
-    resourceNames:
-    - kube-scheduler
+    - coordination.k8s.io
     resources:
-    - configmaps
+    - leasecandidates
     verbs:
+    - create
     - get
+    - list
     - update
+    - watch
 - apiVersion: rbac.authorization.k8s.io/v1
   kind: Role
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:bootstrap-signer
@@ -130,7 +138,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:cloud-provider
@@ -150,7 +157,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:token-cleaner
@@ -167,6 +173,7 @@ items:
     - watch
   - apiGroups:
     - ""
+    - events.k8s.io
     resources:
     - events
     verbs:

@@ -17,35 +17,70 @@ limitations under the License.
 package cpumanager
 
 import (
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/utils/cpuset"
 )
 
-type nonePolicy struct{}
+type nonePolicy struct {
+}
 
 var _ Policy = &nonePolicy{}
 
 // PolicyNone name of none policy
 const PolicyNone policyName = "none"
 
-// NewNonePolicy returns a cupset manager policy that does nothing
-func NewNonePolicy() Policy {
-	return &nonePolicy{}
+// NewNonePolicy returns a cpuset manager policy that does nothing
+func NewNonePolicy(cpuPolicyOptions map[string]string) (Policy, error) {
+	if len(cpuPolicyOptions) > 0 {
+		return nil, fmt.Errorf("None policy: received unsupported options=%v", cpuPolicyOptions)
+	}
+	return &nonePolicy{}, nil
 }
 
 func (p *nonePolicy) Name() string {
 	return string(PolicyNone)
 }
 
-func (p *nonePolicy) Start(s state.State) {
-	glog.Info("[cpumanager] none policy: Start")
-}
-
-func (p *nonePolicy) AddContainer(s state.State, pod *v1.Pod, container *v1.Container, containerID string) error {
+func (p *nonePolicy) Start(logger klog.Logger, _ state.State) error {
+	logger.Info("Start")
 	return nil
 }
 
-func (p *nonePolicy) RemoveContainer(s state.State, containerID string) error {
+func (p *nonePolicy) Allocate(_ klog.Logger, _ state.State, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) error {
 	return nil
+}
+
+func (p *nonePolicy) RemoveContainer(_ klog.Logger, _ state.State, _ string, _ string) error {
+	return nil
+}
+
+func (p *nonePolicy) GetTopologyHints(_ klog.Logger, _ state.State, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	return nil
+}
+
+func (p *nonePolicy) GetPodTopologyHints(_ klog.Logger, _ state.State, _ *v1.Pod, _ lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	return nil
+}
+
+func (p *nonePolicy) AllocatePod(_ klog.Logger, _ state.State, _ *v1.Pod, _ lifecycle.Operation) error {
+	return nil
+}
+
+// Assignable CPUs are the ones that can be exclusively allocated to pods that meet the exclusivity requirement
+// (ie guaranteed QoS class and integral CPU request).
+// Assignability of CPUs as a concept is only applicable in case of static policy i.e. scenarios where workloads
+// CAN get exclusive access to core(s).
+// Hence, we return empty set here: no cpus are assignable according to above definition with this policy.
+func (p *nonePolicy) GetAllocatableCPUs(_ state.State) cpuset.CPUSet {
+	return cpuset.New()
+}
+
+func (p *nonePolicy) CanAllocateExclusively() bool {
+	return false
 }

@@ -23,35 +23,26 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/kubernetes/pkg/apis/policy"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 )
 
-func newStorage(t *testing.T) (*REST, *StatusREST, *etcdtesting.EtcdTestServer) {
+func newStorage(t *testing.T) (*REST, *StatusREST, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, policy.GroupName)
 	restOptions := generic.RESTOptions{StorageConfig: etcdStorage, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "poddisruptionbudgets"}
-	podDisruptionBudgetStorage, statusStorage := NewREST(restOptions)
+	podDisruptionBudgetStorage, statusStorage, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return podDisruptionBudgetStorage, statusStorage, server
 }
 
-// createPodDisruptionBudget is a helper function that returns a PodDisruptionBudget with the updated resource version.
-func createPodDisruptionBudget(storage *REST, pdb policy.PodDisruptionBudget, t *testing.T) (policy.PodDisruptionBudget, error) {
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), pdb.Namespace)
-	obj, err := storage.Create(ctx, &pdb, rest.ValidateAllObjectFunc, false)
-	if err != nil {
-		t.Errorf("Failed to create PodDisruptionBudget, %v", err)
-	}
-	newPS := obj.(*policy.PodDisruptionBudget)
-	return *newPS, nil
-}
-
 func validNewPodDisruptionBudget() *policy.PodDisruptionBudget {
-	minAvailable := intstr.FromInt(7)
+	minAvailable := intstr.FromInt32(7)
 	return &policy.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "foo",
@@ -86,10 +77,11 @@ func TestStatusUpdate(t *testing.T) {
 	storage, statusStorage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+	statusCtx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault, "status")
 	key := "/poddisruptionbudgets/" + metav1.NamespaceDefault + "/foo"
 	validPodDisruptionBudget := validNewPodDisruptionBudget()
-	if err := storage.Storage.Create(ctx, key, validPodDisruptionBudget, nil, 0); err != nil {
+	if err := storage.Storage.Create(ctx, key, validPodDisruptionBudget, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -99,7 +91,7 @@ func TestStatusUpdate(t *testing.T) {
 	}
 	obtainedPdb := obj.(*policy.PodDisruptionBudget)
 
-	minAvailable := intstr.FromInt(8)
+	minAvailable := intstr.FromInt32(8)
 	update := policy.PodDisruptionBudget{
 		ObjectMeta: obtainedPdb.ObjectMeta,
 		Spec: policy.PodDisruptionBudgetSpec{
@@ -110,7 +102,7 @@ func TestStatusUpdate(t *testing.T) {
 		},
 	}
 
-	if _, _, err := statusStorage.Update(ctx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc); err != nil {
+	if _, _, err := statusStorage.Update(statusCtx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	obj, err = storage.Get(ctx, "foo", &metav1.GetOptions{})

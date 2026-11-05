@@ -17,22 +17,27 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/proxy"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	genericfeatures "k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	translator "k8s.io/apiserver/pkg/util/proxy"
+	proxymetrics "k8s.io/apiserver/pkg/util/proxy/metrics"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/capabilities"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	"k8s.io/kubernetes/pkg/registry/core/pod"
+	"k8s.io/streaming/pkg/httpstream/wsstream"
 )
 
 // ProxyREST implements the proxy subresource for a Pod
@@ -46,9 +51,15 @@ var _ = rest.Connecter(&ProxyREST{})
 
 var proxyMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
-// New returns an empty pod resource
+// New returns an empty podProxyOptions object.
 func (r *ProxyREST) New() runtime.Object {
-	return &api.Pod{}
+	return &api.PodProxyOptions{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *ProxyREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // ConnectMethods returns the list of HTTP methods that can be proxied
@@ -62,18 +73,18 @@ func (r *ProxyREST) NewConnectOptions() (runtime.Object, bool, string) {
 }
 
 // Connect returns a handler for the pod proxy
-func (r *ProxyREST) Connect(ctx genericapirequest.Context, id string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+func (r *ProxyREST) Connect(ctx context.Context, id string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
 	proxyOpts, ok := opts.(*api.PodProxyOptions)
 	if !ok {
 		return nil, fmt.Errorf("Invalid options object: %#v", opts)
 	}
-	location, transport, err := pod.ResourceLocation(r.Store, r.ProxyTransport, ctx, id)
+	location, transport, err := pod.ResourceLocation(ctx, r.Store, r.ProxyTransport, id)
 	if err != nil {
 		return nil, err
 	}
 	location.Path = net.JoinPreservingTrailingSlash(location.Path, proxyOpts.Path)
 	// Return a proxy handler that uses the desired transport, wrapped with additional proxy handling (to get URL rewriting, X-Forwarded-* headers, etc)
-	return newThrottledUpgradeAwareProxyHandler(location, transport, true, false, false, responder), nil
+	return newThrottledUpgradeAwareProxyHandler(location, transport, true, false, responder), nil
 }
 
 // Support both GET and POST methods. We must support GET for browsers that want to use WebSockets.
@@ -81,29 +92,67 @@ var upgradeableMethods = []string{"GET", "POST"}
 
 // AttachREST implements the attach subresource for a Pod
 type AttachREST struct {
-	Store       *genericregistry.Store
+	Store       pod.ResourceGetter
 	KubeletConn client.ConnectionInfoGetter
+	Authorizer  authorizer.UnconditionalAuthorizer
 }
 
 // Implement Connecter
 var _ = rest.Connecter(&AttachREST{})
 
-// New creates a new Pod object
+// New creates a new podAttachOptions object.
 func (r *AttachREST) New() runtime.Object {
-	return &api.Pod{}
+	return &api.PodAttachOptions{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *AttachREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Connect returns a handler for the pod exec proxy
-func (r *AttachREST) Connect(ctx genericapirequest.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+func (r *AttachREST) Connect(ctx context.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+	// Forces a authz check for "create", if feature gate enabled.
+	// See: https://github.com/kubernetes/kubernetes/issues/133515
+	if utilfeature.DefaultFeatureGate.Enabled(features.AuthorizePodWebsocketUpgradeCreatePermission) {
+		if err := ensureAuthorizedForVerb(ctx, r.Authorizer, "create"); err != nil {
+			return nil, err
+		}
+	}
+
 	attachOpts, ok := opts.(*api.PodAttachOptions)
 	if !ok {
 		return nil, fmt.Errorf("Invalid options object: %#v", opts)
 	}
-	location, transport, err := pod.AttachLocation(r.Store, r.KubeletConn, ctx, name, attachOpts)
+
+	location, connInfo, err := pod.AttachLocation(ctx, r.Store, r.KubeletConn, name, attachOpts)
 	if err != nil {
 		return nil, err
 	}
-	return newThrottledUpgradeAwareProxyHandler(location, transport, false, true, true, responder), nil
+	transport := connInfo.Transport
+	nodeSupportsWebsockets := checkNodeSupportsWebsockets(connInfo.NodeFeatures)
+	handler := newThrottledUpgradeAwareProxyHandler(location, transport, false, true, responder)
+	if utilfeature.DefaultFeatureGate.Enabled(features.TranslateStreamCloseWebsocketRequests) {
+		// If the node supports websocket translation, revert to legacy proxy, and let kubelet handle it.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ExtendWebSocketsToKubelet) && nodeSupportsWebsockets {
+			proxymetrics.IncWebSocketStreamingRequest(ctx, "attach", "proxied_to_kubelet")
+			return handler, nil
+		}
+		proxymetrics.IncWebSocketStreamingRequest(ctx, "attach", "translated_at_apiserver")
+		// Wrap the upgrade aware handler to implement stream translation
+		// for WebSocket/V5 upgrade requests.
+		streamOptions := translator.Options{
+			Stdin:  attachOpts.Stdin,
+			Stdout: attachOpts.Stdout,
+			Stderr: attachOpts.Stderr,
+			Tty:    attachOpts.TTY,
+		}
+		maxBytesPerSec := capabilities.Get().PerConnectionBandwidthLimitBytesPerSec
+		streamtranslator := translator.NewStreamTranslatorHandler(location, transport, maxBytesPerSec, streamOptions)
+		handler = translator.NewTranslatingHandler(handler, streamtranslator, wsstream.IsWebSocketRequestWithStreamCloseProtocol)
+	}
+	return handler, nil
 }
 
 // NewConnectOptions returns the versioned object that represents exec parameters
@@ -118,29 +167,67 @@ func (r *AttachREST) ConnectMethods() []string {
 
 // ExecREST implements the exec subresource for a Pod
 type ExecREST struct {
-	Store       *genericregistry.Store
+	Store       pod.ResourceGetter
 	KubeletConn client.ConnectionInfoGetter
+	Authorizer  authorizer.UnconditionalAuthorizer
 }
 
 // Implement Connecter
 var _ = rest.Connecter(&ExecREST{})
 
-// New creates a new Pod object
+// New creates a new podExecOptions object.
 func (r *ExecREST) New() runtime.Object {
-	return &api.Pod{}
+	return &api.PodExecOptions{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *ExecREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Connect returns a handler for the pod exec proxy
-func (r *ExecREST) Connect(ctx genericapirequest.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+func (r *ExecREST) Connect(ctx context.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+	// Forces a authz check for "create", if feature gate enabled.
+	// See: https://github.com/kubernetes/kubernetes/issues/133515
+	if utilfeature.DefaultFeatureGate.Enabled(features.AuthorizePodWebsocketUpgradeCreatePermission) {
+		if err := ensureAuthorizedForVerb(ctx, r.Authorizer, "create"); err != nil {
+			return nil, err
+		}
+	}
+
 	execOpts, ok := opts.(*api.PodExecOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", opts)
 	}
-	location, transport, err := pod.ExecLocation(r.Store, r.KubeletConn, ctx, name, execOpts)
+
+	location, connInfo, err := pod.ExecLocation(ctx, r.Store, r.KubeletConn, name, execOpts)
 	if err != nil {
 		return nil, err
 	}
-	return newThrottledUpgradeAwareProxyHandler(location, transport, false, true, true, responder), nil
+	transport := connInfo.Transport
+	nodeSupportsWebsockets := checkNodeSupportsWebsockets(connInfo.NodeFeatures)
+	handler := newThrottledUpgradeAwareProxyHandler(location, transport, false, true, responder)
+	if utilfeature.DefaultFeatureGate.Enabled(features.TranslateStreamCloseWebsocketRequests) {
+		// If the node supports websocket translation, revert to legacy proxy, and let kubelet handle it.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ExtendWebSocketsToKubelet) && nodeSupportsWebsockets {
+			proxymetrics.IncWebSocketStreamingRequest(ctx, "exec", "proxied_to_kubelet")
+			return handler, nil
+		}
+		proxymetrics.IncWebSocketStreamingRequest(ctx, "exec", "translated_at_apiserver")
+		// Wrap the upgrade aware handler to implement stream translation
+		// for WebSocket/V5 upgrade requests.
+		streamOptions := translator.Options{
+			Stdin:  execOpts.Stdin,
+			Stdout: execOpts.Stdout,
+			Stderr: execOpts.Stderr,
+			Tty:    execOpts.TTY,
+		}
+		maxBytesPerSec := capabilities.Get().PerConnectionBandwidthLimitBytesPerSec
+		streamtranslator := translator.NewStreamTranslatorHandler(location, transport, maxBytesPerSec, streamOptions)
+		handler = translator.NewTranslatingHandler(handler, streamtranslator, wsstream.IsWebSocketRequestWithStreamCloseProtocol)
+	}
+	return handler, nil
 }
 
 // NewConnectOptions returns the versioned object that represents exec parameters
@@ -155,16 +242,23 @@ func (r *ExecREST) ConnectMethods() []string {
 
 // PortForwardREST implements the portforward subresource for a Pod
 type PortForwardREST struct {
-	Store       *genericregistry.Store
+	Store       pod.ResourceGetter
 	KubeletConn client.ConnectionInfoGetter
+	Authorizer  authorizer.UnconditionalAuthorizer
 }
 
 // Implement Connecter
 var _ = rest.Connecter(&PortForwardREST{})
 
-// New returns an empty pod object
+// New returns an empty podPortForwardOptions object
 func (r *PortForwardREST) New() runtime.Object {
-	return &api.Pod{}
+	return &api.PodPortForwardOptions{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *PortForwardREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // NewConnectOptions returns the versioned object that represents the
@@ -179,21 +273,48 @@ func (r *PortForwardREST) ConnectMethods() []string {
 }
 
 // Connect returns a handler for the pod portforward proxy
-func (r *PortForwardREST) Connect(ctx genericapirequest.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+func (r *PortForwardREST) Connect(ctx context.Context, name string, opts runtime.Object, responder rest.Responder) (http.Handler, error) {
+	// Forces a authz check for "create", if feature gate enabled.
+	// See: https://github.com/kubernetes/kubernetes/issues/133515
+	if utilfeature.DefaultFeatureGate.Enabled(features.AuthorizePodWebsocketUpgradeCreatePermission) {
+		if err := ensureAuthorizedForVerb(ctx, r.Authorizer, "create"); err != nil {
+			return nil, err
+		}
+	}
+
 	portForwardOpts, ok := opts.(*api.PodPortForwardOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", opts)
 	}
-	location, transport, err := pod.PortForwardLocation(r.Store, r.KubeletConn, ctx, name, portForwardOpts)
+	location, connInfo, err := pod.PortForwardLocation(ctx, r.Store, r.KubeletConn, name, portForwardOpts)
 	if err != nil {
 		return nil, err
 	}
-	return newThrottledUpgradeAwareProxyHandler(location, transport, false, true, true, responder), nil
+	transport := connInfo.Transport
+	nodeSupportsWebsockets := checkNodeSupportsWebsockets(connInfo.NodeFeatures)
+	handler := newThrottledUpgradeAwareProxyHandler(location, transport, false, true, responder)
+	if utilfeature.DefaultFeatureGate.Enabled(features.PortForwardWebsockets) {
+		// If the node supports websocket tunneling, revert to legacy proxy, and let kubelet handle it.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ExtendWebSocketsToKubelet) && nodeSupportsWebsockets {
+			proxymetrics.IncWebSocketStreamingRequest(ctx, "portforward", "proxied_to_kubelet")
+			return handler, nil
+		}
+		proxymetrics.IncWebSocketStreamingRequest(ctx, "portforward", "translated_at_apiserver")
+		tunnelingHandler := translator.NewTunnelingHandler(handler)
+		handler = translator.NewTranslatingHandler(handler, tunnelingHandler, wsstream.IsWebSocketRequestWithTunnelingProtocol)
+	}
+	return handler, nil
 }
 
-func newThrottledUpgradeAwareProxyHandler(location *url.URL, transport http.RoundTripper, wrapTransport, upgradeRequired, interceptRedirects bool, responder rest.Responder) *proxy.UpgradeAwareHandler {
+func newThrottledUpgradeAwareProxyHandler(location *url.URL, transport http.RoundTripper, wrapTransport, upgradeRequired bool, responder rest.Responder) http.Handler {
 	handler := proxy.NewUpgradeAwareHandler(location, transport, wrapTransport, upgradeRequired, proxy.NewErrorResponder(responder))
-	handler.InterceptRedirects = interceptRedirects && utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StreamingProxyRedirects)
 	handler.MaxBytesPerSec = capabilities.Get().PerConnectionBandwidthLimitBytesPerSec
 	return handler
+}
+
+// Given features node supports, return true if kubelet supports websocket
+// translation/tunneling, false otherwise.
+func checkNodeSupportsWebsockets(nodeFeatures []string) bool {
+	nodeSupportsWebsockets := slices.Contains(nodeFeatures, string(features.ExtendWebSocketsToKubelet))
+	return nodeSupportsWebsockets
 }

@@ -25,28 +25,28 @@ import (
 
 // A ServiceResolver knows how to get a URL given a service.
 type ServiceResolver interface {
-	ResolveEndpoint(namespace, name string) (*url.URL, error)
+	ResolveEndpoint(namespace, name string, port int32) (*url.URL, error)
 }
 
 // NewEndpointServiceResolver returns a ServiceResolver that chooses one of the
 // service's endpoints.
-func NewEndpointServiceResolver(services listersv1.ServiceLister, endpoints listersv1.EndpointsLister) ServiceResolver {
+func NewEndpointServiceResolver(services listersv1.ServiceLister, endpointSliceGetter proxy.EndpointSliceGetter) ServiceResolver {
 	return &aggregatorEndpointRouting{
-		services:  services,
-		endpoints: endpoints,
+		services:            services,
+		endpointSliceGetter: endpointSliceGetter,
 	}
 }
 
 type aggregatorEndpointRouting struct {
-	services  listersv1.ServiceLister
-	endpoints listersv1.EndpointsLister
+	services            listersv1.ServiceLister
+	endpointSliceGetter proxy.EndpointSliceGetter
 }
 
-func (r *aggregatorEndpointRouting) ResolveEndpoint(namespace, name string) (*url.URL, error) {
-	return proxy.ResolveEndpoint(r.services, r.endpoints, namespace, name)
+func (r *aggregatorEndpointRouting) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	return proxy.ResolveEndpoint(r.services, r.endpointSliceGetter, namespace, name, port)
 }
 
-// NewEndpointServiceResolver returns a ServiceResolver that directly calls the
+// NewClusterIPServiceResolver returns a ServiceResolver that directly calls the
 // service's cluster IP.
 func NewClusterIPServiceResolver(services listersv1.ServiceLister) ServiceResolver {
 	return &aggregatorClusterRouting{
@@ -58,6 +58,27 @@ type aggregatorClusterRouting struct {
 	services listersv1.ServiceLister
 }
 
-func (r *aggregatorClusterRouting) ResolveEndpoint(namespace, name string) (*url.URL, error) {
-	return proxy.ResolveCluster(r.services, namespace, name)
+func (r *aggregatorClusterRouting) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	return proxy.ResolveCluster(r.services, namespace, name, port)
+}
+
+// NewLoopbackServiceResolver returns a ServiceResolver that routes
+// the kubernetes/default service with port 443 to loopback.
+func NewLoopbackServiceResolver(delegate ServiceResolver, host *url.URL) ServiceResolver {
+	return &loopbackResolver{
+		delegate: delegate,
+		host:     host,
+	}
+}
+
+type loopbackResolver struct {
+	delegate ServiceResolver
+	host     *url.URL
+}
+
+func (r *loopbackResolver) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	if namespace == "default" && name == "kubernetes" && port == 443 {
+		return r.host, nil
+	}
+	return r.delegate.ResolveEndpoint(namespace, name, port)
 }

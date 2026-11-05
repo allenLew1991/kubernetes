@@ -19,78 +19,76 @@ package auth
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apiserver/pkg/authentication/group"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	bootstrapapi "k8s.io/kubernetes/pkg/bootstrap/api"
-	"k8s.io/kubernetes/plugin/pkg/admission/admit"
+	"k8s.io/client-go/rest"
+	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/plugin/pkg/auth/authenticator/token/bootstrap"
-	bootstraputil "k8s.io/kubernetes/test/e2e/lifecycle/bootstrap"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-type bootstrapSecrets []*api.Secret
+type bootstrapSecrets []*corev1.Secret
 
-func (b bootstrapSecrets) List(selector labels.Selector) (ret []*api.Secret, err error) {
+func (b bootstrapSecrets) List(selector labels.Selector) (ret []*corev1.Secret, err error) {
 	return b, nil
 }
 
-func (b bootstrapSecrets) Get(name string) (*api.Secret, error) {
+func (b bootstrapSecrets) Get(name string) (*corev1.Secret, error) {
 	return b[0], nil
 }
 
 // TestBootstrapTokenAuth tests the bootstrap token auth provider
 func TestBootstrapTokenAuth(t *testing.T) {
-	tokenId, err := bootstraputil.GenerateTokenId()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	secret, err := bootstraputil.GenerateTokenSecret()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	var bootstrapSecretValid = &api.Secret{
+	validTokenID := "token1"
+	validSecret := "validtokensecret"
+	var bootstrapSecretValid = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: metav1.NamespaceSystem,
 			Name:      bootstrapapi.BootstrapTokenSecretPrefix,
 		},
-		Type: api.SecretTypeBootstrapToken,
+		Type: corev1.SecretTypeBootstrapToken,
 		Data: map[string][]byte{
-			bootstrapapi.BootstrapTokenIDKey:               []byte(tokenId),
-			bootstrapapi.BootstrapTokenSecretKey:           []byte(secret),
+			bootstrapapi.BootstrapTokenIDKey:               []byte(validTokenID),
+			bootstrapapi.BootstrapTokenSecretKey:           []byte(validSecret),
 			bootstrapapi.BootstrapTokenUsageAuthentication: []byte("true"),
 		},
 	}
-	var bootstrapSecretInvalid = &api.Secret{
+	var bootstrapSecretInvalid = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: metav1.NamespaceSystem,
 			Name:      bootstrapapi.BootstrapTokenSecretPrefix,
 		},
-		Type: api.SecretTypeBootstrapToken,
+		Type: corev1.SecretTypeBootstrapToken,
 		Data: map[string][]byte{
-			bootstrapapi.BootstrapTokenIDKey:               []byte(tokenId),
+			bootstrapapi.BootstrapTokenIDKey:               []byte(validTokenID),
 			bootstrapapi.BootstrapTokenSecretKey:           []byte("invalid"),
 			bootstrapapi.BootstrapTokenUsageAuthentication: []byte("true"),
 		},
 	}
-	var expiredBootstrapToken = &api.Secret{
+	tokenExpiredTime := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	var expiredBootstrapToken = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: metav1.NamespaceSystem,
 			Name:      bootstrapapi.BootstrapTokenSecretPrefix,
 		},
-		Type: api.SecretTypeBootstrapToken,
+		Type: corev1.SecretTypeBootstrapToken,
 		Data: map[string][]byte{
-			bootstrapapi.BootstrapTokenIDKey:               []byte(tokenId),
+			bootstrapapi.BootstrapTokenIDKey:               []byte(validTokenID),
 			bootstrapapi.BootstrapTokenSecretKey:           []byte("invalid"),
 			bootstrapapi.BootstrapTokenUsageAuthentication: []byte("true"),
-			bootstrapapi.BootstrapTokenExpirationKey:       []byte(bootstraputil.TimeStringFromNow(-time.Hour)),
+			bootstrapapi.BootstrapTokenExpirationKey:       []byte(tokenExpiredTime),
 		},
 	}
 	type request struct {
@@ -102,7 +100,7 @@ func TestBootstrapTokenAuth(t *testing.T) {
 	tests := []struct {
 		name    string
 		request request
-		secret  *api.Secret
+		secret  *corev1.Secret
 	}{
 		{
 			name:    "valid token",
@@ -121,68 +119,77 @@ func TestBootstrapTokenAuth(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			authenticator := group.NewAuthenticatedGroupAdder(bearertoken.New(bootstrap.NewTokenAuthenticator(bootstrapSecrets{test.secret})))
 
-		authenticator := bearertoken.New(bootstrap.NewTokenAuthenticator(bootstrapSecrets{test.secret}))
-		// Set up a master
-		masterConfig := framework.NewIntegrationTestMasterConfig()
-		masterConfig.GenericConfig.Authenticator = authenticator
-		masterConfig.GenericConfig.AdmissionControl = admit.NewAlwaysAdmit()
-		_, s, closeFn := framework.RunAMaster(masterConfig)
-		defer closeFn()
+			kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+				ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+					opts.Authorization.Modes = []string{"AlwaysAllow"}
+				},
+				ModifyServerConfig: func(config *controlplane.Config) {
+					config.ControlPlane.Generic.Authentication.Authenticator = authenticator
+				},
+			})
+			defer tearDownFn()
 
-		ns := framework.CreateTestingNamespace("auth-bootstrap-token", s, t)
-		defer framework.DeleteTestingNamespace(ns, s, t)
+			ns := framework.CreateNamespaceOrDie(kubeClient, "auth-bootstrap-token", t)
+			defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-		previousResourceVersion := make(map[string]float64)
-		transport := http.DefaultTransport
-
-		token := tokenId + "." + secret
-		var bodyStr string
-		if test.request.body != "" {
-			sub := ""
-			if test.request.verb == "PUT" {
-				// For update operations, insert previous resource version
-				if resVersion := previousResourceVersion[getPreviousResourceVersionKey(test.request.URL, "")]; resVersion != 0 {
-					sub += fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
-				}
-				sub += fmt.Sprintf(",\r\n\"namespace\": %q", ns.Name)
-			}
-			bodyStr = fmt.Sprintf(test.request.body, sub)
-		}
-		test.request.body = bodyStr
-		bodyBytes := bytes.NewReader([]byte(bodyStr))
-		req, err := http.NewRequest(test.request.verb, s.URL+test.request.URL, bodyBytes)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-		if test.request.verb == "PATCH" {
-			req.Header.Set("Content-Type", "application/merge-patch+json")
-		}
-
-		func() {
-			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
+			previousResourceVersion := make(map[string]float64)
+			transport, err := rest.TransportFor(kubeConfig)
 			if err != nil {
-				t.Logf("case %v", test.name)
+				t.Fatal(err)
+			}
+
+			token := validTokenID + "." + validSecret
+			var bodyStr string
+			if test.request.body != "" {
+				sub := ""
+				if test.request.verb == "PUT" {
+					// For update operations, insert previous resource version
+					if resVersion := previousResourceVersion[getPreviousResourceVersionKey(test.request.URL, "")]; resVersion != 0 {
+						sub += fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
+					}
+					sub += fmt.Sprintf(",\r\n\"namespace\": %q", ns.Name)
+				}
+				bodyStr = fmt.Sprintf(test.request.body, sub)
+			}
+			test.request.body = bodyStr
+			bodyBytes := bytes.NewReader([]byte(bodyStr))
+			req, err := http.NewRequest(test.request.verb, kubeConfig.Host+test.request.URL, bodyBytes)
+			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			b, _ := ioutil.ReadAll(resp.Body)
-			if _, ok := test.request.statusCodes[resp.StatusCode]; !ok {
-				t.Logf("case %v", test.name)
-				t.Errorf("Expected status one of %v, but got %v", test.request.statusCodes, resp.StatusCode)
-				t.Errorf("Body: %v", string(b))
-			} else {
-				if test.request.verb == "POST" {
-					// For successful create operations, extract resourceVersion
-					id, currentResourceVersion, err := parseResourceVersion(b)
-					if err == nil {
-						key := getPreviousResourceVersionKey(test.request.URL, id)
-						previousResourceVersion[key] = currentResourceVersion
-					}
-				}
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+			if test.request.verb == "PATCH" {
+				req.Header.Set("Content-Type", "application/merge-patch+json")
 			}
 
-		}()
+			func() {
+				resp, err := transport.RoundTrip(req)
+				if err != nil {
+					t.Logf("case %v", test.name)
+					t.Fatalf("unexpected error: %v", err)
+				}
+				defer resp.Body.Close()
+				b, _ := io.ReadAll(resp.Body)
+				if _, ok := test.request.statusCodes[resp.StatusCode]; !ok {
+					t.Logf("case %v", test.name)
+					t.Errorf("Expected status one of %v, but got %v", test.request.statusCodes, resp.StatusCode)
+					t.Errorf("Body: %v", string(b))
+				} else {
+					if test.request.verb == "POST" {
+						// For successful create operations, extract resourceVersion
+						id, currentResourceVersion, err := parseResourceVersion(b)
+						if err == nil {
+							key := getPreviousResourceVersionKey(test.request.URL, id)
+							previousResourceVersion[key] = currentResourceVersion
+						}
+					}
+				}
+
+			}()
+		})
 	}
 }

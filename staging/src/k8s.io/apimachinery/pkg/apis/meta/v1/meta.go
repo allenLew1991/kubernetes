@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -55,14 +56,29 @@ type Object interface {
 	SetLabels(labels map[string]string)
 	GetAnnotations() map[string]string
 	SetAnnotations(annotations map[string]string)
-	GetInitializers() *Initializers
-	SetInitializers(initializers *Initializers)
 	GetFinalizers() []string
 	SetFinalizers(finalizers []string)
 	GetOwnerReferences() []OwnerReference
 	SetOwnerReferences([]OwnerReference)
-	GetClusterName() string
-	SetClusterName(clusterName string)
+	GetManagedFields() []ManagedFieldsEntry
+	SetManagedFields(managedFields []ManagedFieldsEntry)
+}
+
+// APIResult is an interface that represents the result of an API operation.
+type APIResult interface {
+	// Get returns the result as a runtime.Object, or an error if the operation failed.
+	// If Error() returns a non-nil error, Get will return nil, err.
+	Get() (runtime.Object, error)
+
+	// StatusCode returns the HTTP status code of the response and any error encountered.
+	// If Error() returns a non-nil error that prevented a response from being read (such as a network failure),
+	// StatusCode returns 0, err.
+	// If the error was returned from the server with an HTTP status code, StatusCode returns status, err.
+	// If the operation succeeded, StatusCode returns status, nil.
+	StatusCode() (int, error)
+
+	// Error returns the error executing the request, or nil if no error occurred.
+	Error() error
 }
 
 // ListMetaAccessor retrieves the list interface from an object
@@ -92,6 +108,15 @@ type ListInterface interface {
 	SetSelfLink(selfLink string)
 	GetContinue() string
 	SetContinue(c string)
+	GetRemainingItemCount() *int64
+	SetRemainingItemCount(c *int64)
+}
+
+// ShardedListInterface can be implemented by list types to indicate that they
+// represent a sharded subset of the full collection rather than the complete list.
+type ShardedListInterface interface {
+	GetShardInfo() *ShardInfo
+	SetShardInfo(*ShardInfo)
 }
 
 // Type exposes the type and APIVersion of versioned or internal API objects.
@@ -103,12 +128,18 @@ type Type interface {
 	SetKind(kind string)
 }
 
+var _ ListInterface = &ListMeta{}
+
 func (meta *ListMeta) GetResourceVersion() string        { return meta.ResourceVersion }
 func (meta *ListMeta) SetResourceVersion(version string) { meta.ResourceVersion = version }
 func (meta *ListMeta) GetSelfLink() string               { return meta.SelfLink }
 func (meta *ListMeta) SetSelfLink(selfLink string)       { meta.SelfLink = selfLink }
 func (meta *ListMeta) GetContinue() string               { return meta.Continue }
 func (meta *ListMeta) SetContinue(c string)              { meta.Continue = c }
+func (meta *ListMeta) GetRemainingItemCount() *int64     { return meta.RemainingItemCount }
+func (meta *ListMeta) SetRemainingItemCount(c *int64)    { meta.RemainingItemCount = c }
+func (meta *ListMeta) GetShardInfo() *ShardInfo          { return meta.ShardInfo }
+func (meta *ListMeta) SetShardInfo(s *ShardInfo)         { meta.ShardInfo = s }
 
 func (obj *TypeMeta) GetObjectKind() schema.ObjectKind { return obj }
 
@@ -150,7 +181,9 @@ func (meta *ObjectMeta) GetDeletionTimestamp() *Time { return meta.DeletionTimes
 func (meta *ObjectMeta) SetDeletionTimestamp(deletionTimestamp *Time) {
 	meta.DeletionTimestamp = deletionTimestamp
 }
-func (meta *ObjectMeta) GetDeletionGracePeriodSeconds() *int64 { return meta.DeletionGracePeriodSeconds }
+func (meta *ObjectMeta) GetDeletionGracePeriodSeconds() *int64 {
+	return meta.DeletionGracePeriodSeconds
+}
 func (meta *ObjectMeta) SetDeletionGracePeriodSeconds(deletionGracePeriodSeconds *int64) {
 	meta.DeletionGracePeriodSeconds = deletionGracePeriodSeconds
 }
@@ -158,59 +191,13 @@ func (meta *ObjectMeta) GetLabels() map[string]string                 { return m
 func (meta *ObjectMeta) SetLabels(labels map[string]string)           { meta.Labels = labels }
 func (meta *ObjectMeta) GetAnnotations() map[string]string            { return meta.Annotations }
 func (meta *ObjectMeta) SetAnnotations(annotations map[string]string) { meta.Annotations = annotations }
-func (meta *ObjectMeta) GetInitializers() *Initializers               { return meta.Initializers }
-func (meta *ObjectMeta) SetInitializers(initializers *Initializers)   { meta.Initializers = initializers }
 func (meta *ObjectMeta) GetFinalizers() []string                      { return meta.Finalizers }
 func (meta *ObjectMeta) SetFinalizers(finalizers []string)            { meta.Finalizers = finalizers }
-
-func (meta *ObjectMeta) GetOwnerReferences() []OwnerReference {
-	if meta.OwnerReferences == nil {
-		return nil
-	}
-	ret := make([]OwnerReference, len(meta.OwnerReferences))
-	for i := 0; i < len(meta.OwnerReferences); i++ {
-		ret[i].Kind = meta.OwnerReferences[i].Kind
-		ret[i].Name = meta.OwnerReferences[i].Name
-		ret[i].UID = meta.OwnerReferences[i].UID
-		ret[i].APIVersion = meta.OwnerReferences[i].APIVersion
-		if meta.OwnerReferences[i].Controller != nil {
-			value := *meta.OwnerReferences[i].Controller
-			ret[i].Controller = &value
-		}
-		if meta.OwnerReferences[i].BlockOwnerDeletion != nil {
-			value := *meta.OwnerReferences[i].BlockOwnerDeletion
-			ret[i].BlockOwnerDeletion = &value
-		}
-	}
-	return ret
-}
-
+func (meta *ObjectMeta) GetOwnerReferences() []OwnerReference         { return meta.OwnerReferences }
 func (meta *ObjectMeta) SetOwnerReferences(references []OwnerReference) {
-	if references == nil {
-		meta.OwnerReferences = nil
-		return
-	}
-	newReferences := make([]OwnerReference, len(references))
-	for i := 0; i < len(references); i++ {
-		newReferences[i].Kind = references[i].Kind
-		newReferences[i].Name = references[i].Name
-		newReferences[i].UID = references[i].UID
-		newReferences[i].APIVersion = references[i].APIVersion
-		if references[i].Controller != nil {
-			value := *references[i].Controller
-			newReferences[i].Controller = &value
-		}
-		if references[i].BlockOwnerDeletion != nil {
-			value := *references[i].BlockOwnerDeletion
-			newReferences[i].BlockOwnerDeletion = &value
-		}
-	}
-	meta.OwnerReferences = newReferences
+	meta.OwnerReferences = references
 }
-
-func (meta *ObjectMeta) GetClusterName() string {
-	return meta.ClusterName
-}
-func (meta *ObjectMeta) SetClusterName(clusterName string) {
-	meta.ClusterName = clusterName
+func (meta *ObjectMeta) GetManagedFields() []ManagedFieldsEntry { return meta.ManagedFields }
+func (meta *ObjectMeta) SetManagedFields(managedFields []ManagedFieldsEntry) {
+	meta.ManagedFields = managedFields
 }

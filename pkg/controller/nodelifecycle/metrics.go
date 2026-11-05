@@ -19,7 +19,8 @@ package nodelifecycle
 import (
 	"sync"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 )
 
 const (
@@ -27,41 +28,67 @@ const (
 	zoneHealthStatisticKey  = "zone_health"
 	zoneSizeKey             = "zone_size"
 	zoneNoUnhealthyNodesKey = "unhealthy_nodes_in_zone"
-	evictionsNumberKey      = "evictions_number"
+	evictionsTotalKey       = "evictions_total"
+
+	updateNodeHealthKey     = "update_node_health_duration_seconds"
+	updateAllNodesHealthKey = "update_all_nodes_health_duration_seconds"
 )
 
 var (
-	zoneHealth = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Subsystem: nodeControllerSubsystem,
-			Name:      zoneHealthStatisticKey,
-			Help:      "Gauge measuring percentage of healthy nodes per zone.",
+	zoneHealth = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           zoneHealthStatisticKey,
+			Help:           "Gauge measuring percentage of healthy nodes per zone.",
+			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"zone"},
 	)
-	zoneSize = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Subsystem: nodeControllerSubsystem,
-			Name:      zoneSizeKey,
-			Help:      "Gauge measuring number of registered Nodes per zones.",
+	zoneSize = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           zoneSizeKey,
+			Help:           "Gauge measuring number of registered Nodes per zones.",
+			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"zone"},
 	)
-	unhealthyNodes = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Subsystem: nodeControllerSubsystem,
-			Name:      zoneNoUnhealthyNodesKey,
-			Help:      "Gauge measuring number of not Ready Nodes per zones.",
+	unhealthyNodes = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           zoneNoUnhealthyNodesKey,
+			Help:           "Gauge measuring number of not Ready Nodes per zones.",
+			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"zone"},
 	)
-	evictionsNumber = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Subsystem: nodeControllerSubsystem,
-			Name:      evictionsNumberKey,
-			Help:      "Number of Node evictions that happened since current instance of NodeController started.",
+	evictionsTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           evictionsTotalKey,
+			Help:           "Number of Node evictions that happened since current instance of NodeController started.",
+			StabilityLevel: metrics.STABLE,
 		},
 		[]string{"zone"},
+	)
+
+	updateNodeHealthDuration = metrics.NewHistogram(
+		&metrics.HistogramOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           updateNodeHealthKey,
+			Help:           "Duration in seconds for NodeController to update the health of a single node.",
+			Buckets:        metrics.ExponentialBuckets(0.001, 4, 8), // 1ms -> ~15s
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+	updateAllNodesHealthDuration = metrics.NewHistogram(
+		&metrics.HistogramOpts{
+			Subsystem:      nodeControllerSubsystem,
+			Name:           updateAllNodesHealthKey,
+			Help:           "Duration in seconds for NodeController to update the health of all nodes.",
+			Buckets:        metrics.ExponentialBuckets(0.01, 4, 8), // 10ms -> ~3m
+			StabilityLevel: metrics.ALPHA,
+		},
 	)
 )
 
@@ -70,9 +97,11 @@ var registerMetrics sync.Once
 // Register the metrics that are to be monitored.
 func Register() {
 	registerMetrics.Do(func() {
-		prometheus.MustRegister(zoneHealth)
-		prometheus.MustRegister(zoneSize)
-		prometheus.MustRegister(unhealthyNodes)
-		prometheus.MustRegister(evictionsNumber)
+		legacyregistry.MustRegister(zoneHealth)
+		legacyregistry.MustRegister(zoneSize)
+		legacyregistry.MustRegister(unhealthyNodes)
+		legacyregistry.MustRegister(evictionsTotal)
+		legacyregistry.MustRegister(updateNodeHealthDuration)
+		legacyregistry.MustRegister(updateAllNodesHealthDuration)
 	})
 }

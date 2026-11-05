@@ -22,18 +22,20 @@ import (
 	"strings"
 
 	clientgentypes "k8s.io/code-generator/cmd/client-gen/types"
-	"k8s.io/gengo/generator"
-	"k8s.io/gengo/namer"
-	"k8s.io/gengo/types"
+	codegennamer "k8s.io/code-generator/pkg/namer"
+	"k8s.io/gengo/v2/generator"
+	"k8s.io/gengo/v2/namer"
+	"k8s.io/gengo/v2/types"
 )
 
 // genericGenerator generates the generic informer.
 type genericGenerator struct {
-	generator.DefaultGen
+	generator.GoGenerator
 	outputPackage        string
 	imports              namer.ImportTracker
 	groupVersions        map[string]clientgentypes.GroupVersions
 	groupGoNames         map[string]string
+	pluralExceptions     map[string]string
 	typesForGroupVersion map[clientgentypes.GroupVersion][]*types.Type
 	filtered             bool
 }
@@ -49,19 +51,16 @@ func (g *genericGenerator) Filter(c *generator.Context, t *types.Type) bool {
 }
 
 func (g *genericGenerator) Namers(c *generator.Context) namer.NameSystems {
-	pluralExceptions := map[string]string{
-		"Endpoints": "Endpoints",
-	}
 	return namer.NameSystems{
 		"raw":                namer.NewRawNamer(g.outputPackage, g.imports),
-		"allLowercasePlural": namer.NewAllLowercasePluralNamer(pluralExceptions),
-		"publicPlural":       namer.NewPublicPluralNamer(pluralExceptions),
+		"allLowercasePlural": namer.NewAllLowercasePluralNamer(g.pluralExceptions),
+		"publicPlural":       namer.NewPublicPluralNamer(g.pluralExceptions),
+		"resource":           codegennamer.NewTagOverrideNamer("resourceName", namer.NewAllLowercasePluralNamer(g.pluralExceptions)),
 	}
 }
 
 func (g *genericGenerator) Imports(c *generator.Context) (imports []string) {
 	imports = append(imports, g.imports.ImportLines()...)
-	imports = append(imports, "fmt")
 	return
 }
 
@@ -73,9 +72,11 @@ type group struct {
 
 type groupSort []group
 
-func (g groupSort) Len() int           { return len(g) }
-func (g groupSort) Less(i, j int) bool { return strings.ToLower(g[i].Name) < strings.ToLower(g[j].Name) }
-func (g groupSort) Swap(i, j int)      { g[i], g[j] = g[j], g[i] }
+func (g groupSort) Len() int { return len(g) }
+func (g groupSort) Less(i, j int) bool {
+	return strings.ToLower(g[i].Name) < strings.ToLower(g[j].Name)
+}
+func (g groupSort) Swap(i, j int) { g[i], g[j] = g[j], g[i] }
 
 type version struct {
 	Name      string
@@ -111,7 +112,9 @@ func (g *genericGenerator) GenerateType(c *generator.Context, t *types.Type, w i
 				GoName:    namer.IC(v.Version.NonEmpty()),
 				Resources: orderer.OrderTypes(g.typesForGroupVersion[gv]),
 			}
-			schemeGVs[version] = c.Universe.Variable(types.Name{Package: g.typesForGroupVersion[gv][0].Name.Package, Name: "SchemeGroupVersion"})
+			func() {
+				schemeGVs[version] = c.Universe.Variable(types.Name{Package: g.typesForGroupVersion[gv][0].Name.Package, Name: "SchemeGroupVersion"})
+			}()
 			group.Versions = append(group.Versions, version)
 		}
 		sort.Sort(versionSort(group.Versions))
@@ -123,6 +126,7 @@ func (g *genericGenerator) GenerateType(c *generator.Context, t *types.Type, w i
 		"cacheGenericLister":         c.Universe.Type(cacheGenericLister),
 		"cacheNewGenericLister":      c.Universe.Function(cacheNewGenericLister),
 		"cacheSharedIndexInformer":   c.Universe.Type(cacheSharedIndexInformer),
+		"fmtErrorf":                  c.Universe.Type(fmtErrorfFunc),
 		"groups":                     groups,
 		"schemeGVs":                  schemeGVs,
 		"schemaGroupResource":        c.Universe.Type(schemaGroupResource),
@@ -168,13 +172,13 @@ func (f *sharedInformerFactory) ForResource(resource {{.schemaGroupVersionResour
 			{{range $version := .Versions -}}
 	// Group={{$group.Name}}, Version={{.Name}}
 				{{range .Resources -}}
-	case {{index $.schemeGVs $version|raw}}.WithResource("{{.|allLowercasePlural}}"):
+	case {{index $.schemeGVs $version|raw}}.WithResource("{{.|resource}}"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.{{$GroupGoName}}().{{$version.GoName}}().{{.|publicPlural}}().Informer()}, nil
 				{{end}}
 			{{end}}
 		{{end -}}
 	}
 
-	return nil, fmt.Errorf("no informer found for %v", resource)
+	return nil, {{.fmtErrorf|raw}}("no informer found for %v", resource)
 }
 `

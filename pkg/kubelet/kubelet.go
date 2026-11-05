@@ -17,94 +17,136 @@ limitations under the License.
 package kubelet
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"path"
+	"path/filepath"
+	sysruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/glog"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
+	inuserns "github.com/moby/sys/userns"
+	"github.com/opencontainers/selinux/go-selinux"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"k8s.io/api/core/v1"
+	"k8s.io/client-go/informers"
+	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
+	"k8s.io/mount-utils"
+
+	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+	utilfs "k8s.io/kubernetes/pkg/util/filesystem"
+	utilpod "k8s.io/kubernetes/pkg/util/pod"
+	netutils "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	versionutil "k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/apiserver/pkg/server/flagz"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	coreinformersv1 "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/certificate"
 	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/client-go/util/integer"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/cloudprovider"
+	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/component-base/version"
+	"k8s.io/component-helpers/apimachinery/lease"
+	resourcehelper "k8s.io/component-helpers/resource"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	remote "k8s.io/cri-client/pkg"
+	"k8s.io/klog/v2"
+	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/features"
-	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
-	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig"
+	"k8s.io/kubernetes/pkg/kubelet/allocation"
+	"k8s.io/kubernetes/pkg/kubelet/allocation/state"
+	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/config"
+	"k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1"
+	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
+	"k8s.io/kubernetes/pkg/kubelet/apis/pods"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	kubeletcertificate "k8s.io/kubernetes/pkg/kubelet/certificate"
+	"k8s.io/kubernetes/pkg/kubelet/clustertrustbundle"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	"k8s.io/kubernetes/pkg/kubelet/configmap"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim"
-	dockerremote "k8s.io/kubernetes/pkg/kubelet/dockershim/remote"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
-	"k8s.io/kubernetes/pkg/kubelet/gpu"
-	"k8s.io/kubernetes/pkg/kubelet/gpu/nvidia"
 	"k8s.io/kubernetes/pkg/kubelet/images"
 	"k8s.io/kubernetes/pkg/kubelet/kubeletconfig"
 	"k8s.io/kubernetes/pkg/kubelet/kuberuntime"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/logs"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
-	"k8s.io/kubernetes/pkg/kubelet/network"
+	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
+	"k8s.io/kubernetes/pkg/kubelet/metrics/cri"
 	"k8s.io/kubernetes/pkg/kubelet/network/dns"
+	"k8s.io/kubernetes/pkg/kubelet/nodeshutdown"
+	oomwatcher "k8s.io/kubernetes/pkg/kubelet/oom"
 	"k8s.io/kubernetes/pkg/kubelet/pleg"
+	"k8s.io/kubernetes/pkg/kubelet/pluginmanager"
+	plugincache "k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	kubepod "k8s.io/kubernetes/pkg/kubelet/pod"
+	"k8s.io/kubernetes/pkg/kubelet/podcertificate"
 	"k8s.io/kubernetes/pkg/kubelet/preemption"
 	"k8s.io/kubernetes/pkg/kubelet/prober"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
-	"k8s.io/kubernetes/pkg/kubelet/remote"
-	"k8s.io/kubernetes/pkg/kubelet/rkt"
+	"k8s.io/kubernetes/pkg/kubelet/runtimeclass"
 	"k8s.io/kubernetes/pkg/kubelet/secret"
 	"k8s.io/kubernetes/pkg/kubelet/server"
+	servermetrics "k8s.io/kubernetes/pkg/kubelet/server/metrics"
 	serverstats "k8s.io/kubernetes/pkg/kubelet/server/stats"
-	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 	"k8s.io/kubernetes/pkg/kubelet/stats"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	"k8s.io/kubernetes/pkg/kubelet/sysctl"
+	"k8s.io/kubernetes/pkg/kubelet/token"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	"k8s.io/kubernetes/pkg/kubelet/userns"
+	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/kubernetes/pkg/kubelet/util/manager"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
 	"k8s.io/kubernetes/pkg/kubelet/util/sliceutils"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
+	"k8s.io/kubernetes/pkg/kubelet/watchdog"
+	httpprobe "k8s.io/kubernetes/pkg/probe/http"
 	"k8s.io/kubernetes/pkg/security/apparmor"
-	utildbus "k8s.io/kubernetes/pkg/util/dbus"
-	kubeio "k8s.io/kubernetes/pkg/util/io"
-	utilipt "k8s.io/kubernetes/pkg/util/iptables"
-	"k8s.io/kubernetes/pkg/util/mount"
-	nodeutil "k8s.io/kubernetes/pkg/util/node"
 	"k8s.io/kubernetes/pkg/util/oom"
 	"k8s.io/kubernetes/pkg/volume"
-	utilexec "k8s.io/utils/exec"
+	"k8s.io/kubernetes/pkg/volume/csi"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
+	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+	"k8s.io/utils/clock"
 )
 
 const (
@@ -114,26 +156,50 @@ const (
 	// nodeStatusUpdateRetry specifies how many times kubelet retries when posting node status failed.
 	nodeStatusUpdateRetry = 5
 
-	// ContainerLogsDir is the location of container logs.
-	ContainerLogsDir = "/var/log/containers"
+	// nodeReadyGracePeriod is the period to allow for before fast status update is
+	// terminated and container runtime not being ready is logged without verbosity guard.
+	nodeReadyGracePeriod = 120 * time.Second
 
-	// MaxContainerBackOff is the max backoff period, exported for the e2e test
-	MaxContainerBackOff = 300 * time.Second
+	// DefaultContainerLogsDir is the location of container logs.
+	DefaultContainerLogsDir = "/var/log/containers"
 
-	// Capacity of the channel for storing pods to kill. A small number should
-	// suffice because a goroutine is dedicated to check the channel and does
-	// not block on anything else.
-	podKillingChannelCapacity = 50
+	// MaxCrashLoopBackOff is the max backoff period for container restarts, exported for the e2e test
+	MaxCrashLoopBackOff = v1beta1.MaxContainerBackOff
+
+	// reducedMaxCrashLoopBackOff is the default max backoff period for container restarts when the alpha feature
+	// gate ReduceDefaultCrashLoopBackOffDecay is enabled
+	reducedMaxCrashLoopBackOff = 60 * time.Second
+
+	// Initial period for the exponential backoff for container restarts.
+	initialCrashLoopBackOff = time.Second * 10
+
+	// reducedInitialCrashLoopBackOff is the default initial backoff period for container restarts when the alpha feature
+	// gate ReduceDefaultCrashLoopBackOffDecay is enabled
+	reducedInitialCrashLoopBackOff = 1 * time.Second
+
+	// MaxImageBackOff is the max backoff period for image pulls, exported for the e2e test
+	MaxImageBackOff = 300 * time.Second
 
 	// Period for performing global cleanup tasks.
 	housekeepingPeriod = time.Second * 2
 
+	// Duration at which housekeeping failed to satisfy the invariant that
+	// housekeeping should be fast to avoid blocking pod config (while
+	// housekeeping is running no new pods are started or deleted).
+	housekeepingWarningDuration = time.Second * 1
+
+	// Period after which the runtime cache expires - set to slightly longer than
+	// the expected length between housekeeping periods, which explicitly refreshes
+	// the cache.
+	runtimeCacheRefreshPeriod = housekeepingPeriod + housekeepingWarningDuration
+
 	// Period for performing eviction monitoring.
-	// TODO ensure this is in sync with internal cadvisor housekeeping.
+	// ensure this is kept in sync with internal cadvisor housekeeping.
 	evictionMonitoringPeriod = time.Second * 10
 
 	// The path in containers' filesystems where the hosts file is mounted.
-	etcHostsPath = "/etc/hosts"
+	linuxEtcHostsPath   = "/etc/hosts"
+	windowsEtcHostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts"
 
 	// Capacity of the channel for receiving pod lifecycle events. This number
 	// is a bit arbitrary and may be adjusted in the future.
@@ -147,12 +213,18 @@ const (
 	// Note that even though we set the period to 1s, the relisting itself can
 	// take more than 1s to finish if the container runtime responds slowly
 	// and/or when there are many container changes in one cycle.
-	plegRelistPeriod = time.Second * 1
+	genericPlegRelistPeriod    = time.Second * 1
+	genericPlegRelistThreshold = time.Minute * 3
+
+	// Evented PLEG CRI stream retry limit.
+	eventedPlegMaxStreamRetries = 5
 
 	// backOffPeriod is the period to back off when pod syncing results in an
-	// error. It is also used as the base period for the exponential backoff
-	// container restarts and image pulls.
+	// error.
 	backOffPeriod = time.Second * 10
+
+	// Initial period for the exponential backoff for image pulls.
+	imageBackOffPeriod = time.Second * 10
 
 	// ContainerGCPeriod is the period for performing container garbage collection.
 	ContainerGCPeriod = time.Minute
@@ -161,16 +233,64 @@ const (
 
 	// Minimum number of dead containers to keep in a pod
 	minDeadContainerInPod = 1
+
+	// nodeLeaseRenewIntervalFraction is the fraction of lease duration to renew the lease
+	nodeLeaseRenewIntervalFraction = 0.25
+
+	// instrumentationScope is the name of OpenTelemetry instrumentation scope
+	instrumentationScope = "k8s.io/kubernetes/pkg/kubelet"
+
+	actuatedPodsStateFile = "actuated_pods_state"
 )
+
+var (
+	// ContainerLogsDir can be overwritten for testing usage
+	ContainerLogsDir = DefaultContainerLogsDir
+	etcHostsPath     = getContainerEtcHostsPath()
+
+	admissionRejectionReasons = sets.New[string](
+		lifecycle.AppArmorNotAdmittedReason,
+		lifecycle.PodOSSelectorNodeLabelDoesNotMatch,
+		lifecycle.PodOSNotSupported,
+		lifecycle.InvalidNodeInfo,
+		lifecycle.InitContainerRestartPolicyForbidden,
+		lifecycle.SupplementalGroupsPolicyNotSupported,
+		lifecycle.UnexpectedAdmissionError,
+		lifecycle.UnknownReason,
+		lifecycle.UnexpectedPredicateFailureType,
+		lifecycle.OutOfCPU,
+		lifecycle.OutOfMemory,
+		lifecycle.OutOfEphemeralStorage,
+		lifecycle.OutOfPods,
+		lifecycle.PodLevelResourcesNotAdmittedReason,
+		lifecycle.PodFeatureUnsupported,
+		tainttoleration.ErrReasonNotMatch,
+		eviction.Reason,
+		sysctl.ForbiddenReason,
+		topologymanager.ErrorTopologyAffinity,
+		nodeshutdown.NodeShutdownNotAdmittedReason,
+		volumemanager.VolumeAttachmentLimitExceededReason,
+	)
+
+	// This is exposed for unit tests.
+	goos = sysruntime.GOOS
+)
+
+func getContainerEtcHostsPath() string {
+	if goos == "windows" {
+		return windowsEtcHostsPath
+	}
+	return linuxEtcHostsPath
+}
 
 // SyncHandler is an interface implemented by Kubelet, for testability
 type SyncHandler interface {
-	HandlePodAdditions(pods []*v1.Pod)
-	HandlePodUpdates(pods []*v1.Pod)
-	HandlePodRemoves(pods []*v1.Pod)
-	HandlePodReconcile(pods []*v1.Pod)
-	HandlePodSyncs(pods []*v1.Pod)
-	HandlePodCleanups() error
+	HandlePodAdditions(ctx context.Context, pods []*v1.Pod)
+	HandlePodUpdates(ctx context.Context, pods []*v1.Pod)
+	HandlePodRemoves(ctx context.Context, pods []*v1.Pod)
+	HandlePodReconcile(ctx context.Context, pods []*v1.Pod)
+	HandlePodSyncs(ctx context.Context, pods []*v1.Pod)
+	HandlePodCleanups(ctx context.Context) error
 }
 
 // Option is a functional option type for Kubelet
@@ -180,44 +300,13 @@ type Option func(*Kubelet)
 type Bootstrap interface {
 	GetConfiguration() kubeletconfiginternal.KubeletConfiguration
 	BirthCry()
-	StartGarbageCollection()
-	ListenAndServe(address net.IP, port uint, tlsOptions *server.TLSOptions, auth server.AuthInterface, enableDebuggingHandlers, enableContentionProfiling bool)
-	ListenAndServeReadOnly(address net.IP, port uint)
-	Run(<-chan kubetypes.PodUpdate)
-	RunOnce(<-chan kubetypes.PodUpdate) ([]RunPodResult, error)
+	StartGarbageCollection(ctx context.Context)
+	ListenAndServe(ctx context.Context, kubeCfg *kubeletconfiginternal.KubeletConfiguration, tlsConfig *tls.Config, auth server.AuthInterface, tp trace.TracerProvider)
+	ListenAndServeReadOnly(ctx context.Context, address net.IP, port uint, tp trace.TracerProvider)
+	ListenAndServePodResources(ctx context.Context)
+	ListenAndServePods(ctx context.Context)
+	Run(ctx context.Context, updates <-chan kubetypes.PodUpdate)
 }
-
-// Builder creates and initializes a Kubelet instance
-type Builder func(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
-	kubeDeps *Dependencies,
-	crOptions *config.ContainerRuntimeOptions,
-	containerRuntime string,
-	runtimeCgroups string,
-	hostnameOverride string,
-	nodeIP string,
-	providerID string,
-	cloudProvider string,
-	certDirectory string,
-	rootDirectory string,
-	registerNode bool,
-	registerWithTaints []api.Taint,
-	allowedUnsafeSysctls []string,
-	remoteRuntimeEndpoint string,
-	remoteImageEndpoint string,
-	experimentalMounterPath string,
-	experimentalKernelMemcgNotification bool,
-	experimentalCheckNodeCapabilitiesBeforeMount bool,
-	experimentalNodeAllocatableIgnoreEvictionThreshold bool,
-	minimumGCAge metav1.Duration,
-	maxPerPodContainerCount int32,
-	maxContainerCount int32,
-	masterServiceNamespace string,
-	registerSchedulable bool,
-	nonMasqueradeCIDR string,
-	keepTerminatedPodVolumes bool,
-	nodeLabels map[string]string,
-	seccompProfileRoot string,
-	bootstrapCheckpointPath string) (Bootstrap, error)
 
 // Dependencies is a bin for things we might consider "injected dependencies" -- objects constructed
 // at runtime that are necessary for running the Kubelet. This is a temporary solution for grouping
@@ -226,185 +315,235 @@ type Dependencies struct {
 	Options []Option
 
 	// Injected Dependencies
-	Auth                    server.AuthInterface
-	CAdvisorInterface       cadvisor.Interface
-	Cloud                   cloudprovider.Interface
-	ContainerManager        cm.ContainerManager
-	DockerClientConfig      *dockershim.ClientConfig
-	EventClient             v1core.EventsGetter
-	HeartbeatClient         v1core.CoreV1Interface
-	KubeClient              clientset.Interface
-	ExternalKubeClient      clientset.Interface
-	Mounter                 mount.Interface
-	NetworkPlugins          []network.NetworkPlugin
-	OOMAdjuster             *oom.OOMAdjuster
-	OSInterface             kubecontainer.OSInterface
-	PodConfig               *config.PodConfig
-	Recorder                record.EventRecorder
-	Writer                  kubeio.Writer
-	VolumePlugins           []volume.VolumePlugin
-	DynamicPluginProber     volume.DynamicPluginProber
-	TLSOptions              *server.TLSOptions
-	KubeletConfigController *kubeletconfig.Controller
+	Flagz                     flagz.Reader
+	Auth                      server.AuthInterface
+	CAdvisorInterface         cadvisor.Interface
+	ContainerManager          cm.ContainerManager
+	EventClient               v1core.EventsGetter
+	HeartbeatClient           clientset.Interface
+	OnHeartbeatFailure        func()
+	KubeClient                clientset.Interface
+	Mounter                   mount.Interface
+	HostUtil                  hostutil.HostUtils
+	OOMAdjuster               *oom.OOMAdjuster
+	OSInterface               kubecontainer.OSInterface
+	PodConfig                 *config.PodConfig
+	ProbeManager              prober.Manager
+	Recorder                  record.EventRecorderLogger
+	Subpather                 subpath.Interface
+	TracerProvider            trace.TracerProvider
+	VolumePlugins             []volume.VolumePlugin
+	DynamicPluginProber       volume.DynamicPluginProber
+	TLSOptions                *server.TLSOptions
+	TLSConfig                 *tls.Config
+	RemoteRuntimeService      internalapi.RuntimeService
+	RemoteImageService        internalapi.ImageManagerService
+	PodStartupLatencyTracker  util.PodStartupLatencyTracker
+	NodeStartupLatencyTracker util.NodeStartupLatencyTracker
+	HealthChecker             watchdog.HealthChecker
+	// remove it after cadvisor.UsingLegacyCadvisorStats dropped.
+	useLegacyCadvisorStats bool
+	// PodSandboxStatsUnimplemented is set during init when the CRI does not
+	// support PodSandboxStats. It can be removed once
+	// PodAndContainerStatsFromCRI is GA and cadvisor stats are no longer
+	// used as a fallback.
+	PodSandboxStatsUnimplemented bool
 }
 
-// makePodSourceConfig creates a config.PodConfig from the given
-// KubeletConfiguration or returns an error.
-func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies, nodeName types.NodeName, bootstrapCheckpointPath string) (*config.PodConfig, error) {
+// newCrashLoopBackOff configures the backoff maximum to be used
+// by kubelet for container restarts depending on the alpha gates
+// and kubelet configuration set
+func newCrashLoopBackOff(kubeCfg *kubeletconfiginternal.KubeletConfiguration) (time.Duration, time.Duration) {
+	boMax := MaxCrashLoopBackOff
+	boInitial := initialCrashLoopBackOff
+	if utilfeature.DefaultFeatureGate.Enabled(features.ReduceDefaultCrashLoopBackOffDecay) {
+		boMax = reducedMaxCrashLoopBackOff
+		boInitial = reducedInitialCrashLoopBackOff
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletCrashLoopBackOffMax) {
+		// operator-invoked configuration always has precedence if valid
+		boMax = kubeCfg.CrashLoopBackOff.MaxContainerRestartPeriod.Duration
+		if boMax < boInitial {
+			boInitial = boMax
+		}
+	}
+	return boMax, boInitial
+}
+
+// staticPodURLHeaderAndKeys canonicalizes the StaticPodURLHeader config map
+// into an http.Header and a sorted slice of canonicalized header key names.
+func staticPodURLHeaderAndKeys(headers map[string][]string) (http.Header, []string) {
 	manifestURLHeader := make(http.Header)
-	if len(kubeCfg.ManifestURLHeader) > 0 {
-		for k, v := range kubeCfg.ManifestURLHeader {
+	if len(headers) > 0 {
+		for k, v := range headers {
 			for i := range v {
-				manifestURLHeader.Add(k, v[i])
+				manifestURLHeader.Add(k, v[i]) // Add canonicalizes k internally
 			}
 		}
 	}
+	// Collect keys from the header after Add has canonicalized them,
+	// avoiding the need for a separate http.CanonicalHeaderKey call.
+	keys := make([]string, 0, len(manifestURLHeader))
+	for k := range manifestURLHeader {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return manifestURLHeader, keys
+}
+
+func makePodSourceConfig(ctx context.Context, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies, nodeName types.NodeName, nodeHasSynced func() bool) (*config.PodConfig, error) {
+	logger := klog.FromContext(ctx)
+	manifestURLHeader, manifestURLHeaderKeys := staticPodURLHeaderAndKeys(kubeCfg.StaticPodURLHeader)
 
 	// source of all configuration
-	cfg := config.NewPodConfig(config.PodConfigNotificationIncremental, kubeDeps.Recorder)
+	cfg := config.NewPodConfig(kubeDeps.Recorder, kubeDeps.PodStartupLatencyTracker)
 
 	// define file config source
-	if kubeCfg.PodManifestPath != "" {
-		glog.Infof("Adding manifest path: %v", kubeCfg.PodManifestPath)
-		config.NewSourceFile(kubeCfg.PodManifestPath, nodeName, kubeCfg.FileCheckFrequency.Duration, cfg.Channel(kubetypes.FileSource))
+	if kubeCfg.StaticPodPath != "" {
+		logger.Info("Adding static pod path", "path", kubeCfg.StaticPodPath)
+		config.NewSourceFile(logger, kubeCfg.StaticPodPath, nodeName, kubeCfg.FileCheckFrequency.Duration, cfg.Channel(ctx, kubetypes.FileSource))
 	}
 
 	// define url config source
-	if kubeCfg.ManifestURL != "" {
-		glog.Infof("Adding manifest url %q with HTTP header %v", kubeCfg.ManifestURL, manifestURLHeader)
-		config.NewSourceURL(kubeCfg.ManifestURL, manifestURLHeader, nodeName, kubeCfg.HTTPCheckFrequency.Duration, cfg.Channel(kubetypes.HTTPSource))
-	}
-
-	// Restore from the checkpoint path
-	// NOTE: This MUST happen before creating the apiserver source
-	// below, or the checkpoint would override the source of truth.
-	updatechannel := cfg.Channel(kubetypes.ApiserverSource)
-	if bootstrapCheckpointPath != "" {
-		glog.Infof("Adding checkpoint path: %v", bootstrapCheckpointPath)
-		err := cfg.Restore(bootstrapCheckpointPath, updatechannel)
-		if err != nil {
-			return nil, err
-		}
+	if kubeCfg.StaticPodURL != "" {
+		logger.Info("Adding pod URL with HTTP headers", "URL", kubeCfg.StaticPodURL, "header", manifestURLHeaderKeys)
+		config.NewSourceURL(logger, kubeCfg.StaticPodURL, manifestURLHeader, nodeName, kubeCfg.HTTPCheckFrequency.Duration, cfg.Channel(ctx, kubetypes.HTTPSource))
 	}
 
 	if kubeDeps.KubeClient != nil {
-		glog.Infof("Watching apiserver")
-		config.NewSourceApiserver(kubeDeps.KubeClient, nodeName, updatechannel)
+		logger.Info("Adding apiserver pod source")
+		config.NewSourceApiserver(logger, kubeDeps.KubeClient, nodeName, nodeHasSynced, cfg.Channel(ctx, kubetypes.ApiserverSource))
 	}
 	return cfg, nil
 }
 
-func getRuntimeAndImageServices(remoteRuntimeEndpoint string, remoteImageEndpoint string, runtimeRequestTimeout metav1.Duration) (internalapi.RuntimeService, internalapi.ImageManagerService, error) {
-	rs, err := remote.NewRemoteRuntimeService(remoteRuntimeEndpoint, runtimeRequestTimeout.Duration)
-	if err != nil {
-		return nil, nil, err
+// PreInitRuntimeService will init runtime service before RunKubelet.
+func PreInitRuntimeService(ctx context.Context, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies) error {
+	remoteImageEndpoint := kubeCfg.ImageServiceEndpoint
+	if remoteImageEndpoint == "" && kubeCfg.ContainerRuntimeEndpoint != "" {
+		remoteImageEndpoint = kubeCfg.ContainerRuntimeEndpoint
 	}
-	is, err := remote.NewRemoteImageService(remoteImageEndpoint, runtimeRequestTimeout.Duration)
-	if err != nil {
-		return nil, nil, err
+	var err error
+	useStreaming := utilfeature.DefaultFeatureGate.Enabled(features.CRIListStreaming)
+	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeServiceBuilder().
+		WithEndpoint(kubeCfg.ContainerRuntimeEndpoint).
+		WithConnectionTimeout(kubeCfg.RuntimeRequestTimeout.Duration).
+		WithTracerProvider(kubeDeps.TracerProvider).
+		WithUseStreaming(useStreaming).
+		Build(ctx); err != nil {
+		return err
 	}
-	return rs, is, err
+	kubeDeps.RemoteRuntimeService = cri.NewInstrumentedRuntimeService(kubeDeps.RemoteRuntimeService)
+	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageServiceBuilder().
+		WithEndpoint(remoteImageEndpoint).
+		WithConnectionTimeout(kubeCfg.RuntimeRequestTimeout.Duration).
+		WithTracerProvider(kubeDeps.TracerProvider).
+		WithUseStreaming(useStreaming).
+		Build(ctx); err != nil {
+		return err
+	}
+	kubeDeps.RemoteImageService = cri.NewInstrumentedImageManagerService(kubeDeps.RemoteImageService)
+
+	kubeDeps.useLegacyCadvisorStats = cadvisor.UsingLegacyCadvisorStats(kubeCfg.ContainerRuntimeEndpoint)
+
+	return nil
+}
+
+// newNodeHasSyncedFunc returns an InformerSynced that reports true only once the
+// node object for this kubelet is present in the informer cache.
+func newNodeHasSyncedFunc(nodeLister corelisters.NodeLister, nodeName types.NodeName) cache.InformerSynced {
+	var synced atomic.Bool
+	return func() bool {
+		if synced.Load() {
+			return true
+		}
+		if _, err := nodeLister.Get(string(nodeName)); err == nil {
+			synced.Store(true)
+			return true
+		}
+		return false
+	}
 }
 
 // NewMainKubelet instantiates a new Kubelet object along with all the required internal modules.
 // No initialization of Kubelet and its modules should happen here.
-func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+func NewMainKubelet(ctx context.Context,
+	kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	kubeDeps *Dependencies,
-	crOptions *config.ContainerRuntimeOptions,
-	containerRuntime string,
-	runtimeCgroups string,
-	hostnameOverride string,
-	nodeIP string,
+	crOptions *kubeletconfig.ContainerRuntimeOptions,
+	hostname string,
+	nodeName types.NodeName,
+	nodeIPs []net.IP,
 	providerID string,
 	cloudProvider string,
 	certDirectory string,
 	rootDirectory string,
+	podLogsDirectory string,
+	imageCredentialProviderConfigPath string,
+	imageCredentialProviderBinDir string,
 	registerNode bool,
-	registerWithTaints []api.Taint,
+	registerWithTaints []v1.Taint,
 	allowedUnsafeSysctls []string,
-	remoteRuntimeEndpoint string,
-	remoteImageEndpoint string,
 	experimentalMounterPath string,
-	experimentalKernelMemcgNotification bool,
-	experimentalCheckNodeCapabilitiesBeforeMount bool,
+	kernelMemcgNotification bool,
 	experimentalNodeAllocatableIgnoreEvictionThreshold bool,
 	minimumGCAge metav1.Duration,
 	maxPerPodContainerCount int32,
 	maxContainerCount int32,
-	masterServiceNamespace string,
-	registerSchedulable bool,
-	nonMasqueradeCIDR string,
-	keepTerminatedPodVolumes bool,
 	nodeLabels map[string]string,
-	seccompProfileRoot string,
-	bootstrapCheckpointPath string) (*Kubelet, error) {
+	nodeStatusMaxImages int32,
+	seccompDefault bool,
+) (*Kubelet, error) {
+	logger := klog.FromContext(ctx)
+
 	if rootDirectory == "" {
 		return nil, fmt.Errorf("invalid root directory %q", rootDirectory)
+	}
+	if podLogsDirectory == "" {
+		return nil, errors.New("pod logs root directory is empty")
 	}
 	if kubeCfg.SyncFrequency.Duration <= 0 {
 		return nil, fmt.Errorf("invalid sync frequency %d", kubeCfg.SyncFrequency.Duration)
 	}
 
-	if kubeCfg.MakeIPTablesUtilChains {
-		if kubeCfg.IPTablesMasqueradeBit > 31 || kubeCfg.IPTablesMasqueradeBit < 0 {
-			return nil, fmt.Errorf("iptables-masquerade-bit is not valid. Must be within [0, 31]")
-		}
-		if kubeCfg.IPTablesDropBit > 31 || kubeCfg.IPTablesDropBit < 0 {
-			return nil, fmt.Errorf("iptables-drop-bit is not valid. Must be within [0, 31]")
-		}
-		if kubeCfg.IPTablesDropBit == kubeCfg.IPTablesMasqueradeBit {
-			return nil, fmt.Errorf("iptables-masquerade-bit and iptables-drop-bit must be different")
-		}
+	if !cloudprovider.IsExternal(cloudProvider) && len(cloudProvider) != 0 {
+		cloudprovider.DisableWarningForProvider(cloudProvider)
+		return nil, cloudprovider.ErrorForDisabledProvider(cloudProvider)
 	}
 
-	hostname := nodeutil.GetHostname(hostnameOverride)
-	// Query the cloud provider for our node name, default to hostname
-	nodeName := types.NodeName(hostname)
-	cloudIPs := []net.IP{}
-	cloudNames := []string{}
-	if kubeDeps.Cloud != nil {
-		var err error
-		instances, ok := kubeDeps.Cloud.Instances()
-		if !ok {
-			return nil, fmt.Errorf("failed to get instances from cloud provider")
-		}
+	var nodeHasSynced cache.InformerSynced
+	var nodeInformer coreinformersv1.NodeInformer
+	var nodeLister corelisters.NodeLister
 
-		nodeName, err = instances.CurrentNodeName(hostname)
-		if err != nil {
-			return nil, fmt.Errorf("error fetching current instance name from cloud provider: %v", err)
-		}
-
-		glog.V(2).Infof("cloud provider determined current node name to be %s", nodeName)
-
-		if utilfeature.DefaultFeatureGate.Enabled(features.RotateKubeletServerCertificate) {
-			nodeAddresses, err := instances.NodeAddresses(nodeName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get the addresses of the current instance from the cloud provider: %v", err)
-			}
-			for _, nodeAddress := range nodeAddresses {
-				switch nodeAddress.Type {
-				case v1.NodeExternalIP, v1.NodeInternalIP:
-					ip := net.ParseIP(nodeAddress.Address)
-					if ip != nil && !ip.IsLoopback() {
-						cloudIPs = append(cloudIPs, ip)
-					}
-				case v1.NodeExternalDNS, v1.NodeInternalDNS, v1.NodeHostName:
-					cloudNames = append(cloudNames, nodeAddress.Address)
-				}
-			}
-		}
-
+	// If kubeClient == nil, we are running in standalone mode (i.e. no API servers)
+	// If not nil, we are running as part of a cluster and should sync w/API
+	if kubeDeps.KubeClient != nil {
+		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.Set{metav1.ObjectNameField: string(nodeName)}.String()
+		}))
+		nodeInformer = kubeInformers.Core().V1().Nodes()
+		nodeLister = nodeInformer.Lister()
+		nodeHasSynced = newNodeHasSyncedFunc(nodeLister, nodeName)
+		kubeInformers.StartWithContext(ctx)
+		logger.Info("Attempting to sync node with API server")
+	} else {
+		// we don't have a client to sync!
+		nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		nodeLister = corelisters.NewNodeLister(nodeIndexer)
+		nodeHasSynced = func() bool { return true }
+		logger.Info("Kubelet is running in standalone mode, will skip API server sync")
 	}
 
 	if kubeDeps.PodConfig == nil {
 		var err error
-		kubeDeps.PodConfig, err = makePodSourceConfig(kubeCfg, kubeDeps, nodeName, bootstrapCheckpointPath)
+		kubeDeps.PodConfig, err = makePodSourceConfig(ctx, kubeCfg, kubeDeps, nodeName, nodeHasSynced)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	containerGCPolicy := kubecontainer.ContainerGCPolicy{
+	containerGCPolicy := kubecontainer.GCPolicy{
 		MinAge:             minimumGCAge.Duration,
 		MaxPerPodContainer: int(maxPerPodContainerCount),
 		MaxContainers:      int(maxContainerCount),
@@ -420,6 +559,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		LowThresholdPercent:  int(kubeCfg.ImageGCLowThresholdPercent),
 	}
 
+	imageGCPolicy.MaxAge = kubeCfg.ImageMaximumGCAge.Duration
+
 	enforceNodeAllocatable := kubeCfg.EnforceNodeAllocatable
 	if experimentalNodeAllocatableIgnoreEvictionThreshold {
 		// Do not provide kubeCfg.EnforceNodeAllocatable to eviction threshold parsing if we are not enforcing Evictions
@@ -433,306 +574,358 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		PressureTransitionPeriod: kubeCfg.EvictionPressureTransitionPeriod.Duration,
 		MaxPodGracePeriodSeconds: int64(kubeCfg.EvictionMaxPodGracePeriod),
 		Thresholds:               thresholds,
-		KernelMemcgNotification:  experimentalKernelMemcgNotification,
+		KernelMemcgNotification:  kernelMemcgNotification,
+		PodCgroupRoot:            kubeDeps.ContainerManager.GetPodCgroupRoot(),
 	}
 
-	serviceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	var serviceLister corelisters.ServiceLister
+	var serviceHasSynced cache.InformerSynced
 	if kubeDeps.KubeClient != nil {
-		serviceLW := cache.NewListWatchFromClient(kubeDeps.KubeClient.CoreV1().RESTClient(), "services", metav1.NamespaceAll, fields.Everything())
-		r := cache.NewReflector(serviceLW, &v1.Service{}, serviceIndexer, 0)
-		go r.Run(wait.NeverStop)
+		// don't watch headless services, they are not needed since this informer is only used to create the environment variables for pods.
+		// See https://issues.k8s.io/122394
+		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermNotEqualSelector("spec.clusterIP", v1.ClusterIPNone).String()
+		}))
+		serviceLister = kubeInformers.Core().V1().Services().Lister()
+		serviceHasSynced = kubeInformers.Core().V1().Services().Informer().HasSynced
+		kubeInformers.StartWithContext(ctx)
+	} else {
+		serviceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+		serviceLister = corelisters.NewServiceLister(serviceIndexer)
+		serviceHasSynced = func() bool { return true }
 	}
-	serviceLister := corelisters.NewServiceLister(serviceIndexer)
 
-	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	if kubeDeps.KubeClient != nil {
-		fieldSelector := fields.Set{api.ObjectNameField: string(nodeName)}.AsSelector()
-		nodeLW := cache.NewListWatchFromClient(kubeDeps.KubeClient.CoreV1().RESTClient(), "nodes", metav1.NamespaceAll, fieldSelector)
-		r := cache.NewReflector(nodeLW, &v1.Node{}, nodeIndexer, 0)
-		go r.Run(wait.NeverStop)
-	}
-	nodeInfo := &predicates.CachedNodeInfo{NodeLister: corelisters.NewNodeLister(nodeIndexer)}
-
-	// TODO: get the real node object of ourself,
-	// and use the real node name and UID.
-	// TODO: what is namespace for node?
+	// construct a node reference used for events
 	nodeRef := &v1.ObjectReference{
-		Kind:      "Node",
-		Name:      string(nodeName),
-		UID:       types.UID(nodeName),
-		Namespace: "",
+		APIVersion: "v1",
+		Kind:       "Node",
+		Name:       string(nodeName),
+		Namespace:  "",
 	}
 
-	containerRefManager := kubecontainer.NewRefManager()
-
-	oomWatcher := NewOOMWatcher(kubeDeps.CAdvisorInterface, kubeDeps.Recorder)
+	oomWatcher, err := oomwatcher.NewWatcher(kubeDeps.Recorder)
+	if err != nil {
+		if inuserns.RunningInUserNS() {
+			if utilfeature.DefaultFeatureGate.Enabled(features.KubeletInUserNamespace) {
+				// oomwatcher.NewWatcher returns "open /dev/kmsg: operation not permitted" error,
+				// when running in a user namespace with sysctl value `kernel.dmesg_restrict=1`.
+				logger.V(2).Info("Failed to create an oomWatcher (running in UserNS, ignoring)", "err", err)
+				oomWatcher = nil
+			} else {
+				logger.Error(err, "Failed to create an oomWatcher (running in UserNS, Hint: enable KubeletInUserNamespace feature flag to ignore the error)")
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
 
 	clusterDNS := make([]net.IP, 0, len(kubeCfg.ClusterDNS))
 	for _, ipEntry := range kubeCfg.ClusterDNS {
-		ip := net.ParseIP(ipEntry)
+		ip := netutils.ParseIPSloppy(ipEntry)
 		if ip == nil {
-			glog.Warningf("Invalid clusterDNS ip '%q'", ipEntry)
+			logger.Info("Invalid clusterDNS IP", "IP", ipEntry)
 		} else {
 			clusterDNS = append(clusterDNS, ip)
 		}
 	}
-	httpClient := &http.Client{}
-	parsedNodeIP := net.ParseIP(nodeIP)
+
+	// A TLS transport is needed to make HTTPS-based container lifecycle requests,
+	// but we do not have the information necessary to do TLS verification.
+	//
+	// This client must not be modified to include credentials, because it is
+	// critical that credentials not leak from the client to arbitrary hosts.
+	insecureContainerLifecycleHTTPClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		CheckRedirect: httpprobe.RedirectChecker(false),
+	}
+
+	tracer := kubeDeps.TracerProvider.Tracer(instrumentationScope)
 
 	klet := &Kubelet{
-		hostname:                       hostname,
-		nodeName:                       nodeName,
-		kubeClient:                     kubeDeps.KubeClient,
-		heartbeatClient:                kubeDeps.HeartbeatClient,
-		rootDirectory:                  rootDirectory,
-		resyncInterval:                 kubeCfg.SyncFrequency.Duration,
-		sourcesReady:                   config.NewSourcesReady(kubeDeps.PodConfig.SeenAllSources),
-		registerNode:                   registerNode,
-		registerWithTaints:             registerWithTaints,
-		registerSchedulable:            registerSchedulable,
-		dnsConfigurer:                  dns.NewConfigurer(kubeDeps.Recorder, nodeRef, parsedNodeIP, clusterDNS, kubeCfg.ClusterDomain, kubeCfg.ResolverConfig),
-		serviceLister:                  serviceLister,
-		nodeInfo:                       nodeInfo,
-		masterServiceNamespace:         masterServiceNamespace,
-		streamingConnectionIdleTimeout: kubeCfg.StreamingConnectionIdleTimeout.Duration,
-		recorder:                       kubeDeps.Recorder,
-		cadvisor:                       kubeDeps.CAdvisorInterface,
-		cloud:                          kubeDeps.Cloud,
-		externalCloudProvider:     cloudprovider.IsExternal(cloudProvider),
-		providerID:                providerID,
-		nodeRef:                   nodeRef,
-		nodeLabels:                nodeLabels,
-		nodeStatusUpdateFrequency: kubeCfg.NodeStatusUpdateFrequency.Duration,
-		os:                   kubeDeps.OSInterface,
-		oomWatcher:           oomWatcher,
-		cgroupsPerQOS:        kubeCfg.CgroupsPerQOS,
-		cgroupRoot:           kubeCfg.CgroupRoot,
-		mounter:              kubeDeps.Mounter,
-		writer:               kubeDeps.Writer,
-		maxPods:              int(kubeCfg.MaxPods),
-		podsPerCore:          int(kubeCfg.PodsPerCore),
-		syncLoopMonitor:      atomic.Value{},
-		daemonEndpoints:      daemonEndpoints,
-		containerManager:     kubeDeps.ContainerManager,
-		containerRuntimeName: containerRuntime,
-		nodeIP:               parsedNodeIP,
-		clock:                clock.RealClock{},
-		enableControllerAttachDetach:            kubeCfg.EnableControllerAttachDetach,
-		iptClient:                               utilipt.New(utilexec.New(), utildbus.New(), utilipt.ProtocolIpv4),
-		makeIPTablesUtilChains:                  kubeCfg.MakeIPTablesUtilChains,
-		iptablesMasqueradeBit:                   int(kubeCfg.IPTablesMasqueradeBit),
-		iptablesDropBit:                         int(kubeCfg.IPTablesDropBit),
-		experimentalHostUserNamespaceDefaulting: utilfeature.DefaultFeatureGate.Enabled(features.ExperimentalHostUserNamespaceDefaultingGate),
-		keepTerminatedPodVolumes:                keepTerminatedPodVolumes,
+		hostname:                     hostname,
+		nodeName:                     nodeName,
+		kubeClient:                   kubeDeps.KubeClient,
+		heartbeatClient:              kubeDeps.HeartbeatClient,
+		onRepeatedHeartbeatFailure:   kubeDeps.OnHeartbeatFailure,
+		rootDirectory:                filepath.Clean(rootDirectory),
+		podLogsDirectory:             podLogsDirectory,
+		resyncInterval:               kubeCfg.SyncFrequency.Duration,
+		sourcesReady:                 config.NewSourcesReady(kubeDeps.PodConfig.SourcesReadyFn(logger)),
+		registerNode:                 registerNode,
+		registerWithTaints:           registerWithTaints,
+		dnsConfigurer:                dns.NewConfigurer(kubeDeps.Recorder, nodeRef, nodeIPs, clusterDNS, kubeCfg.ClusterDomain, kubeCfg.ResolverConfig),
+		serviceLister:                serviceLister,
+		serviceHasSynced:             serviceHasSynced,
+		nodeLister:                   nodeLister,
+		nodeHasSynced:                nodeHasSynced,
+		recorder:                     kubeDeps.Recorder,
+		cadvisor:                     kubeDeps.CAdvisorInterface,
+		externalCloudProvider:        cloudprovider.IsExternal(cloudProvider),
+		providerID:                   providerID,
+		nodeRef:                      nodeRef,
+		nodeLabels:                   nodeLabels,
+		nodeStatusUpdateFrequency:    kubeCfg.NodeStatusUpdateFrequency.Duration,
+		nodeStatusReportFrequency:    kubeCfg.NodeStatusReportFrequency.Duration,
+		os:                           kubeDeps.OSInterface,
+		oomWatcher:                   oomWatcher,
+		cgroupsPerQOS:                kubeCfg.CgroupsPerQOS,
+		cgroupRoot:                   kubeCfg.CgroupRoot,
+		mounter:                      kubeDeps.Mounter,
+		hostutil:                     kubeDeps.HostUtil,
+		subpather:                    kubeDeps.Subpather,
+		maxPods:                      int(kubeCfg.MaxPods),
+		podsPerCore:                  int(kubeCfg.PodsPerCore),
+		syncLoopMonitor:              atomic.Value{},
+		daemonEndpoints:              daemonEndpoints,
+		containerManager:             kubeDeps.ContainerManager,
+		nodeIPs:                      nodeIPs,
+		nodeIPValidator:              validateNodeIP,
+		clock:                        clock.RealClock{},
+		enableControllerAttachDetach: kubeCfg.EnableControllerAttachDetach,
+		makeIPTablesUtilChains:       kubeCfg.MakeIPTablesUtilChains,
+		nodeStatusMaxImages:          nodeStatusMaxImages,
+		pluginManagerStopCh:          wait.NeverStop,
+		tracer:                       tracer,
+		nodeStartupLatencyTracker:    kubeDeps.NodeStartupLatencyTracker,
+		podStartupLatencyTracker:     kubeDeps.PodStartupLatencyTracker,
+		healthChecker:                kubeDeps.HealthChecker,
+		flagz:                        kubeDeps.Flagz,
 	}
 
-	secretManager := secret.NewCachingSecretManager(
-		kubeDeps.KubeClient, secret.GetObjectTTLFromNodeFunc(klet.GetNode))
-	klet.secretManager = secretManager
+	var secretManager secret.Manager
+	var configMapManager configmap.Manager
+	if klet.kubeClient != nil {
+		switch kubeCfg.ConfigMapAndSecretChangeDetectionStrategy {
+		case kubeletconfiginternal.WatchChangeDetectionStrategy:
+			secretManager = secret.NewWatchingSecretManager(ctx, klet.kubeClient, klet.resyncInterval)
+			configMapManager = configmap.NewWatchingConfigMapManager(ctx, klet.kubeClient, klet.resyncInterval)
+		case kubeletconfiginternal.TTLCacheChangeDetectionStrategy:
+			secretManager = secret.NewCachingSecretManager(
+				ctx, klet.kubeClient, manager.GetObjectTTLFromNodeFunc(ctx, klet.GetNode))
+			configMapManager = configmap.NewCachingConfigMapManager(
+				ctx, klet.kubeClient, manager.GetObjectTTLFromNodeFunc(ctx, klet.GetNode))
+		case kubeletconfiginternal.GetChangeDetectionStrategy:
+			secretManager = secret.NewSimpleSecretManager(klet.kubeClient)
+			configMapManager = configmap.NewSimpleConfigMapManager(klet.kubeClient)
+		default:
+			return nil, fmt.Errorf("unknown configmap and secret manager mode: %v", kubeCfg.ConfigMapAndSecretChangeDetectionStrategy)
+		}
 
-	configMapManager := configmap.NewCachingConfigMapManager(
-		kubeDeps.KubeClient, configmap.GetObjectTTLFromNodeFunc(klet.GetNode))
-	klet.configMapManager = configMapManager
-
-	if klet.experimentalHostUserNamespaceDefaulting {
-		glog.Infof("Experimental host user namespace defaulting is enabled.")
+		klet.secretManager = secretManager
+		klet.configMapManager = configMapManager
 	}
 
-	hairpinMode, err := effectiveHairpinMode(kubeletconfiginternal.HairpinMode(kubeCfg.HairpinMode), containerRuntime, crOptions.NetworkPluginName)
-	if err != nil {
-		// This is a non-recoverable error. Returning it up the callstack will just
-		// lead to retries of the same failure, so just fail hard.
-		glog.Fatalf("Invalid hairpin mode: %v", err)
-	}
-	glog.Infof("Hairpin mode set to %q", hairpinMode)
-
-	plug, err := network.InitNetworkPlugin(kubeDeps.NetworkPlugins, crOptions.NetworkPluginName, &criNetworkHost{&networkHost{klet}, &network.NoopPortMappingGetter{}}, hairpinMode, nonMasqueradeCIDR, int(crOptions.NetworkPluginMTU))
+	machineInfo, err := klet.cadvisor.MachineInfo(logger)
 	if err != nil {
 		return nil, err
 	}
-	klet.networkPlugin = plug
+	// Avoid collector collects it as a timestamped metric
+	// See PR #95210 and #97006 for more details.
+	machineInfo.Timestamp = time.Time{}
+	klet.setCachedMachineInfo(machineInfo)
 
-	machineInfo, err := klet.GetCachedMachineInfo()
-	if err != nil {
-		return nil, err
-	}
-
-	imageBackOff := flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
+	imageBackOff := flowcontrol.NewBackOff(imageBackOffPeriod, MaxImageBackOff)
 
 	klet.livenessManager = proberesults.NewManager()
+	klet.readinessManager = proberesults.NewManager()
+	klet.startupManager = proberesults.NewManager()
+	podCache := kubecontainer.NewCache()
+	klet.podCache = podCache
 
-	klet.podCache = kubecontainer.NewCache()
-	// podManager is also responsible for keeping secretManager and configMapManager contents up-to-date.
-	klet.podManager = kubepod.NewBasicPodManager(kubepod.NewBasicMirrorClient(klet.kubeClient), secretManager, configMapManager)
+	klet.mirrorPodClient = kubepod.NewBasicMirrorClient(klet.kubeClient, string(nodeName), nodeLister)
+	klet.podManager = kubepod.NewBasicPodManager()
 
-	if remoteRuntimeEndpoint != "" {
-		// remoteImageEndpoint is same as remoteRuntimeEndpoint if not explicitly specified
-		if remoteImageEndpoint == "" {
-			remoteImageEndpoint = remoteRuntimeEndpoint
-		}
+	klet.statusManager = status.NewManager(klet.kubeClient, klet.podManager, klet, kubeDeps.PodStartupLatencyTracker)
+
+	broadcaster := pods.NewBroadcaster(ctx)
+	klet.podsServer = pods.NewPodsServer(broadcaster, klet.podManager, klet.statusManager, klet.sourcesReady)
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodsAPI) {
+		klet.statusManager.AddPodUpdateNotifier(klet.podsServer)
+	}
+	klet.allocationManager = allocation.NewManager(
+		klet.getRootDir(),
+		klet.statusManager,
+		klet,
+		klet.sourcesReady,
+		kubeDeps.Recorder,
+		logger,
+	)
+
+	klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(ctx, klet, kubeCfg.VolumeStatsAggPeriod.Duration, kubeDeps.Recorder)
+	klet.runtimeService = kubeDeps.RemoteRuntimeService
+
+	if kubeDeps.KubeClient != nil {
+		klet.runtimeClassManager = runtimeclass.NewManager(kubeDeps.KubeClient)
 	}
 
-	// TODO: These need to become arguments to a standalone docker shim.
-	pluginSettings := dockershim.NetworkPluginSettings{
-		HairpinMode:       hairpinMode,
-		NonMasqueradeCIDR: nonMasqueradeCIDR,
-		PluginName:        crOptions.NetworkPluginName,
-		PluginConfDir:     crOptions.CNIConfDir,
-		PluginBinDir:      crOptions.CNIBinDir,
-		MTU:               int(crOptions.NetworkPluginMTU),
+	// setup containerLogManager for CRI container runtime
+	containerLogManager, err := logs.NewContainerLogManager(
+		logger.WithName("ContainerLogManager"),
+		klet.runtimeService,
+		kubeDeps.OSInterface,
+		kubeCfg.ContainerLogMaxSize,
+		int(kubeCfg.ContainerLogMaxFiles),
+		int(kubeCfg.ContainerLogMaxWorkers),
+		kubeCfg.ContainerLogMonitorInterval,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize container log manager: %v", err)
 	}
+	klet.containerLogManager = containerLogManager
 
-	klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(klet, kubeCfg.VolumeStatsAggPeriod.Duration)
+	klet.reasonCache = NewReasonCache()
+	klet.workQueue = queue.NewBasicWorkQueue(klet.clock)
+	klet.podWorkers = newPodWorkers(
+		klet,
+		kubeDeps.Recorder,
+		klet.workQueue,
+		klet.resyncInterval,
+		backOffPeriod,
+		klet.podCache,
+		klet.allocationManager,
+	)
 
-	// Remote runtime shim just cannot talk back to kubelet, so it doesn't
-	// support bandwidth shaping or hostports till #35457. To enable legacy
-	// features, replace with networkHost.
-	var nl *NoOpLegacyHost
-	pluginSettings.LegacyRuntimeHost = nl
-
-	// rktnetes cannot be run with CRI.
-	if containerRuntime != kubetypes.RktContainerRuntime {
-		// kubelet defers to the runtime shim to setup networking. Setting
-		// this to nil will prevent it from trying to invoke the plugin.
-		// It's easier to always probe and initialize plugins till cri
-		// becomes the default.
-		klet.networkPlugin = nil
-		// if left at nil, that means it is unneeded
-		var legacyLogProvider kuberuntime.LegacyLogProvider
-
-		switch containerRuntime {
-		case kubetypes.DockerContainerRuntime:
-			// Create and start the CRI shim running as a grpc server.
-			streamingConfig := getStreamingConfig(kubeCfg, kubeDeps)
-			ds, err := dockershim.NewDockerService(kubeDeps.DockerClientConfig, crOptions.PodSandboxImage, streamingConfig,
-				&pluginSettings, runtimeCgroups, kubeCfg.CgroupDriver, crOptions.DockershimRootDirectory,
-				crOptions.DockerDisableSharedPID)
-			if err != nil {
-				return nil, err
-			}
-			if err := ds.Start(); err != nil {
-				return nil, err
-			}
-			// For now, the CRI shim redirects the streaming requests to the
-			// kubelet, which handles the requests using DockerService..
-			klet.criHandler = ds
-
-			// The unix socket for kubelet <-> dockershim communication.
-			glog.V(5).Infof("RemoteRuntimeEndpoint: %q, RemoteImageEndpoint: %q",
-				remoteRuntimeEndpoint,
-				remoteImageEndpoint)
-			glog.V(2).Infof("Starting the GRPC server for the docker CRI shim.")
-			server := dockerremote.NewDockerServer(remoteRuntimeEndpoint, ds)
-			if err := server.Start(); err != nil {
-				return nil, err
-			}
-
-			// Create dockerLegacyService when the logging driver is not supported.
-			supported, err := ds.IsCRISupportedLogDriver()
-			if err != nil {
-				return nil, err
-			}
-			if !supported {
-				klet.dockerLegacyService = ds.NewDockerLegacyService()
-				legacyLogProvider = dockershim.NewLegacyLogProvider(klet.dockerLegacyService)
-			}
-		case kubetypes.RemoteContainerRuntime:
-			// No-op.
-			break
-		default:
-			return nil, fmt.Errorf("unsupported CRI runtime: %q", containerRuntime)
-		}
-		runtimeService, imageService, err := getRuntimeAndImageServices(remoteRuntimeEndpoint, remoteImageEndpoint, kubeCfg.RuntimeRequestTimeout)
-		if err != nil {
-			return nil, err
-		}
-		klet.runtimeService = runtimeService
-		runtime, err := kuberuntime.NewKubeGenericRuntimeManager(
-			kubecontainer.FilterEventRecorder(kubeDeps.Recorder),
-			klet.livenessManager,
-			seccompProfileRoot,
-			containerRefManager,
-			machineInfo,
-			klet,
-			kubeDeps.OSInterface,
-			klet,
-			httpClient,
-			imageBackOff,
-			kubeCfg.SerializeImagePulls,
-			float32(kubeCfg.RegistryPullQPS),
-			int(kubeCfg.RegistryBurst),
-			kubeCfg.CPUCFSQuota,
-			runtimeService,
-			imageService,
-			kubeDeps.ContainerManager.InternalContainerLifecycle(),
-			legacyLogProvider,
-		)
-		if err != nil {
-			return nil, err
-		}
-		klet.containerRuntime = runtime
-		klet.runner = runtime
-
-		if cadvisor.UsingLegacyCadvisorStats(containerRuntime, remoteRuntimeEndpoint) {
-			klet.StatsProvider = stats.NewCadvisorStatsProvider(
-				klet.cadvisor,
-				klet.resourceAnalyzer,
-				klet.podManager,
-				klet.runtimeCache,
-				klet.containerRuntime)
+	var singleProcessOOMKill *bool
+	if sysruntime.GOOS == "linux" {
+		if !util.IsCgroup2UnifiedMode() {
+			// This is a default behavior for cgroups v1.
+			singleProcessOOMKill = ptr.To(true)
 		} else {
-			klet.StatsProvider = stats.NewCRIStatsProvider(
-				klet.cadvisor,
-				klet.resourceAnalyzer,
-				klet.podManager,
-				klet.runtimeCache,
-				runtimeService,
-				imageService)
+			if kubeCfg.SingleProcessOOMKill == nil {
+				singleProcessOOMKill = ptr.To(false)
+			} else {
+				singleProcessOOMKill = kubeCfg.SingleProcessOOMKill
+			}
 		}
+	}
+
+	tokenManager := token.NewManager(kubeDeps.KubeClient)
+	getServiceAccount := func(namespace, name string) (*v1.ServiceAccount, error) {
+		return nil, fmt.Errorf("get service account is not implemented")
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletServiceAccountTokenForCredentialProviders) {
+		getServiceAccount = func(namespace, name string) (*v1.ServiceAccount, error) {
+			if klet.kubeClient == nil {
+				return nil, errors.New("cannot get ServiceAccounts when kubelet is in standalone mode")
+			}
+			return klet.kubeClient.CoreV1().ServiceAccounts(namespace).Get(ctx, name, metav1.GetOptions{})
+		}
+	}
+
+	actuatedState, err := state.NewStateCheckpoint(logger, rootDirectory, actuatedPodsStateFile, kuberuntime.KeepOnlyResourceValues)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize actuated state checkpoint: %w", err)
+	}
+
+	runtime, postImageGCHooks, err := kuberuntime.NewKubeGenericRuntimeManager(
+		ctx,
+		kubecontainer.FilterEventRecorder(kubeDeps.Recorder),
+		klet.livenessManager,
+		klet.readinessManager,
+		klet.startupManager,
+		rootDirectory,
+		podLogsDirectory,
+		machineInfo,
+		klet.podWorkers,
+		kubeCfg.MaxPods,
+		kubeDeps.OSInterface,
+		klet,
+		insecureContainerLifecycleHTTPClient,
+		imageBackOff,
+		kubeCfg.SerializeImagePulls,
+		kubeCfg.MaxParallelImagePulls,
+		float32(kubeCfg.RegistryPullQPS),
+		int(kubeCfg.RegistryBurst),
+		kubeCfg.ImagePullCredentialsVerificationPolicy,
+		kubeCfg.PreloadedImagesVerificationAllowlist,
+		imageCredentialProviderConfigPath,
+		imageCredentialProviderBinDir,
+		singleProcessOOMKill,
+		kubeCfg.CPUCFSQuota,
+		kubeCfg.CPUCFSQuotaPeriod,
+		kubeCfg.DefaultPodSysctls,
+		kubeDeps.RemoteRuntimeService,
+		kubeDeps.RemoteImageService,
+		kubeDeps.ContainerManager,
+		klet.containerLogManager,
+		klet.runtimeClassManager,
+		seccompDefault,
+		kubeCfg.MemorySwap.SwapBehavior,
+		kubeDeps.ContainerManager.GetNodeAllocatableAbsolute,
+		kubeCfg.MemoryThrottlingFactor,
+		kubeCfg.MemoryReservationPolicy,
+		klet.podStartupLatencyTracker,
+		kubeDeps.TracerProvider,
+		tokenManager,
+		getServiceAccount,
+		klet.podStartupLatencyTracker,
+		actuatedState,
+	)
+	if err != nil {
+		return nil, err
+	}
+	klet.containerRuntime = runtime
+	klet.streamingRuntime = runtime
+	klet.runner = kubecontainer.NewCommandRunner(kubeDeps.RemoteRuntimeService)
+	resizeAdmitHandler := allocation.NewPodResizesAdmitHandler(klet.containerManager, klet.containerManager, runtime, klet.allocationManager)
+
+	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime, runtimeCacheRefreshPeriod)
+	if err != nil {
+		return nil, err
+	}
+	klet.runtimeCache = runtimeCache
+
+	// common provider to get host file system usage associated with a pod managed by kubelet
+	hostStatsProvider := stats.NewHostStatsProvider(kubecontainer.RealOS{}, func(podUID types.UID) string {
+		return getEtcHostsPath(klet.getPodDir(podUID))
+	}, podLogsDirectory)
+
+	cadvisorStatsProvider := stats.NewCadvisorStatsProvider(
+		klet.cadvisor,
+		klet.resourceAnalyzer,
+		klet.podManager,
+		klet.containerRuntime,
+		klet.statusManager,
+		hostStatsProvider,
+		kubeDeps.ContainerManager,
+	)
+	if kubeDeps.useLegacyCadvisorStats {
+		klet.StatsProvider = cadvisorStatsProvider
 	} else {
-		// rkt uses the legacy, non-CRI, integration. Configure it the old way.
-		// TODO: Include hairpin mode settings in rkt?
-		conf := &rkt.Config{
-			Path:            crOptions.RktPath,
-			Stage1Image:     crOptions.RktStage1Image,
-			InsecureOptions: "image,ondisk",
-		}
-		runtime, err := rkt.New(
-			crOptions.RktAPIEndpoint,
-			conf,
-			klet,
-			kubeDeps.Recorder,
-			containerRefManager,
-			klet,
-			klet.livenessManager,
-			httpClient,
-			klet.networkPlugin,
-			hairpinMode == kubeletconfiginternal.HairpinVeth,
-			utilexec.New(),
-			kubecontainer.RealOS{},
-			imageBackOff,
-			kubeCfg.SerializeImagePulls,
-			float32(kubeCfg.RegistryPullQPS),
-			int(kubeCfg.RegistryBurst),
-			kubeCfg.RuntimeRequestTimeout.Duration,
-		)
-		if err != nil {
-			return nil, err
-		}
-		klet.containerRuntime = runtime
-		klet.runner = kubecontainer.DirectStreamingRunner(runtime)
-		klet.StatsProvider = stats.NewCadvisorStatsProvider(
+		klet.StatsProvider = stats.NewCRIStatsProvider(
 			klet.cadvisor,
 			klet.resourceAnalyzer,
 			klet.podManager,
-			klet.runtimeCache,
-			klet.containerRuntime)
+			kubeDeps.RemoteRuntimeService,
+			kubeDeps.RemoteImageService,
+			hostStatsProvider,
+			utilfeature.DefaultFeatureGate.Enabled(features.PodAndContainerStatsFromCRI),
+			kubeDeps.PodSandboxStatsUnimplemented,
+			cadvisorStatsProvider,
+		)
 	}
 
-	klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, plegChannelCapacity, plegRelistPeriod, klet.podCache, clock.RealClock{})
+	eventChannel := make(chan *pleg.PodLifecycleEvent, plegChannelCapacity)
+	genericRelistDuration := &pleg.RelistDuration{
+		RelistPeriod:    genericPlegRelistPeriod,
+		RelistThreshold: genericPlegRelistThreshold,
+	}
+	klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, eventChannel, genericRelistDuration, podCache, clock.RealClock{})
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.EventedPLEG) {
+		// EventedPLEG only watches the CRI event stream and requests relists.
+		// GenericPLEG remains responsible for cache updates and lifecycle events.
+		klet.eventedPlegWatcher = pleg.NewEventedPLEG(klet.runtimeService, klet.pleg, eventedPlegMaxStreamRetries)
+	}
+
 	klet.runtimeState = newRuntimeState(maxWaitForContainerRuntime)
 	klet.runtimeState.addHealthCheck("PLEG", klet.pleg.Healthy)
-	klet.updatePodCIDR(kubeCfg.PodCIDR)
+	if _, err := klet.updatePodCIDR(ctx, kubeCfg.PodCIDR); err != nil {
+		logger.Error(err, "Pod CIDR update failed")
+	}
 
 	// setup containerGC
 	containerGC, err := kubecontainer.NewContainerGC(klet.containerRuntime, containerGCPolicy, klet.sourcesReady)
@@ -740,120 +933,219 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		return nil, err
 	}
 	klet.containerGC = containerGC
-	klet.containerDeletor = newPodContainerDeletor(klet.containerRuntime, integer.IntMax(containerGCPolicy.MaxPerPodContainer, minDeadContainerInPod))
+	klet.containerDeletor = newPodContainerDeletor(logger, klet.containerRuntime, max(containerGCPolicy.MaxPerPodContainer, minDeadContainerInPod))
 
 	// setup imageManager
-	imageManager, err := images.NewImageGCManager(klet.containerRuntime, klet.StatsProvider, kubeDeps.Recorder, nodeRef, imageGCPolicy)
+	imageManager, err := images.NewImageGCManager(klet.containerRuntime, klet.StatsProvider, postImageGCHooks, kubeDeps.Recorder, nodeRef, imageGCPolicy, kubeDeps.TracerProvider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize image manager: %v", err)
 	}
 	klet.imageManager = imageManager
 
-	klet.statusManager = status.NewManager(klet.kubeClient, klet.podManager, klet)
+	if kubeDeps.TLSOptions != nil {
+		kubeDeps.TLSConfig = &tls.Config{}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.RotateKubeletServerCertificate) && kubeDeps.TLSOptions != nil {
-		var ips []net.IP
-		cfgAddress := net.ParseIP(kubeCfg.Address)
-		if cfgAddress == nil || cfgAddress.IsUnspecified() {
-			localIPs, err := allLocalIPsWithoutLoopback()
+		kubeDeps.TLSConfig.MinVersion = kubeDeps.TLSOptions.MinVersion
+		kubeDeps.TLSConfig.CipherSuites = kubeDeps.TLSOptions.CipherSuites
+		kubeDeps.TLSConfig.CurvePreferences = kubeDeps.TLSOptions.CurvePreferences
+
+		getServingCertificate := func() *tls.Certificate { return nil }
+
+		// kubelet configuration that automatically rotates serving certs
+		if kubeCfg.ServerTLSBootstrap && utilfeature.DefaultFeatureGate.Enabled(features.RotateKubeletServerCertificate) {
+			klet.serverCertificateManager, err = kubeletcertificate.NewKubeletServerCertificateManager(logger, klet.kubeClient, kubeCfg, klet.nodeName, func() []v1.NodeAddress {
+				return klet.getLastObservedNodeAddresses(ctx)
+			}, certDirectory)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to initialize certificate manager: %w", err)
 			}
-			ips = localIPs
-		} else {
-			ips = []net.IP{cfgAddress}
+			getServingCertificate = klet.serverCertificateManager.Current
+
+		} else if kubeDeps.TLSOptions.CertFile != "" && kubeDeps.TLSOptions.KeyFile != "" {
+
+			if utilfeature.DefaultFeatureGate.Enabled(features.ReloadKubeletServerCertificateFile) {
+				// kubelet configuration that reloads serving certs from the disk when updated
+				klet.serverCertificateManager, err = kubeletcertificate.NewKubeletServerCertificateDynamicFileManager(kubeDeps.TLSOptions.CertFile, kubeDeps.TLSOptions.KeyFile)
+				if err != nil {
+					return nil, fmt.Errorf("failed to initialize file based certificate manager: %w", err)
+				}
+				getServingCertificate = klet.serverCertificateManager.Current
+
+			} else {
+				// kubelet configuration that sets static serving certs
+				servingCert, err := tls.LoadX509KeyPair(kubeDeps.TLSOptions.CertFile, kubeDeps.TLSOptions.KeyFile)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load certificate: %w", err)
+				}
+				getServingCertificate = func() *tls.Certificate { return &servingCert }
+			}
 		}
 
-		ips = append(ips, cloudIPs...)
-		names := append([]string{klet.GetHostname(), hostnameOverride}, cloudNames...)
-		klet.serverCertificateManager, err = kubeletcertificate.NewKubeletServerCertificateManager(klet.kubeClient, kubeCfg, klet.nodeName, ips, names, certDirectory)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize certificate manager: %v", err)
-		}
-		kubeDeps.TLSOptions.Config.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			cert := klet.serverCertificateManager.Current()
+		kubeDeps.TLSConfig.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert := getServingCertificate()
 			if cert == nil {
-				return nil, fmt.Errorf("no certificate available")
+				return nil, fmt.Errorf("no serving certificate available for the kubelet")
 			}
 			return cert, nil
 		}
+
+		if kubeDeps.TLSOptions.ClientCAFile != "" {
+			// Populate PeerCertificates in requests, but don't reject connections without verified certificates
+			kubeDeps.TLSConfig.ClientAuth = tls.RequestClientCert
+
+			if utilfeature.DefaultFeatureGate.Enabled(features.ReloadKubeletClientCAFile) {
+				// kubelet configuration that reloads Client CA Bundle from the disk when updated
+				klet.clientCAManager = dynamiccertificates.NewDynamicServingCertificateController(kubeDeps.TLSConfig.Clone(), kubeDeps.Auth, nil, nil, nil)
+
+				err := klet.clientCAManager.RunOnce()
+				if err != nil {
+					return nil, fmt.Errorf("unable to load client CA file %s: %w", kubeDeps.TLSOptions.ClientCAFile, err)
+				}
+
+				kubeDeps.TLSConfig.GetConfigForClient = klet.clientCAManager.GetConfigForClient
+
+			} else {
+				// kubelet configuration that sets static Client CA Bundle
+				clientCAs, err := certutil.NewPool(kubeDeps.TLSOptions.ClientCAFile)
+				if err != nil {
+					return nil, fmt.Errorf("unable to load client CA file %s: %w", kubeDeps.TLSOptions.ClientCAFile, err)
+				}
+				kubeDeps.TLSConfig.ClientCAs = clientCAs
+			}
+		}
 	}
 
-	klet.probeManager = prober.NewManager(
-		klet.statusManager,
-		klet.livenessManager,
-		klet.runner,
-		containerRefManager,
-		kubeDeps.Recorder)
+	if kubeDeps.ProbeManager != nil {
+		klet.probeManager = kubeDeps.ProbeManager
+	} else {
+		klet.probeManager = prober.NewManager(
+			klet.statusManager,
+			klet.livenessManager,
+			klet.readinessManager,
+			klet.startupManager,
+			klet.runner,
+			kubeDeps.Recorder)
+	}
 
-	klet.volumePluginMgr, err =
-		NewInitializedVolumePluginMgr(klet, secretManager, configMapManager, kubeDeps.VolumePlugins, kubeDeps.DynamicPluginProber)
+	var clusterTrustBundleManager clustertrustbundle.Manager = &clustertrustbundle.NoopManager{}
+	if kubeDeps.KubeClient != nil && utilfeature.DefaultFeatureGate.Enabled(features.ClusterTrustBundleProjection) {
+		clusterTrustBundleManager = clustertrustbundle.NewLazyInformerManager(ctx, kubeDeps.KubeClient, 2*int(kubeCfg.MaxPods))
+		logger.Info("ClusterTrustBundle informer will be started eventually once a trust bundle is requested")
+	} else {
+		logger.Info("Not starting ClusterTrustBundle informer because we are in static kubelet mode or the ClusterTrustBundleProjection featuregate is disabled")
+	}
+
+	if kubeDeps.KubeClient != nil && utilfeature.DefaultFeatureGate.Enabled(features.PodCertificateRequest) {
+		kubeInformers := informers.NewSharedInformerFactoryWithOptions(
+			kubeDeps.KubeClient,
+			0,
+			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+				options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", string(nodeName)).String()
+			}),
+		)
+		podCertificateManager := podcertificate.NewIssuingManager(
+			klog.FromContext(ctx),
+			kubeDeps.KubeClient,
+			klet.podManager,
+			kubeDeps.Recorder,
+			kubeInformers.Certificates().V1().PodCertificateRequests(),
+			nodeInformer,
+			nodeName,
+			clock.RealClock{},
+		)
+		klet.podCertificateManager = podCertificateManager
+		kubeInformers.StartWithContext(ctx)
+		go podCertificateManager.Run(ctx)
+
+		metrics.RegisterCollectors(collectors.PodCertificateCollectorFor(podCertificateManager))
+	} else {
+		klet.podCertificateManager = &podcertificate.NoOpManager{}
+		logger.Info("Not starting PodCertificateRequest manager because we are in static kubelet mode or the PodCertificateProjection feature gate is disabled")
+	}
+
+	// NewInitializedVolumePluginMgr initializes some storageErrors on the Kubelet runtimeState (in csi_plugin.go init)
+	// which affects node ready status. This function must be called before Kubelet is initialized so that the Node
+	// ReadyState is accurate with the storage state.
+	klet.volumePluginMgr, err = NewInitializedVolumePluginMgr(logger, klet, secretManager, configMapManager, tokenManager, clusterTrustBundleManager, kubeDeps.VolumePlugins, kubeDeps.DynamicPluginProber)
 	if err != nil {
 		return nil, err
 	}
+	klet.pluginManager = pluginmanager.NewPluginManager(
+		klet.getPluginsRegistrationDir(), /* sockDir */
+		kubeDeps.Recorder,
+	)
 
 	// If the experimentalMounterPathFlag is set, we do not want to
 	// check node capabilities since the mount path is not the default
 	if len(experimentalMounterPath) != 0 {
-		experimentalCheckNodeCapabilitiesBeforeMount = false
-		// Replace the nameserver in containerized-mounter's rootfs/etc/resolve.conf with kubelet.ClusterDNS
+		// Replace the nameserver in containerized-mounter's rootfs/etc/resolv.conf with kubelet.ClusterDNS
 		// so that service name could be resolved
-		klet.dnsConfigurer.SetupDNSinContainerizedMounter(experimentalMounterPath)
+		klet.dnsConfigurer.SetupDNSinContainerizedMounter(logger, experimentalMounterPath)
 	}
 
 	// setup volumeManager
+	var vmPodManager volumemanager.PodManager = klet.podManager
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingMemoryBackedVolumes) {
+		// The volume manager should only ever be aware of the 'allocated' pod.
+		vmPodManager = &allocatedPodManager{baseManager: klet.podManager, allocationManager: klet.allocationManager}
+	}
+
 	klet.volumeManager = volumemanager.NewVolumeManager(
 		kubeCfg.EnableControllerAttachDetach,
 		nodeName,
-		klet.podManager,
-		klet.statusManager,
+		vmPodManager,
+		klet.podWorkers,
 		klet.kubeClient,
 		klet.volumePluginMgr,
-		klet.containerRuntime,
 		kubeDeps.Mounter,
+		kubeDeps.HostUtil,
 		klet.getPodsDir(),
 		kubeDeps.Recorder,
-		experimentalCheckNodeCapabilitiesBeforeMount,
-		keepTerminatedPodVolumes)
+		volumepathhandler.NewBlockVolumePathHandler(),
+		klet.statusManager,
+		kubeCfg.VolumeStatsAggPeriod.Duration,
+		actuatedState)
 
-	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime)
-	if err != nil {
-		return nil, err
+	boMax, base := newCrashLoopBackOff(kubeCfg)
+
+	klet.crashLoopBackOff = flowcontrol.NewBackOff(base, boMax)
+	klet.crashLoopBackOff.HasExpiredFunc = func(eventTime time.Time, lastUpdate time.Time, maxDuration time.Duration) bool {
+		return eventTime.Sub(lastUpdate) > 600*time.Second
 	}
-	klet.runtimeCache = runtimeCache
-	klet.reasonCache = NewReasonCache()
-	klet.workQueue = queue.NewBasicWorkQueue(klet.clock)
-	klet.podWorkers = newPodWorkers(klet.syncPod, kubeDeps.Recorder, klet.workQueue, klet.resyncInterval, backOffPeriod, klet.podCache)
-
-	klet.backOff = flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
-	klet.podKillingCh = make(chan *kubecontainer.PodPair, podKillingChannelCapacity)
-	klet.setNodeStatusFuncs = klet.defaultNodeStatusFuncs()
 
 	// setup eviction manager
-	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock)
+	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig,
+		killPodNow(ctx, klet.podWorkers, kubeDeps.Recorder), klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock, kubeCfg.LocalStorageCapacityIsolation)
 
 	klet.evictionManager = evictionManager
-	klet.admitHandlers.AddPodAdmitHandler(evictionAdmitHandler)
+	handlers := []lifecycle.PodAdmitHandler{}
+	handlers = append(handlers, evictionAdmitHandler)
 
-	// add sysctl admission
-	runtimeSupport, err := sysctl.NewRuntimeAdmitHandler(klet.containerRuntime)
-	if err != nil {
-		return nil, err
+	if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures) {
+		if status, err := klet.containerRuntime.Status(ctx); err == nil && status != nil {
+			klet.runtimeState.setRuntimeFeatures(status.Features)
+		} else if err != nil {
+			logger.V(4).Info("Unable to prefetch container runtime features for node declared features", "err", err)
+		}
+		v, err := versionutil.Parse(version.Get().String())
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse version: %w", err)
+		}
+		framework := ndf.DefaultFramework
+		klet.version = v
+		klet.nodeDeclaredFeaturesFramework = framework
+		klet.nodeDeclaredFeatures = klet.discoverNodeDeclaredFeatures()
+		klet.nodeDeclaredFeaturesSet = framework.MustMapSorted(klet.nodeDeclaredFeatures)
 	}
-	safeWhitelist, err := sysctl.NewWhitelist(sysctl.SafeSysctlWhitelist(), v1.SysctlsPodAnnotationKey)
-	if err != nil {
-		return nil, err
-	}
-	// Safe, whitelisted sysctls can always be used as unsafe sysctls in the spec
+
+	// Safe, allowed sysctls can always be used as unsafe sysctls in the spec.
 	// Hence, we concatenate those two lists.
-	safeAndUnsafeSysctls := append(sysctl.SafeSysctlWhitelist(), allowedUnsafeSysctls...)
-	unsafeWhitelist, err := sysctl.NewWhitelist(safeAndUnsafeSysctls, v1.UnsafeSysctlsPodAnnotationKey)
+	safeAndUnsafeSysctls := append(sysctl.SafeSysctlAllowlist(ctx), allowedUnsafeSysctls...)
+	sysctlsAllowlist, err := sysctl.NewAllowlist(safeAndUnsafeSysctls)
 	if err != nil {
 		return nil, err
 	}
-	klet.admitHandlers.AddPodAdmitHandler(runtimeSupport)
-	klet.admitHandlers.AddPodAdmitHandler(safeWhitelist)
-	klet.admitHandlers.AddPodAdmitHandler(unsafeWhitelist)
+	handlers = append(handlers, sysctlsAllowlist)
 
 	// enable active deadline handler
 	activeDeadlineHandler, err := newActiveDeadlineHandler(klet.statusManager, kubeDeps.Recorder, klet.clock)
@@ -863,33 +1155,76 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.AddPodSyncLoopHandler(activeDeadlineHandler)
 	klet.AddPodSyncHandler(activeDeadlineHandler)
 
-	criticalPodAdmissionHandler := preemption.NewCriticalPodAdmissionHandler(klet.GetActivePods, killPodNow(klet.podWorkers, kubeDeps.Recorder), kubeDeps.Recorder)
-	klet.admitHandlers.AddPodAdmitHandler(lifecycle.NewPredicateAdmitHandler(klet.getNodeAnyWay, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources))
+	handlers = append(handlers, klet.containerManager.GetAllocateResourcesPodAdmitHandler(logger))
+
+	criticalPodAdmissionHandler := preemption.NewCriticalPodAdmissionHandler(klet.getAllocatedPods, killPodNow(ctx, klet.podWorkers, kubeDeps.Recorder), kubeDeps.Recorder)
+	handlers = append(handlers, lifecycle.NewPredicateAdmitHandler(klet.GetCachedNode, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources))
 	// apply functional Option's
 	for _, opt := range kubeDeps.Options {
 		opt(klet)
 	}
 
-	klet.appArmorValidator = apparmor.NewValidator(containerRuntime)
-	klet.softAdmitHandlers.AddPodAdmitHandler(lifecycle.NewAppArmorAdmitHandler(klet.appArmorValidator))
-	klet.softAdmitHandlers.AddPodAdmitHandler(lifecycle.NewNoNewPrivsAdmitHandler(klet.containerRuntime))
-	if utilfeature.DefaultFeatureGate.Enabled(features.Accelerators) {
-		if containerRuntime == kubetypes.DockerContainerRuntime {
-			glog.Warningln("Accelerators feature is deprecated and will be removed in v1.11. Please use device plugins instead. They can be enabled using the DevicePlugins feature gate.")
-			if klet.gpuManager, err = nvidia.NewNvidiaGPUManager(klet, kubeDeps.DockerClientConfig); err != nil {
-				return nil, err
-			}
-		} else {
-			glog.Errorf("Accelerators feature is supported with docker runtime only. Disabling this feature internally.")
-		}
+	if goos == "linux" {
+		// AppArmor is a Linux kernel security module and it does not support other operating systems.
+		klet.appArmorValidator = apparmor.NewValidator()
+		handlers = append(handlers, lifecycle.NewAppArmorAdmitHandler(klet.appArmorValidator))
 	}
-	// Set GPU manager to a stub implementation if it is not enabled or cannot be supported.
-	if klet.gpuManager == nil {
-		klet.gpuManager = gpu.NewGPUManagerStub()
+
+	handlers = append(handlers, lifecycle.NewPodFeaturesAdmitHandler())
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures) {
+		handlers = append(handlers, lifecycle.NewDeclaredFeaturesAdmitHandler(klet.nodeDeclaredFeaturesFramework, klet.nodeDeclaredFeaturesSet, klet.version))
 	}
+
+	leaseDuration := time.Duration(kubeCfg.NodeLeaseDurationSeconds) * time.Second
+	renewInterval := time.Duration(float64(leaseDuration) * nodeLeaseRenewIntervalFraction)
+	klet.nodeLeaseController = lease.NewController(
+		klet.clock,
+		klet.heartbeatClient,
+		string(klet.nodeName),
+		kubeCfg.NodeLeaseDurationSeconds,
+		klet.onRepeatedHeartbeatFailure,
+		renewInterval,
+		string(klet.nodeName),
+		v1.NamespaceNodeLease,
+		util.SetNodeOwnerFunc(ctx, klet.heartbeatClient, string(klet.nodeName)))
+
+	// setup node shutdown manager
+	shutdownManager := nodeshutdown.NewManager(&nodeshutdown.Config{
+		Logger:                           logger,
+		VolumeManager:                    klet.volumeManager,
+		Recorder:                         kubeDeps.Recorder,
+		NodeRef:                          nodeRef,
+		GetPodsFunc:                      klet.GetActivePods,
+		KillPodFunc:                      killPodNow(ctx, klet.podWorkers, kubeDeps.Recorder),
+		SyncNodeStatusFunc:               klet.syncNodeStatus,
+		ShutdownGracePeriodRequested:     kubeCfg.ShutdownGracePeriod.Duration,
+		ShutdownGracePeriodCriticalPods:  kubeCfg.ShutdownGracePeriodCriticalPods.Duration,
+		ShutdownGracePeriodByPodPriority: kubeCfg.ShutdownGracePeriodByPodPriority,
+		StateDirectory:                   rootDirectory,
+	})
+	klet.shutdownManager = shutdownManager
+	handlers = append(handlers, shutdownManager)
+
+	klet.allocationManager.AddPodAdmitHandlers(append([]lifecycle.PodAdmitHandler{resizeAdmitHandler}, handlers...))
+
+	var usernsIDsPerPod *int64
+	if kubeCfg.UserNamespaces != nil {
+		usernsIDsPerPod = kubeCfg.UserNamespaces.IDsPerPod
+	}
+	klet.usernsManager, err = userns.MakeUserNsManager(logger, klet, usernsIDsPerPod)
+	if err != nil {
+		return nil, fmt.Errorf("create user namespace manager: %w", err)
+	}
+
 	// Finally, put the most recent version of the config on the Kubelet, so
 	// people can see how it was configured.
 	klet.kubeletConfiguration = *kubeCfg
+
+	// Generating the status funcs should be the last thing we do,
+	// since this relies on the rest of the Kubelet having been constructed.
+	klet.setNodeStatusFuncs = klet.defaultNodeStatusFuncs()
+
 	return klet, nil
 }
 
@@ -901,16 +1236,115 @@ type serviceLister interface {
 type Kubelet struct {
 	kubeletConfiguration kubeletconfiginternal.KubeletConfiguration
 
-	hostname        string
+	// hostname is the hostname the kubelet detected or was given via flag/config
+	hostname string
+
 	nodeName        types.NodeName
+	cachedNode      *v1.Node
 	runtimeCache    kubecontainer.RuntimeCache
 	kubeClient      clientset.Interface
-	heartbeatClient v1core.CoreV1Interface
-	iptClient       utilipt.Interface
-	rootDirectory   string
+	heartbeatClient clientset.Interface
+	// mirrorPodClient is used to create and delete mirror pods in the API for static
+	// pods.
+	mirrorPodClient kubepod.MirrorClient
 
-	// podWorkers handle syncing Pods in response to events.
+	rootDirectory    string
+	podLogsDirectory string
+
+	// onRepeatedHeartbeatFailure is called when a heartbeat operation fails more than once. optional.
+	onRepeatedHeartbeatFailure func()
+
+	// podManager stores the desired set of admitted pods and mirror pods that the kubelet should be
+	// running. The actual set of running pods is stored on the podWorkers. The manager is populated
+	// by the kubelet config loops which abstracts receiving configuration from many different sources
+	// (api for regular pods, local filesystem or http for static pods). The manager may be consulted
+	// by other components that need to see the set of desired pods. Note that not all desired pods are
+	// running, and not all running pods are in the podManager - for instance, force deleting a pod
+	// from the apiserver will remove it from the podManager, but the pod may still be terminating and
+	// tracked by the podWorkers. Components that need to know the actual consumed resources of the
+	// node or are driven by podWorkers and the sync*Pod methods (status, volume, stats) should also
+	// consult the podWorkers when reconciling.
+	//
+	// TODO: review all kubelet components that need the actual set of pods (vs the desired set)
+	// and update them to use podWorkers instead of podManager. This may introduce latency in some
+	// methods, but avoids race conditions and correctly accounts for terminating pods that have
+	// been force deleted or static pods that have been updated.
+	// https://github.com/kubernetes/kubernetes/issues/116970
+	podManager kubepod.Manager
+
+	// podWorkers is responsible for driving the lifecycle state machine of each pod. The worker is
+	// notified of config changes, updates, periodic reconciliation, container runtime updates, and
+	// evictions of all desired pods and will invoke reconciliation methods per pod in separate
+	// goroutines. The podWorkers are authoritative in the kubelet for what pods are actually being
+	// run and their current state:
+	//
+	// * syncing: pod should be running (syncPod)
+	// * terminating: pod should be stopped (syncTerminatingPod)
+	// * terminated: pod should have all resources cleaned up (syncTerminatedPod)
+	//
+	// and invoke the handler methods that correspond to each state. Components within the
+	// kubelet that need to know the phase of the pod in order to correctly set up or tear down
+	// resources must consult the podWorkers.
+	//
+	// Once a pod has been accepted by the pod workers, no other pod with that same UID (and
+	// name+namespace, for static pods) will be started until the first pod has fully terminated
+	// and been cleaned up by SyncKnownPods. This means a pod may be desired (in API), admitted
+	// (in pod manager), and requested (by invoking UpdatePod) but not start for an arbitrarily
+	// long interval because a prior pod is still terminating.
+	//
+	// As an event-driven (by UpdatePod) controller, the podWorkers must periodically be resynced
+	// by the kubelet invoking SyncKnownPods with the desired state (admitted pods in podManager).
+	// Since the podManager may be unaware of some running pods due to force deletion, the
+	// podWorkers are responsible for triggering a sync of pods that are no longer desired but
+	// must still run to completion.
 	podWorkers PodWorkers
+
+	// evictionManager observes the state of the node for situations that could impact node stability
+	// and evicts pods (sets to phase Failed with reason Evicted) to reduce resource pressure. The
+	// eviction manager acts on the actual state of the node and considers the podWorker to be
+	// authoritative.
+	evictionManager eviction.Manager
+
+	// probeManager tracks the set of running pods and ensures any user-defined periodic checks are
+	// run to introspect the state of each pod.  The probe manager acts on the actual state of the node
+	// and is notified of pods by the podWorker. The probe manager is the authoritative source of the
+	// most recent probe status and is responsible for notifying the status manager, which
+	// synthesizes them into the overall pod status.
+	probeManager prober.Manager
+
+	// secretManager caches the set of secrets used by running pods on this node. The podWorkers
+	// notify the secretManager when pods are started and terminated, and the secretManager must
+	// then keep the needed secrets up-to-date as they change.
+	secretManager secret.Manager
+
+	// configMapManager caches the set of config maps used by running pods on this node. The
+	// podWorkers notify the configMapManager when pods are started and terminated, and the
+	// configMapManager must then keep the needed config maps up-to-date as they change.
+	configMapManager configmap.Manager
+
+	// volumeManager observes the set of running pods and is responsible for attaching, mounting,
+	// unmounting, and detaching as those pods move through their lifecycle. It periodically
+	// synchronizes the set of known volumes to the set of actually desired volumes and cleans up
+	// any orphaned volumes. The volume manager considers the podWorker to be authoritative for
+	// which pods are running.
+	volumeManager volumemanager.VolumeManager
+
+	// statusManager receives updated pod status updates from the podWorker and updates the API
+	// status of those pods to match. The statusManager is authoritative for the synthesized
+	// status of the pod from the kubelet's perspective (other components own the individual
+	// elements of status) and should be consulted by components in preference to assembling
+	// that status themselves. Note that the status manager is downstream of the pod worker
+	// and components that need to check whether a pod is still running should instead directly
+	// consult the pod worker.
+	statusManager status.Manager
+
+	// allocationManager manages allocated resources for pods.
+	allocationManager allocation.Manager
+
+	// podCertificateManager is fed updates as pods are added and removed from
+	// the node, and requests certificates for them based on their configured
+	// pod certificate volumes.
+	podCertificateManager podcertificate.Manager
 
 	// resyncInterval is the interval between periodic full reconciliations of
 	// pods on this node.
@@ -919,17 +1353,10 @@ type Kubelet struct {
 	// sourcesReady records the sources seen by the kubelet, it is thread-safe.
 	sourcesReady config.SourcesReady
 
-	// podManager is a facade that abstracts away the various sources of pods
-	// this Kubelet services.
-	podManager kubepod.Manager
-
-	// Needed to observe and respond to situations that could impact node stability
-	evictionManager eviction.Manager
-
 	// Optional, defaults to /logs/ from /var/log
 	logServer http.Handler
 	// Optional, defaults to simple Docker implementation
-	runner kubecontainer.ContainerCommandRunner
+	runner kubecontainer.CommandRunner
 
 	// cAdvisor used for container information.
 	cadvisor cadvisor.Interface
@@ -937,24 +1364,35 @@ type Kubelet struct {
 	// Set to true to have the node register itself with the apiserver.
 	registerNode bool
 	// List of taints to add to a node object when the kubelet registers itself.
-	registerWithTaints []api.Taint
-	// Set to true to have the node register itself as schedulable.
-	registerSchedulable bool
+	registerWithTaints []v1.Taint
 	// for internal book keeping; access only from within registerWithApiserver
 	registrationCompleted bool
 
 	// dnsConfigurer is used for setting up DNS resolver configuration when launching pods.
 	dnsConfigurer *dns.Configurer
 
-	// masterServiceNamespace is the namespace that the master service is exposed in.
-	masterServiceNamespace string
 	// serviceLister knows how to list services
 	serviceLister serviceLister
-	// nodeInfo knows how to get information about the node for this kubelet.
-	nodeInfo predicates.NodeInfo
-
+	// serviceHasSynced indicates whether services have been sync'd at least once.
+	// Check this before trusting a response from the lister.
+	serviceHasSynced cache.InformerSynced
+	// nodeLister knows how to list nodes
+	nodeLister corelisters.NodeLister
+	// nodeHasSynced indicates whether nodes have been sync'd at least once.
+	// Check this before trusting a response from the node lister.
+	nodeHasSynced cache.InformerSynced
 	// a list of node labels to register
 	nodeLabels map[string]string
+
+	// nodeDeclaredFeatures is the ordered static list of features that are determined at startup and declared in node status.
+	nodeDeclaredFeatures []string
+	// nodeDeclaredFeaturesSet provides the same features as nodeDeclaredFeatures, but as a set for faster inference.
+	nodeDeclaredFeaturesSet ndf.FeatureSet
+	// nodeDeclaredFeaturesFramework provides the shared logic for feature discovery and pod requirement inference.
+	nodeDeclaredFeaturesFramework *ndf.Framework
+
+	// kubelet version
+	version *versionutil.Version
 
 	// Last timestamp when runtime responded on ping.
 	// Mutex is used to protect this value.
@@ -963,97 +1401,122 @@ type Kubelet struct {
 	// Volume plugins.
 	volumePluginMgr *volume.VolumePluginMgr
 
-	// Network plugin.
-	networkPlugin network.NetworkPlugin
-
-	// Handles container probing.
-	probeManager prober.Manager
 	// Manages container health check results.
-	livenessManager proberesults.Manager
-
-	// How long to keep idle streaming command execution/port forwarding
-	// connections open before terminating them
-	streamingConnectionIdleTimeout time.Duration
+	livenessManager  proberesults.Manager
+	readinessManager proberesults.Manager
+	startupManager   proberesults.Manager
 
 	// The EventRecorder to use
-	recorder record.EventRecorder
+	recorder record.EventRecorderLogger
 
 	// Policy for handling garbage collection of dead containers.
-	containerGC kubecontainer.ContainerGC
+	containerGC kubecontainer.GC
 
 	// Manager for image garbage collection.
 	imageManager images.ImageGCManager
 
-	// Secret manager.
-	secretManager secret.Manager
-
-	// ConfigMap manager.
-	configMapManager configmap.Manager
+	// Manager for container logs.
+	containerLogManager logs.ContainerLogManager
 
 	// Cached MachineInfo returned by cadvisor.
-	machineInfo *cadvisorapi.MachineInfo
-
-	//Cached RootFsInfo returned by cadvisor
-	rootfsInfo *cadvisorapiv2.FsInfo
+	machineInfoLock sync.RWMutex
+	machineInfo     *cadvisorapi.MachineInfo
 
 	// Handles certificate rotations.
 	serverCertificateManager certificate.Manager
 
-	// Syncs pods statuses with apiserver; also used as a cache of statuses.
-	statusManager status.Manager
-
-	// VolumeManager runs a set of asynchronous loops that figure out which
-	// volumes need to be attached/mounted/unmounted/detached based on the pods
-	// scheduled on this node and makes it so.
-	volumeManager volumemanager.VolumeManager
-
-	// Cloud provider interface.
-	cloud cloudprovider.Interface
+	// handles reloading of ClientCA from the disk
+	clientCAManager *dynamiccertificates.DynamicServingCertificateController
 
 	// Indicates that the node initialization happens in an external cloud controller
 	externalCloudProvider bool
 	// Reference to this node.
 	nodeRef *v1.ObjectReference
 
-	// The name of the container runtime
-	containerRuntimeName string
+	// cachedNodeRef caches a copy of nodeRef with the Node's UID resolved, so the
+	// common path of recording a node event allocates nothing and does no lister
+	// lookup. It is populated lazily once the UID is known; see nodeRefWithUID.
+	cachedNodeRef atomic.Pointer[v1.ObjectReference]
 
 	// Container runtime.
 	containerRuntime kubecontainer.Runtime
 
+	// Streaming runtime handles container streaming.
+	streamingRuntime kubecontainer.StreamingRuntime
+
 	// Container runtime service (needed by container runtime Start()).
-	// TODO(CD): try to make this available without holding a reference in this
-	//           struct. For example, by adding a getter to generic runtime.
 	runtimeService internalapi.RuntimeService
 
 	// reasonCache caches the failure reason of the last creation of all containers, which is
 	// used for generating ContainerStatus.
 	reasonCache *ReasonCache
 
-	// nodeStatusUpdateFrequency specifies how often kubelet posts node status to master.
-	// Note: be cautious when changing the constant, it must work with nodeMonitorGracePeriod
-	// in nodecontroller. There are several constraints:
-	// 1. nodeMonitorGracePeriod must be N times more than nodeStatusUpdateFrequency, where
-	//    N means number of retries allowed for kubelet to post node status. It is pointless
-	//    to make nodeMonitorGracePeriod be less than nodeStatusUpdateFrequency, since there
-	//    will only be fresh values from Kubelet at an interval of nodeStatusUpdateFrequency.
-	//    The constant must be less than podEvictionTimeout.
-	// 2. nodeStatusUpdateFrequency needs to be large enough for kubelet to generate node
-	//    status. Kubelet may fail to update node status reliably if the value is too small,
-	//    as it takes time to gather all necessary node information.
+	// containerRuntimeReadyExpected indicates whether container runtime being ready is expected
+	// so errors are logged without verbosity guard, to avoid excessive error logs at node startup.
+	// It's false during the node initialization period of nodeReadyGracePeriod, and after that
+	// it's set to true by fastStatusUpdateOnce when it exits.
+	containerRuntimeReadyExpected bool
+
+	// nodeStatusUpdateFrequency specifies how often kubelet computes node status
+	// and checks whether an update to the API server is necessary. On each tick,
+	// kubelet recomputes the node status and posts it to the API server if the
+	// status has changed or if nodeStatusReportFrequency has elapsed since the
+	// last report.
+	// Note: node liveness is primarily signaled to the node controller via
+	// NodeLease renewals. nodeStatusUpdateFrequency controls how quickly node
+	// status changes (e.g. conditions) are detected and reported.
+	// nodeStatusUpdateFrequency needs to be large enough for kubelet to generate
+	// node status. Kubelet may fail to update node status reliably if the value
+	// is too small, as it takes time to gather all necessary node information.
 	nodeStatusUpdateFrequency time.Duration
 
-	// Generates pod events.
+	// nodeStatusReportFrequency is the frequency that kubelet posts node
+	// status to the API server if node status does not change. Kubelet will
+	// ignore this frequency and post node status immediately if any change
+	// is detected.
+	nodeStatusReportFrequency time.Duration
+
+	// delayAfterNodeStatusChange is the one-time random duration that we add to the next node status report interval
+	// every time when there's an actual node status change or kubelet restart. But all future node status update that
+	// is not caused by real status change will stick with nodeStatusReportFrequency. The random duration is a uniform
+	// distribution over [-0.5*nodeStatusReportFrequency, 0.5*nodeStatusReportFrequency]
+	delayAfterNodeStatusChange time.Duration
+
+	// lastStatusReportTime is the time when node status was last reported.
+	lastStatusReportTime time.Time
+
+	// syncNodeStatusMux is a lock on updating the node status, because this path is not thread-safe.
+	// This lock is used by Kubelet.syncNodeStatus and Kubelet.fastNodeStatusUpdate functions and shouldn't be used anywhere else.
+	syncNodeStatusMux sync.Mutex
+
+	// updatePodCIDRMux is a lock on updating pod CIDR, because this path is not thread-safe.
+	// This lock is used by Kubelet.updatePodCIDR function and shouldn't be used anywhere else.
+	updatePodCIDRMux sync.Mutex
+
+	// updateRuntimeMux is a lock on updating runtime, because this path is not thread-safe.
+	// This lock is used by Kubelet.updateRuntimeUp, Kubelet.fastNodeStatusUpdate and
+	// Kubelet.HandlerSupportsUserNamespaces functions and shouldn't be used anywhere else.
+	updateRuntimeMux sync.Mutex
+
+	// nodeLeaseController claims and renews the node lease for this Kubelet
+	nodeLeaseController lease.Controller
+
+	// pleg observes the state of the container runtime and notifies the kubelet of changes to containers, which
+	// notifies the podWorkers to reconcile the state of the pod (for instance, if a container dies and needs to
+	// be restarted).
 	pleg pleg.PodLifecycleEventGenerator
 
+	// eventedPlegWatcher supplements the pleg by using CRI events to request low-latency relists.
+	eventedPlegWatcher *pleg.EventedPLEG
+
 	// Store kubecontainer.PodStatus for all pods.
-	podCache kubecontainer.Cache
+	podCache kubecontainer.ROCache
 
 	// os is a facade for various syscalls that need to be mocked during testing.
 	os kubecontainer.OSInterface
 
 	// Watcher of out of memory events.
-	oomWatcher OOMWatcher
+	oomWatcher oomwatcher.Watcher
 
 	// Monitor resource usage
 	resourceAnalyzer serverstats.ResourceAnalyzer
@@ -1067,8 +1530,11 @@ type Kubelet struct {
 	// Mounter to use for volumes.
 	mounter mount.Interface
 
-	// Writer interface to use for volumes.
-	writer kubeio.Writer
+	// hostutil to interact with filesystems
+	hostutil hostutil.HostUtils
+
+	// subpather to execute subpath actions
+	subpather subpath.Interface
 
 	// Manager of non-Runtime containers.
 	containerManager cm.ContainerManager
@@ -1080,10 +1546,7 @@ type Kubelet struct {
 	syncLoopMonitor atomic.Value
 
 	// Container restart Backoff
-	backOff *flowcontrol.Backoff
-
-	// Channel for sending pods to kill.
-	podKillingCh chan *kubecontainer.PodPair
+	crashLoopBackOff *flowcontrol.Backoff
 
 	// Information about the ports which are opened by daemons on Node running this Kubelet server.
 	daemonEndpoints *v1.NodeDaemonEndpoints
@@ -1094,28 +1557,25 @@ type Kubelet struct {
 	// oneTimeInitializer is used to initialize modules that are dependent on the runtime to be up.
 	oneTimeInitializer sync.Once
 
-	// If non-nil, use this IP address for the node
-	nodeIP net.IP
+	// If set, use this IP address or addresses for the node
+	nodeIPs []net.IP
+
+	// use this function to validate the kubelet nodeIP
+	nodeIPValidator func(net.IP) error
 
 	// If non-nil, this is a unique identifier for the node in an external database, eg. cloudprovider
 	providerID string
 
 	// clock is an interface that provides time related functionality in a way that makes it
 	// easy to test the code.
-	clock clock.Clock
+	clock clock.WithTicker
 
 	// handlers called during the tryUpdateNodeStatus cycle
-	setNodeStatusFuncs []func(*v1.Node) error
+	setNodeStatusFuncs []func(context.Context, *v1.Node) error
 
-	// TODO: think about moving this to be centralized in PodWorkers in follow-on.
-	// the list of handlers to call during pod admission.
-	admitHandlers lifecycle.PodAdmitHandlers
-
-	// softAdmithandlers are applied to the pod after it is admitted by the Kubelet, but before it is
-	// run. A pod rejected by a softAdmitHandler will be left in a Pending state indefinitely. If a
-	// rejected pod should not be recreated, or the scheduler is not aware of the rejection rule, the
-	// admission rule should be applied by a softAdmitHandler.
-	softAdmitHandlers lifecycle.PodAdmitHandlers
+	lastNodeUnschedulableLock sync.Mutex
+	// maintains Node.Spec.Unschedulable value from previous run of tryUpdateNodeStatus()
+	lastNodeUnschedulable bool
 
 	// the list of handlers to call during pod sync loop.
 	lifecycle.PodSyncLoopHandlers
@@ -1137,301 +1597,504 @@ type Kubelet struct {
 	// config iptables util rules
 	makeIPTablesUtilChains bool
 
-	// The bit of the fwmark space to mark packets for SNAT.
-	iptablesMasqueradeBit int
-
-	// The bit of the fwmark space to mark packets for dropping.
-	iptablesDropBit int
-
 	// The AppArmor validator for checking whether AppArmor is supported.
 	appArmorValidator apparmor.Validator
 
-	// The handler serving CRI streaming calls (exec/attach/port-forward).
-	criHandler http.Handler
-
-	// experimentalHostUserNamespaceDefaulting sets userns=true when users request host namespaces (pid, ipc, net),
-	// are using non-namespaced capabilities (mknod, sys_time, sys_module), the pod contains a privileged container,
-	// or using host path volumes.
-	// This should only be enabled when the container runtime is performing user remapping AND if the
-	// experimental behavior is desired.
-	experimentalHostUserNamespaceDefaulting bool
-
-	// GPU Manager
-	gpuManager gpu.GPUManager
-
-	// dockerLegacyService contains some legacy methods for backward compatibility.
-	// It should be set only when docker is using non json-file logging driver.
-	dockerLegacyService dockershim.DockerLegacyService
-
 	// StatsProvider provides the node and the container stats.
-	*stats.StatsProvider
+	StatsProvider *stats.Provider
 
-	// containerized should be set to true if the kubelet is running in a container
-	containerized bool
+	// pluginmanager runs a set of asynchronous loops that figure out which
+	// plugins need to be registered/unregistered based on this node and makes it so.
+	pluginManager pluginmanager.PluginManager
 
-	// This flag, if set, instructs the kubelet to keep volumes from terminated pods mounted to the node.
-	// This can be useful for debugging volume related issues.
-	keepTerminatedPodVolumes bool // DEPRECATED
+	// pluginManagerStopCh controls plugin manager shutdown. Production kubelets
+	// use wait.NeverStop, while tests may inject a closable channel.
+	pluginManagerStopCh <-chan struct{}
+
+	// This flag sets a maximum number of images to report in the node status.
+	nodeStatusMaxImages int32
+
+	// Handles RuntimeClass objects for the Kubelet.
+	runtimeClassManager *runtimeclass.Manager
+
+	// Handles node shutdown events for the Node.
+	shutdownManager nodeshutdown.Manager
+
+	// Manage user namespaces
+	usernsManager *userns.UsernsManager
+
+	// OpenTelemetry Tracer
+	tracer trace.Tracer
+
+	// Track node startup latencies
+	nodeStartupLatencyTracker util.NodeStartupLatencyTracker
+
+	// Track pod startup latencies
+	podStartupLatencyTracker util.PodStartupLatencyTracker
+
+	// Health check kubelet
+	healthChecker watchdog.HealthChecker
+
+	// flagz is the Reader interface to get flags for flagz page.
+	flagz flagz.Reader
+
+	// podsServer is the server that provides the pods gRPC service.
+	podsServer *pods.PodsServer
 }
 
-func allLocalIPsWithoutLoopback() ([]net.IP, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, fmt.Errorf("could not list network interfaces: %v", err)
-	}
-	var ips []net.IP
-	for _, i := range interfaces {
-		addresses, err := i.Addrs()
-		if err != nil {
-			return nil, fmt.Errorf("could not list the addresses for network interface %v: %v", i, err)
-		}
-		for _, address := range addresses {
-			switch v := address.(type) {
-			case *net.IPNet:
-				if !v.IP.IsLoopback() {
-					ips = append(ips, v.IP)
-				}
-			}
-		}
-	}
-	return ips, nil
+// ListPodStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) ListPodStats(ctx context.Context) ([]statsapi.PodStats, error) {
+	return kl.StatsProvider.ListPodStats(ctx)
+}
+
+// ListPodCPUAndMemoryStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) ListPodCPUAndMemoryStats(ctx context.Context) ([]statsapi.PodStats, error) {
+	return kl.StatsProvider.ListPodCPUAndMemoryStats(ctx)
+}
+
+// PodCPUAndMemoryStats is delegated to StatsProvider
+func (kl *Kubelet) PodCPUAndMemoryStats(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) (*statsapi.PodStats, error) {
+	return kl.StatsProvider.PodCPUAndMemoryStats(ctx, pod, podStatus)
+}
+
+// ListPodStatsAndUpdateCPUNanoCoreUsage is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) ListPodStatsAndUpdateCPUNanoCoreUsage(ctx context.Context) ([]statsapi.PodStats, error) {
+	return kl.StatsProvider.ListPodStatsAndUpdateCPUNanoCoreUsage(ctx)
+}
+
+// ImageFsStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) ImageFsStats(ctx context.Context) (*statsapi.FsStats, *statsapi.FsStats, error) {
+	return kl.StatsProvider.ImageFsStats(ctx)
+}
+
+// GetCgroupStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) GetCgroupStats(ctx context.Context, cgroupName string, updateStats bool) (*statsapi.ContainerStats, *statsapi.NetworkStats, error) {
+	return kl.StatsProvider.GetCgroupStats(ctx, cgroupName, updateStats)
+}
+
+// GetCgroupCPUAndMemoryStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) GetCgroupCPUAndMemoryStats(cgroupName string, updateStats bool) (*statsapi.ContainerStats, error) {
+	return kl.StatsProvider.GetCgroupCPUAndMemoryStats(cgroupName, updateStats)
+}
+
+// RootFsStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) RootFsStats() (*statsapi.FsStats, error) {
+	return kl.StatsProvider.RootFsStats()
+}
+
+// RlimitStats is delegated to StatsProvider, which implements stats.Provider interface
+func (kl *Kubelet) RlimitStats() (*statsapi.RlimitStats, error) {
+	return kl.StatsProvider.RlimitStats()
 }
 
 // setupDataDirs creates:
 // 1.  the root directory
 // 2.  the pods directory
 // 3.  the plugins directory
-func (kl *Kubelet) setupDataDirs() error {
-	kl.rootDirectory = path.Clean(kl.rootDirectory)
+// 4.  the pod-resources directory
+// 5.  the checkpoint directory
+// 6.  the pod logs root directory
+func (kl *Kubelet) setupDataDirs(logger klog.Logger) error {
+	if cleanedRoot := filepath.Clean(kl.rootDirectory); cleanedRoot != kl.rootDirectory {
+		return fmt.Errorf("rootDirectory not in canonical form: expected %s, was %s", cleanedRoot, kl.rootDirectory)
+	}
+	pluginRegistrationDir := kl.getPluginsRegistrationDir()
+	pluginsDir := kl.getPluginsDir()
 	if err := os.MkdirAll(kl.getRootDir(), 0750); err != nil {
 		return fmt.Errorf("error creating root directory: %v", err)
 	}
-	if err := kl.mounter.MakeRShared(kl.getRootDir()); err != nil {
+	if err := utilfs.MkdirAll(kl.getPodLogsDir(), 0750); err != nil {
+		return fmt.Errorf("error creating pod logs root directory %q: %w", kl.getPodLogsDir(), err)
+	}
+	if err := kl.hostutil.MakeRShared(kl.getRootDir()); err != nil {
 		return fmt.Errorf("error configuring root directory: %v", err)
 	}
 	if err := os.MkdirAll(kl.getPodsDir(), 0750); err != nil {
 		return fmt.Errorf("error creating pods directory: %v", err)
 	}
-	if err := os.MkdirAll(kl.getPluginsDir(), 0750); err != nil {
+	if err := utilfs.MkdirAll(kl.getPluginsDir(), 0750); err != nil {
 		return fmt.Errorf("error creating plugins directory: %v", err)
+	}
+	if err := utilfs.MkdirAll(kl.getPluginsRegistrationDir(), 0750); err != nil {
+		return fmt.Errorf("error creating plugins registry directory: %v", err)
+	}
+	if err := os.MkdirAll(kl.getPodResourcesDir(), 0750); err != nil {
+		return fmt.Errorf("error creating podresources directory: %v", err)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerCheckpoint) {
+		if err := utilfs.MkdirAll(kl.getCheckpointsDir(), 0700); err != nil {
+			return fmt.Errorf("error creating checkpoint directory: %v", err)
+		}
+	}
+	if selinux.GetEnabled() {
+		err := selinux.SetFileLabel(pluginRegistrationDir, kubeletconfig.KubeletPluginsDirSELinuxLabel)
+		if err != nil {
+			logger.Info("Unprivileged containerized plugins might not work, could not set selinux context on plugin registration dir", "path", pluginRegistrationDir, "err", err)
+		}
+		err = selinux.SetFileLabel(pluginsDir, kubeletconfig.KubeletPluginsDirSELinuxLabel)
+		if err != nil {
+			logger.Info("Unprivileged containerized plugins might not work, could not set selinux context on plugins dir", "path", pluginsDir, "err", err)
+		}
 	}
 	return nil
 }
 
 // StartGarbageCollection starts garbage collection threads.
-func (kl *Kubelet) StartGarbageCollection() {
+func (kl *Kubelet) StartGarbageCollection(ctx context.Context) {
+	logger := klog.FromContext(ctx)
 	loggedContainerGCFailure := false
-	go wait.Until(func() {
-		if err := kl.containerGC.GarbageCollect(); err != nil {
-			glog.Errorf("Container garbage collection failed: %v", err)
-			kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.ContainerGCFailed, err.Error())
+	go wait.UntilWithContext(ctx, func(ctx context.Context) {
+		if err := kl.containerGC.GarbageCollect(ctx); err != nil {
+			logger.Error(err, "Container garbage collection failed")
+			kl.recorder.WithLogger(logger).Eventf(kl.nodeRefWithUID(), v1.EventTypeWarning, events.ContainerGCFailed, "%s", err.Error())
 			loggedContainerGCFailure = true
 		} else {
-			var vLevel glog.Level = 4
+			var vLevel klog.Level = 4
 			if loggedContainerGCFailure {
 				vLevel = 1
 				loggedContainerGCFailure = false
 			}
 
-			glog.V(vLevel).Infof("Container garbage collection succeeded")
+			logger.V(int(vLevel)).Info("Container garbage collection succeeded")
 		}
-	}, ContainerGCPeriod, wait.NeverStop)
+	}, ContainerGCPeriod)
+
+	// when the high threshold is set to 100, and the max age is 0 (or the max age feature is disabled)
+	// stub the image GC manager
+	if kl.kubeletConfiguration.ImageGCHighThresholdPercent == 100 && kl.kubeletConfiguration.ImageMaximumGCAge.Duration == 0 {
+		logger.V(2).Info("ImageGCHighThresholdPercent is set 100 and ImageMaximumGCAge is 0, Disable image GC")
+		return
+	}
 
 	prevImageGCFailed := false
-	go wait.Until(func() {
-		if err := kl.imageManager.GarbageCollect(); err != nil {
+	beganGC := time.Now()
+	go wait.UntilWithContext(ctx, func(ctx context.Context) {
+		if err := kl.imageManager.GarbageCollect(ctx, beganGC); err != nil {
 			if prevImageGCFailed {
-				glog.Errorf("Image garbage collection failed multiple times in a row: %v", err)
+				logger.Error(err, "Image garbage collection failed multiple times in a row")
 				// Only create an event for repeated failures
-				kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.ImageGCFailed, err.Error())
+				kl.recorder.WithLogger(logger).Event(kl.nodeRefWithUID(), v1.EventTypeWarning, events.ImageGCFailed, err.Error())
 			} else {
-				glog.Errorf("Image garbage collection failed once. Stats initialization may not have completed yet: %v", err)
+				logger.Error(err, "Image garbage collection failed once. Stats initialization may not have completed yet")
 			}
 			prevImageGCFailed = true
 		} else {
-			var vLevel glog.Level = 4
+			var vLevel klog.Level = 4
 			if prevImageGCFailed {
 				vLevel = 1
 				prevImageGCFailed = false
 			}
 
-			glog.V(vLevel).Infof("Image garbage collection succeeded")
+			logger.V(int(vLevel)).Info("Image garbage collection succeeded")
 		}
-	}, ImageGCPeriod, wait.NeverStop)
+	}, ImageGCPeriod)
 }
 
 // initializeModules will initialize internal modules that do not require the container runtime to be up.
 // Note that the modules here must not depend on modules that are not initialized here.
-func (kl *Kubelet) initializeModules() error {
+func (kl *Kubelet) initializeModules(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
 	// Prometheus metrics.
-	metrics.Register(kl.runtimeCache)
+	metrics.Register()
+	metrics.RegisterCollectors(
+		collectors.NewVolumeStatsCollector(kl),
+		collectors.NewLogMetricsCollector(kl.StatsProvider.ListPodStats),
+	)
+	metrics.SetNodeName(kl.nodeName)
+	servermetrics.Register()
 
 	// Setup filesystem directories.
-	if err := kl.setupDataDirs(); err != nil {
+	if err := kl.setupDataDirs(logger); err != nil {
 		return err
 	}
 
 	// If the container logs directory does not exist, create it.
 	if _, err := os.Stat(ContainerLogsDir); err != nil {
 		if err := kl.os.MkdirAll(ContainerLogsDir, 0755); err != nil {
-			glog.Errorf("Failed to create directory %q: %v", ContainerLogsDir, err)
+			return fmt.Errorf("failed to create directory %q: %v", ContainerLogsDir, err)
+		}
+	}
+
+	if goos == "windows" {
+		// On Windows we should not allow other users to read the logs directory
+		// to avoid allowing non-root containers from reading the logs of other containers.
+		if err := utilfs.Chmod(ContainerLogsDir, 0750); err != nil {
+			return fmt.Errorf("failed to set permissions on directory %q: %w", ContainerLogsDir, err)
 		}
 	}
 
 	// Start the image manager.
-	kl.imageManager.Start()
+	kl.imageManager.Start(ctx)
 
-	// Start the certificate manager.
-	if utilfeature.DefaultFeatureGate.Enabled(features.RotateKubeletServerCertificate) {
+	// Start the certificate manager if it was enabled.
+	if kl.serverCertificateManager != nil {
 		kl.serverCertificateManager.Start()
 	}
 
-	// Start container manager.
-	node, err := kl.getNodeAnyWay()
-	if err != nil {
-		return fmt.Errorf("Kubelet failed to get node info: %v", err)
-	}
-
-	if err := kl.containerManager.Start(node, kl.GetActivePods, kl.sourcesReady, kl.statusManager, kl.runtimeService); err != nil {
-		return fmt.Errorf("Failed to start ContainerManager %v", err)
+	// Start the client CA manager if it was enabled.
+	if kl.clientCAManager != nil {
+		go kl.clientCAManager.Run(1, ctx.Done())
 	}
 
 	// Start out of memory watcher.
-	if err := kl.oomWatcher.Start(kl.nodeRef); err != nil {
-		return fmt.Errorf("Failed to start OOM watcher %v", err)
-	}
-
-	// Initialize GPUs
-	if err := kl.gpuManager.Start(); err != nil {
-		glog.Errorf("Failed to start gpuManager %v", err)
+	if kl.oomWatcher != nil {
+		if err := kl.oomWatcher.Start(ctx, kl.nodeRef); err != nil {
+			return fmt.Errorf("failed to start OOM watcher: %w", err)
+		}
 	}
 
 	// Start resource analyzer
-	kl.resourceAnalyzer.Start()
+	kl.resourceAnalyzer.Start(ctx)
 
 	return nil
 }
 
 // initializeRuntimeDependentModules will initialize internal modules that require the container runtime to be up.
-func (kl *Kubelet) initializeRuntimeDependentModules() {
+func (kl *Kubelet) initializeRuntimeDependentModules(ctx context.Context) {
+	logger := klog.FromContext(ctx)
 	if err := kl.cadvisor.Start(); err != nil {
 		// Fail kubelet and rely on the babysitter to retry starting kubelet.
-		// TODO(random-liu): Add backoff logic in the babysitter
-		glog.Fatalf("Failed to start cAdvisor %v", err)
+		logger.Error(err, "Failed to start cAdvisor")
+		os.Exit(1)
+	}
+
+	// trigger on-demand stats collection once so that we have capacity information for ephemeral storage.
+	// ignore any errors, since if stats collection is not successful, the container manager will fail to start below.
+	_, _, _ = kl.StatsProvider.GetCgroupStats(ctx, "/", true)
+	// Start container manager.
+	node, err := kl.getNodeAnyWay(ctx)
+	if err != nil {
+		// Fail kubelet and rely on the babysitter to retry starting kubelet.
+		logger.Error(err, "Kubelet failed to get node info")
+		os.Exit(1)
+	}
+	// containerManager must start after cAdvisor because it needs filesystem capacity information
+	if err := kl.containerManager.Start(ctx, node, kl.GetActivePods, kl.getNodeAnyWay, kl.sourcesReady, kl.statusManager, kl.runtimeService, kl.supportLocalStorageCapacityIsolation()); err != nil {
+		// Fail kubelet and rely on the babysitter to retry starting kubelet.
+		logger.Error(err, "Failed to start ContainerManager")
+		os.Exit(1)
 	}
 	// eviction manager must start after cadvisor because it needs to know if the container runtime has a dedicated imagefs
-	kl.evictionManager.Start(kl.cadvisor, kl.GetActivePods, kl.podResourcesAreReclaimed, kl.containerManager, evictionMonitoringPeriod)
+	// Eviction decisions are based on the allocated (rather than desired) pod resources.
+	kl.evictionManager.Start(ctx, kl.StatsProvider, kl.getAllocatedPods, kl.PodIsFinished, evictionMonitoringPeriod)
+
+	// container log manager must start after container runtime is up to retrieve information from container runtime
+	// and inform container to reopen log file after log rotation.
+	kl.containerLogManager.Start(ctx)
+	// Adding Registration Callback function for CSI Driver
+	kl.pluginManager.AddHandler(pluginwatcherapi.CSIPlugin, plugincache.PluginHandler(csi.PluginHandler))
+	// Adding Registration Callback function for DRA Plugin and Device Plugin
+	for name, handler := range kl.containerManager.GetPluginRegistrationHandlers() {
+		kl.pluginManager.AddHandler(name, handler)
+	}
+
+	// Start the plugin manager
+	logger.V(4).Info("Starting plugin manager")
+	pluginManagerStopCh := kl.pluginManagerStopCh
+	if pluginManagerStopCh == nil {
+		pluginManagerStopCh = wait.NeverStop
+	}
+	go kl.pluginManager.Run(ctx, kl.sourcesReady, pluginManagerStopCh)
+
+	err = kl.shutdownManager.Start(ctx)
+	if err != nil {
+		// The shutdown manager is not critical for kubelet, so log failure, but don't block Kubelet startup if there was a failure starting it.
+		logger.Error(err, "Failed to start node shutdown manager")
+	}
 }
 
 // Run starts the kubelet reacting to config updates
-func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
+func (kl *Kubelet) Run(ctx context.Context, updates <-chan kubetypes.PodUpdate) {
+	logger := klog.FromContext(ctx)
 	if kl.logServer == nil {
-		kl.logServer = http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))
+		file := http.FileServer(http.Dir(nodeLogDir))
+		if utilfeature.DefaultFeatureGate.Enabled(features.NodeLogQuery) && kl.kubeletConfiguration.EnableSystemLogQuery {
+			kl.logServer = http.StripPrefix("/logs/", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if nlq, errs := newNodeLogQuery(req.URL.Query()); len(errs) > 0 {
+					http.Error(w, errs.ToAggregate().Error(), http.StatusBadRequest)
+					return
+				} else if nlq != nil {
+					if req.URL.Path != "/" && req.URL.Path != "" {
+						http.Error(w, "path not allowed in query mode", http.StatusNotAcceptable)
+						return
+					}
+					if errs := nlq.validate(); len(errs) > 0 {
+						http.Error(w, errs.ToAggregate().Error(), http.StatusNotAcceptable)
+						return
+					}
+					// Validation ensures that the request does not query services and files at the same time
+					if len(nlq.Services) > 0 {
+						journal.ServeHTTP(w, req)
+						return
+					}
+					// Validation ensures that the request does not explicitly query multiple files at the same time
+					if len(nlq.Files) == 1 {
+						// Account for the \ being used on Windows clients
+						req.URL.Path = filepath.ToSlash(nlq.Files[0])
+					}
+				}
+				// Fall back in case the caller is directly trying to query a file
+				// Example: kubectl get --raw /api/v1/nodes/$name/proxy/logs/foo.log
+				file.ServeHTTP(w, req)
+			}))
+		} else {
+			kl.logServer = http.StripPrefix("/logs/", file)
+		}
 	}
 	if kl.kubeClient == nil {
-		glog.Warning("No api server defined - no node status update will be sent.")
+		logger.Info("No API server defined - no node status update will be sent")
 	}
 
-	if err := kl.initializeModules(); err != nil {
-		kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.KubeletSetupFailed, err.Error())
-		glog.Error(err)
-		kl.runtimeState.setInitError(err)
+	if err := kl.initializeModules(ctx); err != nil {
+		kl.recorder.WithLogger(logger).Eventf(kl.nodeRefWithUID(), v1.EventTypeWarning, events.KubeletSetupFailed, "%s", err.Error())
+		logger.Error(err, "Failed to initialize internal modules")
+		os.Exit(1)
+	}
+
+	if err := kl.cgroupVersionCheck(); err != nil {
+		logger.V(2).Info("Warning: cgroup check", "error", err)
+	}
+
+	// Start the allocation manager
+	if kl.allocationManager != nil {
+		kl.allocationManager.Run(ctx)
 	}
 
 	// Start volume manager
-	go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
+	go kl.volumeManager.Run(ctx, kl.sourcesReady)
 
 	if kl.kubeClient != nil {
-		// Start syncing node status immediately, this may set up things the runtime needs to run.
-		go wait.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, wait.NeverStop)
-	}
-	go wait.Until(kl.syncNetworkStatus, 30*time.Second, wait.NeverStop)
-	go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
+		// Start two go-routines to update the status.
+		//
+		// The first will report to the apiserver every nodeStatusUpdateFrequency and is aimed to provide regular status intervals,
+		// while the second is used to provide a more timely status update during initialization and runs an one-shot update to the apiserver
+		// once the node becomes ready, then exits afterwards.
+		//
+		// Introduce some small jittering to ensure that over time the requests won't start
+		// accumulating at approximately the same time from the set of nodes due to priority and
+		// fairness effect.
+		go func() {
+			// Call updateRuntimeUp once before syncNodeStatus to make sure kubelet had already checked runtime state
+			// otherwise when restart kubelet, syncNodeStatus will report node notReady in first report period
+			kl.updateRuntimeUp(ctx)
+			wait.JitterUntil(func() { kl.syncNodeStatus(ctx) }, kl.nodeStatusUpdateFrequency, 0.04, true, wait.NeverStop)
+		}()
 
-	// Start loop to sync iptables util rules
+		// Keep the previous detached behavior from context.Background while still
+		// propagating logging values for contextual logging.
+		go kl.fastStatusUpdateOnce(context.WithoutCancel(ctx))
+
+		// Keep renewing the node lease until the kubelet exits.
+		// This intentionally does not use the kubelet context so lease renewal can
+		// continue during graceful shutdown.
+		go kl.nodeLeaseController.Run(context.Background())
+
+		// Mirror pods for static pods may not be created immediately during node startup
+		// due to node registration or informer sync delays. They will be created eventually
+		//  when static pods are resynced (every 1-1.5 minutes).
+		// To ensure kube-scheduler is aware of static pod resource usage faster,
+		// mirror pods are created as soon as the node registers.
+		go kl.fastStaticPodsRegistration(ctx)
+	}
+	go wait.UntilWithContext(ctx, kl.updateRuntimeUp, 5*time.Second)
+
+	// Set up iptables util rules
 	if kl.makeIPTablesUtilChains {
-		go wait.Until(kl.syncNetworkUtil, 1*time.Minute, wait.NeverStop)
-	}
-
-	// Start a goroutine responsible for killing pods (that are not properly
-	// handled by pod workers).
-	go wait.Until(kl.podKiller, 1*time.Second, wait.NeverStop)
-
-	// Start gorouting responsible for checking limits in resolv.conf
-	if kl.dnsConfigurer.ResolverConfig != "" {
-		go wait.Until(func() { kl.dnsConfigurer.CheckLimitsForResolvConf() }, 30*time.Second, wait.NeverStop)
+		kl.initNetworkUtil(ctx)
 	}
 
 	// Start component sync loops.
-	kl.statusManager.Start()
-	kl.probeManager.Start()
+	kl.statusManager.Start(ctx)
+
+	// Start syncing RuntimeClasses if enabled.
+	if kl.runtimeClassManager != nil {
+		kl.runtimeClassManager.Start(ctx)
+	}
 
 	// Start the pod lifecycle event generator.
-	kl.pleg.Start()
-	kl.syncLoop(updates, kl)
+	kl.pleg.Start(ctx)
+
+	if kl.eventedPlegWatcher != nil {
+		kl.eventedPlegWatcher.Start(ctx)
+	}
+
+	if kl.healthChecker != nil {
+		kl.healthChecker.SetHealthCheckers(kl, kl.containerManager.GetHealthCheckers())
+	}
+
+	kl.syncLoop(ctx, updates, kl)
 }
 
-// GetKubeClient returns the Kubernetes client.
-// TODO: This is currently only required by network plugins. Replace
-// with more specific methods.
-func (kl *Kubelet) GetKubeClient() clientset.Interface {
-	return kl.kubeClient
-}
-
-// syncPod is the transaction script for the sync of a single pod.
+// SyncPod is the transaction script for the sync of a single pod (setting up)
+// a pod. This method is reentrant and expected to converge a pod towards the
+// desired state of the spec. The reverse (teardown) is handled in
+// SyncTerminatingPod and SyncTerminatedPod. If SyncPod exits without error,
+// then the pod runtime state is in sync with the desired configuration state
+// (pod is running). If SyncPod exits with a transient error, the next
+// invocation of SyncPod is expected to make progress towards reaching the
+// desired state. SyncPod exits with isTerminal when the pod was detected to
+// have reached a terminal lifecycle phase due to container exits (for
+// RestartNever or RestartOnFailure) and the next method invoked will be
+// SyncTerminatingPod. If the pod terminates for any other reason, SyncPod
+// will receive a context cancellation and should exit as soon as possible.
 //
 // Arguments:
 //
-// o - the SyncPodOptions for this invocation
+// updateType - whether this is a create (first time) or an update, should
+// only be used for metrics since this method must be reentrant
+//
+// pod - the pod that is being set up
+//
+// mirrorPod - the mirror pod known to the kubelet for this pod, if any
+//
+// podStatus - the most recent pod status observed for this pod which can
+// be used to determine the set of actions that should be taken during
+// this loop of SyncPod
 //
 // The workflow is:
-// * If the pod is being created, record pod worker start latency
-// * Call generateAPIPodStatus to prepare an v1.PodStatus for the pod
-// * If the pod is being seen as running for the first time, record pod
-//   start latency
-// * Update the status of the pod in the status manager
-// * Kill the pod if it should not be running
-// * Create a mirror pod if the pod is a static pod, and does not
-//   already have a mirror pod
-// * Create the data directories for the pod if they do not exist
-// * Wait for volumes to attach/mount
-// * Fetch the pull secrets for the pod
-// * Call the container runtime's SyncPod callback
-// * Update the traffic shaping for the pod's ingress and egress limits
+//   - If the pod is being created, record pod worker start latency
+//   - Call generateAPIPodStatus to prepare an v1.PodStatus for the pod
+//   - If the pod is being seen as running for the first time, record pod
+//     start latency
+//   - Update the status of the pod in the status manager
+//   - Stop the pod's containers if it should not be running due to soft
+//     admission
+//   - Ensure any background tracking for a runnable pod is started
+//   - Create a mirror pod if the pod is a static pod, and does not
+//     already have a mirror pod
+//   - Create the data directories for the pod if they do not exist
+//   - Wait for volumes to attach/mount
+//   - Fetch the pull secrets for the pod
+//   - Call the container runtime's SyncPod callback
+//   - Update the traffic shaping for the pod's ingress and egress limits
 //
 // If any step of this workflow errors, the error is returned, and is repeated
-// on the next syncPod call.
+// on the next SyncPod call.
 //
 // This operation writes all events that are dispatched in order to provide
 // the most accurate information possible about an error situation to aid debugging.
-// Callers should not throw an event if this operation returns an error.
-func (kl *Kubelet) syncPod(o syncPodOptions) error {
-	// pull out the required options
-	pod := o.pod
-	mirrorPod := o.mirrorPod
-	podStatus := o.podStatus
-	updateType := o.updateType
-
-	// if we want to kill a pod, do it now!
-	if updateType == kubetypes.SyncPodKill {
-		killPodOptions := o.killPodOptions
-		if killPodOptions == nil || killPodOptions.PodStatusFunc == nil {
-			return fmt.Errorf("kill pod options are required if update type is kill")
+// Callers should not write an event if this operation returns an error.
+func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (isTerminal bool, postSync func(), err error) {
+	ctx, otelSpan := kl.tracer.Start(ctx, "syncPod", trace.WithAttributes(
+		semconv.K8SPodUIDKey.String(string(pod.UID)),
+		attribute.String("k8s.pod", klog.KObj(pod).String()),
+		semconv.K8SPodNameKey.String(pod.Name),
+		attribute.String("k8s.pod.update_type", updateType.String()),
+		semconv.K8SNamespaceNameKey.String(pod.Namespace),
+	))
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("SyncPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer func() {
+		if err != nil {
+			otelSpan.RecordError(err)
+			otelSpan.SetStatus(codes.Error, err.Error())
 		}
-		apiPodStatus := killPodOptions.PodStatusFunc(pod, podStatus)
-		kl.statusManager.SetPodStatus(pod, apiPodStatus)
-		// we kill the pod with the specified grace period since this is a termination
-		if err := kl.killPod(pod, nil, podStatus, killPodOptions.PodTerminationGracePeriodSecondsOverride); err != nil {
-			kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
-			// there was an error killing the pod, so we return that error directly
-			utilruntime.HandleError(err)
-			return err
-		}
-		return nil
-	}
+		logger.V(4).Info("SyncPod exit", "pod", klog.KObj(pod), "podUID", pod.UID, "isTerminal", isTerminal)
+		otelSpan.End()
+	}()
 
 	// Latency measurements for the main workflow are relative to the
-	// first time the pod was seen by the API server.
+	// first time the pod was seen by kubelet.
 	var firstSeenTime time.Time
 	if firstSeenTimeStr, ok := pod.Annotations[kubetypes.ConfigFirstSeenAnnotationKey]; ok {
 		firstSeenTime = kubetypes.ConvertToTimestamp(firstSeenTimeStr).Get()
@@ -1443,69 +2106,72 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 		if !firstSeenTime.IsZero() {
 			// This is the first time we are syncing the pod. Record the latency
 			// since kubelet first saw the pod if firstSeenTime is set.
-			metrics.PodWorkerStartLatency.Observe(metrics.SinceInMicroseconds(firstSeenTime))
+			metrics.PodWorkerStartDuration.Observe(metrics.SinceInSeconds(firstSeenTime))
 		} else {
-			glog.V(3).Infof("First seen time not recorded for pod %q", pod.UID)
+			logger.V(3).Info("First seen time not recorded for pod",
+				"podUID", pod.UID,
+				"pod", klog.KObj(pod))
 		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		// Check whether a resize is in progress so we can set the PodResizeInProgressCondition accordingly.
+		if kl.containerRuntime.IsPodResizeInProgress(pod, podStatus) {
+			kl.statusManager.SetPodResizeInProgressCondition(pod.UID, "", "", pod.Generation)
+		} else if generation, cleared := kl.statusManager.ClearPodResizeInProgressCondition(pod.UID); cleared {
+			// (Allocated == Actual) => clear the resize in-progress status.
+			msg := events.PodResizeCompletedMsg(logger, pod, generation)
+			kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeNormal, events.ResizeCompleted, "%s", msg)
+		}
+		// TODO(natasha41575): There is a race condition here, where the goroutine in the
+		// allocation manager may allocate a new resize and unconditionally set the
+		// PodResizeInProgressCondition before we set the status below.
 	}
 
 	// Generate final API pod status with pod and status manager status
-	apiPodStatus := kl.generateAPIPodStatus(pod, podStatus)
+	apiPodStatus := kl.generateAPIPodStatus(ctx, pod, podStatus, SyncPod)
 	// The pod IP may be changed in generateAPIPodStatus if the pod is using host network. (See #24576)
 	// TODO(random-liu): After writing pod spec into container labels, check whether pod is using host network, and
 	// set pod IP to hostIP directly in runtime.GetPodStatus
-	podStatus.IP = apiPodStatus.PodIP
+	podStatus.IPs = make([]string, 0, len(apiPodStatus.PodIPs))
+	for _, ipInfo := range apiPodStatus.PodIPs {
+		podStatus.IPs = append(podStatus.IPs, ipInfo.IP)
+	}
+	if len(podStatus.IPs) == 0 && len(apiPodStatus.PodIP) > 0 {
+		podStatus.IPs = []string{apiPodStatus.PodIP}
+	}
 
-	// Record the time it takes for the pod to become running.
+	// If the pod is terminal, we don't need to continue to setup the pod
+	if apiPodStatus.Phase == v1.PodSucceeded || apiPodStatus.Phase == v1.PodFailed {
+		kl.statusManager.SetPodStatus(logger, pod, apiPodStatus)
+		isTerminal = true
+		return isTerminal, nil, nil
+	}
+
+	// Record the time it takes for the pod to become running
+	// since kubelet first saw the pod if firstSeenTime is set.
 	existingStatus, ok := kl.statusManager.GetPodStatus(pod.UID)
 	if !ok || existingStatus.Phase == v1.PodPending && apiPodStatus.Phase == v1.PodRunning &&
 		!firstSeenTime.IsZero() {
-		metrics.PodStartLatency.Observe(metrics.SinceInMicroseconds(firstSeenTime))
+		metrics.PodStartDuration.Observe(metrics.SinceInSeconds(firstSeenTime))
 	}
 
-	runnable := kl.canRunPod(pod)
-	if !runnable.Admit {
-		// Pod is not runnable; update the Pod and Container statuses to why.
-		apiPodStatus.Reason = runnable.Reason
-		apiPodStatus.Message = runnable.Message
-		// Waiting containers are not creating.
-		const waitingReason = "Blocked"
-		for _, cs := range apiPodStatus.InitContainerStatuses {
-			if cs.State.Waiting != nil {
-				cs.State.Waiting.Reason = waitingReason
-			}
-		}
-		for _, cs := range apiPodStatus.ContainerStatuses {
-			if cs.State.Waiting != nil {
-				cs.State.Waiting.Reason = waitingReason
-			}
-		}
-	}
-
-	// Update status in the status manager
-	kl.statusManager.SetPodStatus(pod, apiPodStatus)
-
-	// Kill pod if it should not be running
-	if !runnable.Admit || pod.DeletionTimestamp != nil || apiPodStatus.Phase == v1.PodFailed {
-		var syncErr error
-		if err := kl.killPod(pod, nil, podStatus, nil); err != nil {
-			kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
-			syncErr = fmt.Errorf("error killing pod: %v", err)
-			utilruntime.HandleError(syncErr)
-		} else {
-			if !runnable.Admit {
-				// There was no error killing the pod, but the pod cannot be run.
-				// Return an error to signal that the sync loop should back off.
-				syncErr = fmt.Errorf("pod cannot be run: %s", runnable.Message)
-			}
-		}
-		return syncErr
-	}
+	kl.statusManager.SetPodStatus(logger, pod, apiPodStatus)
 
 	// If the network plugin is not ready, only start the pod if it uses the host network
-	if rs := kl.runtimeState.networkErrors(); len(rs) != 0 && !kubecontainer.IsHostNetworkPod(pod) {
-		kl.recorder.Eventf(pod, v1.EventTypeWarning, events.NetworkNotReady, "network is not ready: %v", rs)
-		return fmt.Errorf("network is not ready: %v", rs)
+	if err := kl.runtimeState.networkErrors(); err != nil && !kubecontainer.IsHostNetworkPod(pod) {
+		kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.NetworkNotReady, "%s: %v", NetworkNotReadyErrorMsg, err)
+		return false, nil, fmt.Errorf("%s: %v", NetworkNotReadyErrorMsg, err)
+	}
+
+	// ensure the kubelet knows about referenced secrets or configmaps used by the pod
+	if !kl.podWorkers.IsPodTerminationRequested(pod.UID) {
+		if kl.secretManager != nil {
+			kl.secretManager.RegisterPod(pod)
+		}
+		if kl.configMapManager != nil {
+			kl.configMapManager.RegisterPod(pod)
+		}
 	}
 
 	// Create Cgroups for the pod and apply resource parameters
@@ -1513,7 +2179,8 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 	pcm := kl.containerManager.NewPodContainerManager()
 	// If pod has already been terminated then we need not create
 	// or update the pod's cgroup
-	if !kl.podIsTerminated(pod) {
+	// TODO: once context cancellation is added this check can be removed
+	if !kl.podWorkers.IsPodTerminationRequested(pod.UID) {
 		// When the kubelet is restarted with the cgroups-per-qos
 		// flag enabled, all the pod's running containers
 		// should be killed intermittently and brought back up
@@ -1530,8 +2197,14 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 		// exists or the pod is running for the first time
 		podKilled := false
 		if !pcm.Exists(pod) && !firstSync {
-			if err := kl.killPod(pod, nil, podStatus, nil); err == nil {
+			p := kubecontainer.ConvertPodStatusToRunningPod(kl.getRuntime().Type(), podStatus)
+			if err := kl.killPod(ctx, pod, p, nil); err == nil {
 				podKilled = true
+			} else {
+				if wait.Interrupted(err) {
+					return false, nil, nil
+				}
+				logger.Error(err, "KillPod failed", "pod", klog.KObj(pod), "podStatus", podStatus)
 			}
 		}
 		// Create and Update pod's Cgroups
@@ -1541,87 +2214,417 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 		// expected to run only once and if the kubelet is restarted then
 		// they are not expected to run again.
 		// We don't create and apply updates to cgroup if its a run once pod and was killed above
-		if !(podKilled && pod.Spec.RestartPolicy == v1.RestartPolicyNever) {
-			if !pcm.Exists(pod) {
-				if err := kl.containerManager.UpdateQOSCgroups(); err != nil {
-					glog.V(2).Infof("Failed to update QoS cgroups while syncing pod: %v", err)
+		runOnce := pod.Spec.RestartPolicy == v1.RestartPolicyNever
+		// With ContainerRestartRules, if any container is restartable, the pod should be restarted.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ContainerRestartRules) {
+			for _, c := range pod.Spec.Containers {
+				if podutil.IsContainerRestartable(pod.Spec, c) {
+					runOnce = false
 				}
-				if err := pcm.EnsureExists(pod); err != nil {
-					kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToCreatePodContainer, "unable to ensure pod container exists: %v", err)
-					return fmt.Errorf("failed to ensure that the pod: %v cgroups exist and are correctly applied: %v", pod.UID, err)
+			}
+		}
+		if !podKilled || !runOnce {
+			if !pcm.Exists(pod) {
+				if err := kl.containerManager.UpdateQOSCgroups(logger); err != nil {
+					logger.V(2).Info("Failed to update QoS cgroups while syncing pod", "pod", klog.KObj(pod), "err", err)
+				}
+				if err := pcm.EnsureExists(logger, pod); err != nil {
+					kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedToCreatePodContainer, "unable to ensure pod container exists: %v", err)
+					return false, nil, fmt.Errorf("failed to ensure that the pod: %v cgroups exist and are correctly applied: %v", pod.UID, err)
+				}
+
+				if err = kl.containerRuntime.UpdateActuatedPodLevelResources(logger, pod); err != nil {
+					return false, nil, fmt.Errorf("failed to update the state of pod-level resources for the pod %v : %w", pod.UID, err)
 				}
 			}
 		}
 	}
 
 	// Create Mirror Pod for Static Pod if it doesn't already exist
-	if kubepod.IsStaticPod(pod) {
-		podFullName := kubecontainer.GetPodFullName(pod)
-		deleted := false
-		if mirrorPod != nil {
-			if mirrorPod.DeletionTimestamp != nil || !kl.podManager.IsMirrorPodOf(mirrorPod, pod) {
-				// The mirror pod is semantically different from the static pod. Remove
-				// it. The mirror pod will get recreated later.
-				glog.Warningf("Deleting mirror pod %q because it is outdated", format.Pod(mirrorPod))
-				if err := kl.podManager.DeleteMirrorPod(podFullName); err != nil {
-					glog.Errorf("Failed deleting mirror pod %q: %v", format.Pod(mirrorPod), err)
-				} else {
-					deleted = true
-				}
-			}
-		}
-		if mirrorPod == nil || deleted {
-			node, err := kl.GetNode()
-			if err != nil || node.DeletionTimestamp != nil {
-				glog.V(4).Infof("No need to create a mirror pod, since node %q has been removed from the cluster", kl.nodeName)
-			} else {
-				glog.V(4).Infof("Creating a mirror pod for static pod %q", format.Pod(pod))
-				if err := kl.podManager.CreateMirrorPod(pod); err != nil {
-					glog.Errorf("Failed creating a mirror pod for %q: %v", format.Pod(pod), err)
-				}
-			}
-		}
-	}
+	kl.tryReconcileMirrorPods(ctx, pod, mirrorPod)
 
 	// Make data directories for the pod
 	if err := kl.makePodDataDirs(pod); err != nil {
-		kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToMakePodDataDirectories, "error making pod data directories: %v", err)
-		glog.Errorf("Unable to make pod data directories for pod %q: %v", format.Pod(pod), err)
-		return err
+		kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedToMakePodDataDirectories, "error making pod data directories: %v", err)
+		logger.Error(err, "Unable to make pod data directories for pod", "pod", klog.KObj(pod))
+		return false, nil, err
 	}
 
-	// Volume manager will not mount volumes for terminated pods
-	if !kl.podIsTerminated(pod) {
-		// Wait for volumes to attach/mount
-		if err := kl.volumeManager.WaitForAttachAndMount(pod); err != nil {
-			kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedMountVolume, "Unable to mount volumes for pod %q: %v", format.Pod(pod), err)
-			glog.Errorf("Unable to mount volumes for pod %q: %v; skipping pod", format.Pod(pod), err)
-			return err
+	// Wait for volumes to attach/mount
+	if err := kl.volumeManager.WaitForAttachAndMount(ctx, pod); err != nil {
+		var volumeAttachLimitErr *volumemanager.VolumeAttachLimitExceededError
+		if errors.As(err, &volumeAttachLimitErr) {
+			kl.rejectPod(ctx, pod, volumemanager.VolumeAttachmentLimitExceededReason, volumeAttachLimitErr.Error())
+			recordAdmissionRejection(volumemanager.VolumeAttachmentLimitExceededReason)
+			return true, nil, nil
+		}
+		if !wait.Interrupted(err) {
+			kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedMountVolume, "Unable to attach or mount volumes: %v", err)
+			logger.Error(err, "Unable to attach or mount volumes for pod; skipping pod", "pod", klog.KObj(pod))
+		}
+		return false, nil, err
+	}
+	// Volumes are finished mounting. Make sure actuated state (container resources and volume limits) is initialized.
+	kl.containerRuntime.InitializeActuatedPod(logger, pod)
+
+	// Fetch the pull secrets for the pod
+	pullSecrets, missingPullSecretNames := kl.getPullSecretsForPod(logger, pod)
+
+	// Ensure the pod is being probed
+	kl.probeManager.AddPod(ctx, pod)
+
+	// TODO(#113606): use cancellation from the incoming context parameter, which comes from the pod worker.
+	// Currently, using cancellation from that context causes test failures. To remove this WithoutCancel,
+	// any wait.Interrupted errors need to be filtered from result and bypass the reasonCache - cancelling
+	// the context for SyncPod is a known and deliberate error, not a generic error.
+	// Use WithoutCancel instead of a new context.TODO() to propagate trace context
+	// Call the container runtime's SyncPod callback
+	sctx := context.WithoutCancel(ctx)
+	restartingAllContainers := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
+		for _, cond := range apiPodStatus.Conditions {
+			if cond.Type == v1.AllContainersRestarting && cond.Status == v1.ConditionTrue {
+				restartingAllContainers = true
+			}
+		}
+	}
+	result := kl.containerRuntime.SyncPod(sctx, pod, podStatus, pullSecrets, kl.crashLoopBackOff, restartingAllContainers)
+	kl.reasonCache.Update(pod.UID, result)
+
+	// If we just performed a RestartAllContainers reset, we want to immediately
+	// trigger another sync to start the containers, rather than waiting for PLEG
+	// or the periodic resync.
+	if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) &&
+		restartingAllContainers && result.Error() == nil {
+		shouldRequeue := false
+		for _, r := range result.SyncResults {
+			if r.Action == kubecontainer.RemoveContainer && r.Error == nil {
+				shouldRequeue = true
+				break
+			}
+		}
+		if shouldRequeue {
+			// This will not cause an infinite loop because UpdatePod merges concurrent updates
+			// to the same pod. Because all containers are removed, the subsequent SyncPod
+			// execution will unset the AllContainersRestarting condition and break the cycle.
+			kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+				Pod:        pod,
+				MirrorPod:  mirrorPod,
+				UpdateType: kubetypes.SyncPodUpdate,
+			})
 		}
 	}
 
-	// Fetch the pull secrets for the pod
-	pullSecrets := kl.getPullSecretsForPod(pod)
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		for _, r := range result.SyncResults {
+			if r.Action == kubecontainer.ResizePodInPlace && r.Error != nil {
+				// If the condition already exists, the observedGeneration does not get updated.
+				if generation, updated := kl.statusManager.SetPodResizeInProgressCondition(pod.UID, v1.PodReasonError, r.Message, pod.Generation); updated {
+					msg := events.PodResizeErrorMsg(logger, pod, generation, r.Message)
+					kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.ResizeError, "%s", msg)
+				}
+			}
+		}
+	}
 
-	// Call the container runtime's SyncPod callback
-	result := kl.containerRuntime.SyncPod(pod, apiPodStatus, podStatus, pullSecrets, kl.backOff)
-	kl.reasonCache.Update(pod.UID, result)
-	if err := result.Error(); err != nil {
-		// Do not record an event here, as we keep all event logging for sync pod failures
-		// local to container runtime so we get better errors
+	// If there are named pull secrets which couldn't be found and this sync had any image pull errors, emit an event because it may be useful for debugging a configuration error.
+	if len(missingPullSecretNames) > 0 {
+		hasPullFailures := false
+		for _, r := range result.SyncResults {
+			// This only triggers if the sync actually attempted a pull - if the sync didn't pull due to a backoff it won't trigger again.
+			if errors.Is(r.Error, images.ErrImagePull) {
+				hasPullFailures = true
+				break
+			}
+		}
+		if hasPullFailures {
+			kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, "FailedToRetrieveImagePullSecret", "Unable to retrieve some image pull secrets (%s); attempting to pull the image may not succeed.", strings.Join(missingPullSecretNames, ", "))
+		}
+	}
+
+	err = result.Error()
+	if len(result.SyncResults) > 0 && err == nil {
+		postSync = func() {
+			kl.RequestPodRelist(klog.FromContext(ctx), pod.UID)
+		}
+	}
+
+	return false, postSync, err
+}
+
+// SyncTerminatingPod is expected to terminate all running containers in a pod. Once this method
+// returns without error, the pod is considered to be terminated and it will be safe to clean up any
+// pod state that is tied to the lifetime of running containers. The next method invoked will be
+// SyncTerminatedPod. This method is expected to return with the grace period provided and the
+// provided context may be cancelled if the duration is exceeded. The method may also be interrupted
+// with a context cancellation if the grace period is shortened by the user or the kubelet (such as
+// during eviction). This method is not guaranteed to be called if a pod is force deleted from the
+// configuration and the kubelet is restarted - SyncTerminatingRuntimePod handles those orphaned
+// pods.
+func (kl *Kubelet) SyncTerminatingPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) (err error) {
+	// TODO(#113606): connect this with the incoming context parameter, which comes from the pod worker.
+	// Currently, using that context causes test failures.
+	logger := klog.FromContext(ctx)
+	ctx = klog.NewContext(context.TODO(), logger)
+	logger.V(4).Info("SyncTerminatingPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	ctx, otelSpan := kl.tracer.Start(ctx, "syncTerminatingPod", trace.WithAttributes(
+		semconv.K8SPodUIDKey.String(string(pod.UID)),
+		attribute.String("k8s.pod", klog.KObj(pod).String()),
+		semconv.K8SPodNameKey.String(pod.Name),
+		semconv.K8SNamespaceNameKey.String(pod.Namespace),
+	))
+	defer func() {
+		if err != nil {
+			otelSpan.RecordError(err)
+			otelSpan.SetStatus(codes.Error, err.Error())
+		}
+		otelSpan.End()
+		logger.V(4).Info("SyncTerminatingPod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}()
+
+	apiPodStatus := kl.generateAPIPodStatus(ctx, pod, podStatus, TerminatingPod)
+	if podStatusFn != nil {
+		podStatusFn(&apiPodStatus)
+	}
+	kl.statusManager.SetPodStatus(logger, pod, apiPodStatus)
+
+	if gracePeriod != nil {
+		logger.V(4).Info("Pod terminating with grace period", "pod", klog.KObj(pod), "podUID", pod.UID, "gracePeriod", *gracePeriod)
+	} else {
+		logger.V(4).Info("Pod terminating with grace period", "pod", klog.KObj(pod), "podUID", pod.UID, "gracePeriod", nil)
+	}
+
+	kl.probeManager.StopLivenessAndStartup(pod)
+
+	p := kubecontainer.ConvertPodStatusToRunningPod(kl.getRuntime().Type(), podStatus)
+	if err := kl.killPod(ctx, pod, p, gracePeriod); err != nil {
+		kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
+		// there was an error killing the pod, so we return that error directly
+		return fmt.Errorf("error killing terminating pod: %w", err)
+	}
+
+	// Once the containers are stopped, we can stop probing for liveness and readiness.
+	// TODO: once a pod is terminal, certain probes (liveness exec) could be stopped immediately after
+	//   the detection of a container shutdown or (for readiness) after the first failure. Tracked as
+	//   https://github.com/kubernetes/kubernetes/issues/107894 although may not be worth optimizing.
+	kl.probeManager.RemovePod(pod)
+
+	// Guard against consistency issues in KillPod implementations by checking that there are no
+	// running containers. This method is invoked infrequently so this is effectively free and can
+	// catch race conditions introduced by callers updating pod status out of order.
+	// TODO: have KillPod return the terminal status of stopped containers and write that into the
+	//  cache immediately
+	runtimePod, err := kl.containerRuntime.GetPod(ctx, pod.UID)
+	if err != nil {
+		if errors.Is(err, kubecontainer.ErrPodNotFound) {
+			// If pod sandboxes were already cleaned up, proceed with an empty runtimePod.
+			runtimePod = &kubecontainer.Pod{
+				ID:        pod.UID,
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Timestamp: kl.clock.Now(),
+			}
+		} else {
+			return fmt.Errorf("unable to get pod prior to final pod termination: %w", err)
+		}
+	}
+	stoppedPodStatus, err := kl.containerRuntime.GetPodStatus(ctx, runtimePod)
+	if err != nil {
+		return fmt.Errorf("unable to read pod status prior to final pod termination: %w", err)
+	}
+	preserveDataFromBeforeStopping(stoppedPodStatus, podStatus)
+	var runningContainers []string
+	type container struct {
+		Name       string
+		State      string
+		ExitCode   int
+		FinishedAt string
+	}
+	var containers []container
+	loggerV := logger.V(4)
+	loggerVEnabled := loggerV.Enabled()
+	for _, s := range stoppedPodStatus.ContainerStatuses {
+		if s.State == kubecontainer.ContainerStateRunning {
+			runningContainers = append(runningContainers, s.ID.String())
+		}
+		if loggerVEnabled {
+			containers = append(containers, container{Name: s.Name, State: string(s.State), ExitCode: s.ExitCode, FinishedAt: s.FinishedAt.UTC().Format(time.RFC3339Nano)})
+		}
+	}
+	if loggerVEnabled {
+		sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+		logger.V(4).Info("Post-termination container state", "pod", klog.KObj(pod), "podUID", pod.UID, "containers", containers)
+	}
+	if len(runningContainers) > 0 {
+		return fmt.Errorf("detected running containers after a successful KillPod, CRI violation: %v", runningContainers)
+	}
+
+	// NOTE: resources must be unprepared AFTER all containers have stopped
+	// and BEFORE the pod status is changed on the API server
+	// to avoid race conditions with the resource deallocation code in kubernetes core.
+	if err := kl.UnprepareDynamicResources(ctx, pod); err != nil {
 		return err
 	}
+
+	// Compute and update the status in cache once the pods are no longer running.
+	// The computation is done here to ensure the pod status used for it contains
+	// information about the container end states (including exit codes) - when
+	// SyncTerminatedPod is called the containers may already be removed.
+	apiPodStatus = kl.generateAPIPodStatus(ctx, pod, stoppedPodStatus, TerminatedPod)
+	// Re-apply the caller's status override to the status generated after the
+	// containers have stopped: this is the update the status manager is
+	// allowed to publish as terminal, so the override must be part of it.
+	// The application before the kill above is still required. Some callers,
+	// such as the node shutdown manager, only set Failed when the status is
+	// not already Succeeded. If a container handles SIGTERM by exiting 0 the
+	// status generated here computes Succeeded, which such a callback leaves
+	// alone; the earlier application recorded Failed in the status manager
+	// cache, and the phase merge in generateAPIPodStatus preserves it.
+	if podStatusFn != nil {
+		podStatusFn(&apiPodStatus)
+	}
+	kl.statusManager.SetPodStatus(logger, pod, apiPodStatus)
+
+	// we have successfully stopped all containers, the pod is terminating, our status is "done"
+	logger.V(4).Info("Pod termination stopped all running containers", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	return nil
+}
+
+// preserveDataFromBeforeStopping preserves data, like IPs, which are expected
+// to be sent to the API server after termination, but are no longer returned by
+// containerRuntime.GetPodStatus for a stopped pod.
+// Note that Kubelet restart, after the pod is stopped, may still cause losing
+// track of the data.
+func preserveDataFromBeforeStopping(stoppedPodStatus, podStatus *kubecontainer.PodStatus) {
+	stoppedPodStatus.IPs = podStatus.IPs
+}
+
+// SyncTerminatingRuntimePod is expected to terminate running containers in a pod that we have no
+// configuration for. Once this method returns without error, any remaining local state can be safely
+// cleaned up by background processes in each subsystem. Unlike syncTerminatingPod, we lack
+// knowledge of the full pod spec and so cannot perform lifecycle related operations, only ensure
+// that the remnant of the running pod is terminated and allow garbage collection to proceed. We do
+// not update the status of the pod because with the source of configuration removed, we have no
+// place to send that status.
+func (kl *Kubelet) SyncTerminatingRuntimePod(ctx context.Context, runningPod *kubecontainer.Pod) error {
+	// TODO(#113606): connect this with the incoming context parameter, which comes from the pod worker.
+	// Currently, using that context causes test failures.
+	logger := klog.FromContext(ctx)
+	ctx = klog.NewContext(context.TODO(), logger)
+	pod := runningPod.ToAPIPod()
+	logger.V(4).Info("SyncTerminatingRuntimePod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer logger.V(4).Info("SyncTerminatingRuntimePod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// we kill the pod directly since we have lost all other information about the pod.
+	logger.V(4).Info("Orphaned running pod terminating without grace period", "pod", klog.KObj(pod), "podUID", pod.UID)
+	// TODO: this should probably be zero, to bypass any waiting (needs fixes in container runtime)
+	gracePeriod := int64(1)
+	if err := kl.killPod(ctx, pod, *runningPod, &gracePeriod); err != nil {
+		kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
+		// there was an error killing the pod, so we return that error directly
+		utilruntime.HandleError(err)
+		return err
+	}
+	logger.V(4).Info("Pod termination stopped all running orphaned containers", "pod", klog.KObj(pod), "podUID", pod.UID)
+	return nil
+}
+
+// SyncTerminatedPod cleans up a pod that has terminated (has no running containers).
+// The invocations in this call are expected to tear down all pod resources.
+// When this method exits the pod is expected to be ready for cleanup. This method
+// reduces the latency of pod cleanup but is not guaranteed to get called in all scenarios.
+//
+// Because the kubelet has no local store of information, all actions in this method that modify
+// on-disk state must be reentrant and be garbage collected by HandlePodCleanups or a separate loop.
+// This typically occurs when a pod is force deleted from configuration (local disk or API) and the
+// kubelet restarts in the middle of the action.
+func (kl *Kubelet) SyncTerminatedPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) error {
+	ctx, otelSpan := kl.tracer.Start(ctx, "syncTerminatedPod", trace.WithAttributes(
+		semconv.K8SPodUIDKey.String(string(pod.UID)),
+		attribute.String("k8s.pod", klog.KObj(pod).String()),
+		semconv.K8SPodNameKey.String(pod.Name),
+		semconv.K8SNamespaceNameKey.String(pod.Namespace),
+	))
+	logger := klog.FromContext(ctx)
+	defer otelSpan.End()
+	logger.V(4).Info("SyncTerminatedPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer logger.V(4).Info("SyncTerminatedPod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// generate the final status of the pod
+	// TODO: should we simply fold this into TerminatePod? that would give a single pod update
+	apiPodStatus := kl.generateAPIPodStatus(ctx, pod, podStatus, TerminatedPod)
+
+	kl.statusManager.SetPodStatus(logger, pod, apiPodStatus)
+
+	// volumes are unmounted after the pod worker reports ShouldPodRuntimeBeRemoved (which is satisfied
+	// before syncTerminatedPod is invoked)
+	if err := kl.volumeManager.WaitForUnmount(ctx, pod); err != nil {
+		return err
+	}
+	logger.V(4).Info("Pod termination unmounted volumes", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// This waiting loop relies on the background cleanup which starts after pod workers respond
+	// true for ShouldPodRuntimeBeRemoved, which happens after `SyncTerminatingPod` is completed.
+	if err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+		volumesExist := kl.podVolumesExist(logger, pod.UID)
+		if volumesExist {
+			logger.V(3).Info("Pod is terminated, but some volumes have not been cleaned up", "pod", klog.KObj(pod), "podUID", pod.UID)
+		}
+		return !volumesExist, nil
+	}); err != nil {
+		return err
+	}
+	logger.V(3).Info("Pod termination cleaned up volume paths", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// After volume unmount is complete, let the secret and configmap managers know we're done with this pod
+	if kl.secretManager != nil {
+		kl.secretManager.UnregisterPod(pod)
+	}
+	if kl.configMapManager != nil {
+		kl.configMapManager.UnregisterPod(pod)
+	}
+
+	// Note: we leave pod containers to be reclaimed in the background since dockershim requires the
+	// container for retrieving logs and we want to make sure logs are available until the pod is
+	// physically deleted.
+
+	// remove any cgroups in the hierarchy for pods that are no longer running.
+	if kl.cgroupsPerQOS {
+		pcm := kl.containerManager.NewPodContainerManager()
+		name, _ := pcm.GetPodContainerName(pod)
+		if err := pcm.Destroy(logger, name); err != nil {
+			return err
+		}
+		logger.V(4).Info("Pod termination removed cgroups", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
+
+	kl.usernsManager.Release(logger, pod.UID)
+
+	// mark the final pod status
+	kl.statusManager.TerminatePod(logger, pod)
+	logger.V(4).Info("Pod is terminated and will need no more status updates", "pod", klog.KObj(pod), "podUID", pod.UID)
 
 	return nil
 }
 
 // Get pods which should be resynchronized. Currently, the following pod should be resynchronized:
-//   * pod whose work is ready.
-//   * internal modules that request sync of a pod.
+//   - pod whose work is ready.
+//   - internal modules that request sync of a pod.
+//
+// This method does not return orphaned pods (those known only to the pod worker that may have
+// been deleted from configuration). Those pods are synced by HandlePodCleanups as a consequence
+// of driving the state machine to completion.
+//
+// TODO: Consider synchronizing all pods which have not recently been acted on to be resilient
+// to bugs that might prevent updates from being delivered (such as the previous bug with
+// orphaned pods). Instead of asking the work queue for pending work, consider asking the
+// PodWorker which pods should be synced.
 func (kl *Kubelet) getPodsToSync() []*v1.Pod {
 	allPods := kl.podManager.GetPods()
 	podUIDs := kl.workQueue.GetWork()
-	podUIDSet := sets.NewString()
+	podUIDSet := sets.New[string]()
 	for _, podUID := range podUIDs {
 		podUIDSet.Insert(string(podUID))
 	}
@@ -1648,7 +2651,7 @@ func (kl *Kubelet) getPodsToSync() []*v1.Pod {
 //
 // deletePod returns an error if not all sources are ready or the pod is not
 // found in the runtime cache.
-func (kl *Kubelet) deletePod(pod *v1.Pod) error {
+func (kl *Kubelet) deletePod(ctx context.Context, pod *v1.Pod) error {
 	if pod == nil {
 		return fmt.Errorf("deletePod does not allow nil pod")
 	}
@@ -1657,78 +2660,41 @@ func (kl *Kubelet) deletePod(pod *v1.Pod) error {
 		// for sources that haven't reported yet.
 		return fmt.Errorf("skipping delete because sources aren't ready yet")
 	}
-	kl.podWorkers.ForgetWorker(pod.UID)
-
-	// Runtime cache may not have been updated to with the pod, but it's okay
-	// because the periodic cleanup routine will attempt to delete again later.
-	runningPods, err := kl.runtimeCache.GetPods()
-	if err != nil {
-		return fmt.Errorf("error listing containers: %v", err)
-	}
-	runningPod := kubecontainer.Pods(runningPods).FindPod("", pod.UID)
-	if runningPod.IsEmpty() {
-		return fmt.Errorf("pod not found")
-	}
-	podPair := kubecontainer.PodPair{APIPod: pod, RunningPod: &runningPod}
-
-	kl.podKillingCh <- &podPair
-	// TODO: delete the mirror pod here?
-
+	klog.FromContext(ctx).V(3).Info("Pod has been deleted and must be killed", "pod", klog.KObj(pod), "podUID", pod.UID)
+	kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+		Pod:        pod,
+		UpdateType: kubetypes.SyncPodKill,
+	})
 	// We leave the volume/directory cleanup to the periodic cleanup routine.
 	return nil
 }
 
 // rejectPod records an event about the pod with the given reason and message,
-// and updates the pod to the failed phase in the status manage.
-func (kl *Kubelet) rejectPod(pod *v1.Pod, reason, message string) {
-	kl.recorder.Eventf(pod, v1.EventTypeWarning, reason, message)
-	kl.statusManager.SetPodStatus(pod, v1.PodStatus{
-		Phase:   v1.PodFailed,
-		Reason:  reason,
-		Message: "Pod " + message})
+// and updates the pod to the failed phase in the status manager.
+func (kl *Kubelet) rejectPod(ctx context.Context, pod *v1.Pod, reason, message string) {
+	logger := klog.FromContext(ctx)
+	kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, reason, "%s", message)
+	kl.statusManager.SetPodStatus(logger, pod, v1.PodStatus{
+		QOSClass: v1qos.GetPodQOS(pod), // keep it as is
+		Phase:    v1.PodFailed,
+		Reason:   reason,
+		Message:  "Pod was rejected: " + message})
 }
 
-// canAdmitPod determines if a pod can be admitted, and gives a reason if it
-// cannot. "pod" is new pod, while "pods" are all admitted pods
-// The function returns a boolean value indicating whether the pod
-// can be admitted, a brief single-word reason and a message explaining why
-// the pod cannot be admitted.
-func (kl *Kubelet) canAdmitPod(pods []*v1.Pod, pod *v1.Pod) (bool, string, string) {
-	// the kubelet will invoke each pod admit handler in sequence
-	// if any handler rejects, the pod is rejected.
-	// TODO: move out of disk check into a pod admitter
-	// TODO: out of resource eviction should have a pod admitter call-out
-	attrs := &lifecycle.PodAdmitAttributes{Pod: pod, OtherPods: pods}
-	for _, podAdmitHandler := range kl.admitHandlers {
-		if result := podAdmitHandler.Admit(attrs); !result.Admit {
-			return false, result.Reason, result.Message
-		}
+func recordAdmissionRejection(reason string) {
+	// It is possible that the "reason" label can have high cardinality.
+	// To avoid this metric from exploding, we create an allowlist of known
+	// reasons, and only record reasons from this list. Use "Other" reason
+	// for the rest.
+	if admissionRejectionReasons.Has(reason) {
+		metrics.AdmissionRejectionsTotal.WithLabelValues(reason).Inc()
+	} else if strings.HasPrefix(reason, lifecycle.InsufficientResourcePrefix) {
+		// non-extended resources (like cpu, memory, ephemeral-storage, pods)
+		// are already included in admissionRejectionReasons.
+		metrics.AdmissionRejectionsTotal.WithLabelValues("OutOfExtendedResources").Inc()
+	} else {
+		metrics.AdmissionRejectionsTotal.WithLabelValues("Other").Inc()
 	}
-
-	return true, "", ""
-}
-
-func (kl *Kubelet) canRunPod(pod *v1.Pod) lifecycle.PodAdmitResult {
-	attrs := &lifecycle.PodAdmitAttributes{Pod: pod}
-	// Get "OtherPods". Rejected pods are failed, so only include admitted pods that are alive.
-	attrs.OtherPods = kl.filterOutTerminatedPods(kl.podManager.GetPods())
-
-	for _, handler := range kl.softAdmitHandlers {
-		if result := handler.Admit(attrs); !result.Admit {
-			return result
-		}
-	}
-
-	// TODO: Refactor as a soft admit handler.
-	if err := canRunPod(pod); err != nil {
-		return lifecycle.PodAdmitResult{
-			Admit:   false,
-			Reason:  "Forbidden",
-			Message: err.Error(),
-		}
-	}
-
-	return lifecycle.PodAdmitResult{Admit: true}
 }
 
 // syncLoop is the main loop for processing changes. It watches for changes from
@@ -1736,9 +2702,10 @@ func (kl *Kubelet) canRunPod(pod *v1.Pod) lifecycle.PodAdmitResult {
 // any new change seen, will run a sync against desired state and running state. If
 // no changes are seen to the configuration, will synchronize the last known desired
 // state every sync-frequency seconds. Never returns.
-func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHandler) {
-	glog.Info("Starting kubelet main sync loop.")
-	// The resyncTicker wakes up kubelet to checks if there are any pod workers
+func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpdate, handler SyncHandler) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting kubelet main sync loop")
+	// The syncTicker wakes up kubelet to checks if there are any pod workers
 	// that need to be sync'd. A one-second period is sufficient because the
 	// sync interval is defaulted to 10s.
 	syncTicker := time.NewTicker(time.Second)
@@ -1746,15 +2713,32 @@ func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHand
 	housekeepingTicker := time.NewTicker(housekeepingPeriod)
 	defer housekeepingTicker.Stop()
 	plegCh := kl.pleg.Watch()
+	const (
+		base   = 100 * time.Millisecond
+		max    = 5 * time.Second
+		factor = 2
+	)
+	duration := base
+	// Responsible for checking limits in resolv.conf
+	// The limits do not have anything to do with individual pods
+	// Since this is called in syncLoop, we don't need to call it anywhere else
+	if kl.dnsConfigurer != nil && kl.dnsConfigurer.ResolverConfig != "" {
+		kl.dnsConfigurer.CheckLimitsForResolvConf(klog.FromContext(ctx))
+	}
+
 	for {
-		if rs := kl.runtimeState.runtimeErrors(); len(rs) != 0 {
-			glog.Infof("skipping pod synchronization - %v", rs)
-			time.Sleep(5 * time.Second)
+		if err := kl.runtimeState.runtimeErrors(); err != nil {
+			logger.Error(err, "Skipping pod synchronization")
+			// exponential backoff
+			time.Sleep(duration)
+			duration = time.Duration(math.Min(float64(max), factor*float64(duration)))
 			continue
 		}
+		// reset backoff if we have a success
+		duration = base
 
 		kl.syncLoopMonitor.Store(kl.clock.Now())
-		if !kl.syncLoopIteration(updates, handler, syncTicker.C, housekeepingTicker.C, plegCh) {
+		if !kl.syncLoopIteration(ctx, updates, handler, syncTicker.C, housekeepingTicker.C, plegCh) {
 			break
 		}
 		kl.syncLoopMonitor.Store(kl.clock.Now())
@@ -1768,7 +2752,7 @@ func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHand
 // 1.  configCh:       a channel to read config events from
 // 2.  handler:        the SyncHandler to dispatch pods to
 // 3.  syncCh:         a channel to read periodic sync events from
-// 4.  houseKeepingCh: a channel to read housekeeping events from
+// 4.  housekeepingCh: a channel to read housekeeping events from
 // 5.  plegCh:         a channel to read PLEG updates from
 //
 // Events are also read from the kubelet liveness manager's update channel.
@@ -1786,82 +2770,66 @@ func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHand
 // With that in mind, in truly no particular order, the different channels
 // are handled as follows:
 //
-// * configCh: dispatch the pods for the config change to the appropriate
-//             handler callback for the event type
-// * plegCh: update the runtime cache; sync pod
-// * syncCh: sync all pods waiting for sync
-// * houseKeepingCh: trigger cleanup of pods
-// * liveness manager: sync pods that have failed or in which one or more
-//                     containers have failed liveness checks
-func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
+//   - configCh: dispatch the pods for the config change to the appropriate
+//     handler callback for the event type
+//   - plegCh: update the runtime cache; sync pod
+//   - syncCh: sync all pods waiting for sync
+//   - housekeepingCh: trigger cleanup of pods
+//   - health manager: sync pods that have failed or in which one or more
+//     containers have failed health checks
+func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
 	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
+	logger := klog.FromContext(ctx)
 	select {
 	case u, open := <-configCh:
 		// Update from a config source; dispatch it to the right handler
 		// callback.
 		if !open {
-			glog.Errorf("Update channel is closed. Exiting the sync loop.")
+			logger.Error(nil, "Update channel is closed, exiting the sync loop")
 			return false
 		}
 
 		switch u.Op {
 		case kubetypes.ADD:
-			glog.V(2).Infof("SyncLoop (ADD, %q): %q", u.Source, format.Pods(u.Pods))
+			logger.V(2).Info("SyncLoop ADD", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
 			// After restarting, kubelet will get all existing pods through
 			// ADD as if they are new pods. These pods will then go through the
 			// admission process and *may* be rejected. This can be resolved
 			// once we have checkpointing.
-			handler.HandlePodAdditions(u.Pods)
+			handler.HandlePodAdditions(ctx, u.Pods)
 		case kubetypes.UPDATE:
-			glog.V(2).Infof("SyncLoop (UPDATE, %q): %q", u.Source, format.PodsWithDeletiontimestamps(u.Pods))
-			handler.HandlePodUpdates(u.Pods)
+			logger.V(2).Info("SyncLoop UPDATE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
+			handler.HandlePodUpdates(ctx, u.Pods)
 		case kubetypes.REMOVE:
-			glog.V(2).Infof("SyncLoop (REMOVE, %q): %q", u.Source, format.Pods(u.Pods))
-			handler.HandlePodRemoves(u.Pods)
+			logger.V(2).Info("SyncLoop REMOVE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
+			handler.HandlePodRemoves(ctx, u.Pods)
 		case kubetypes.RECONCILE:
-			glog.V(4).Infof("SyncLoop (RECONCILE, %q): %q", u.Source, format.Pods(u.Pods))
-			handler.HandlePodReconcile(u.Pods)
+			logger.V(4).Info("SyncLoop RECONCILE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
+			handler.HandlePodReconcile(ctx, u.Pods)
 		case kubetypes.DELETE:
-			glog.V(2).Infof("SyncLoop (DELETE, %q): %q", u.Source, format.Pods(u.Pods))
+			logger.V(2).Info("SyncLoop DELETE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
 			// DELETE is treated as a UPDATE because of graceful deletion.
-			handler.HandlePodUpdates(u.Pods)
-		case kubetypes.RESTORE:
-			glog.V(2).Infof("SyncLoop (RESTORE, %q): %q", u.Source, format.Pods(u.Pods))
-			// These are pods restored from the checkpoint. Treat them as new
-			// pods.
-			handler.HandlePodAdditions(u.Pods)
-		case kubetypes.SET:
-			// TODO: Do we want to support this?
-			glog.Errorf("Kubelet does not support snapshot update")
+			handler.HandlePodUpdates(ctx, u.Pods)
+		default:
+			logger.Error(nil, "Invalid operation type received", "operation", u.Op)
 		}
 
-		if u.Op != kubetypes.RESTORE {
-			// If the update type is RESTORE, it means that the update is from
-			// the pod checkpoints and may be incomplete. Do not mark the
-			// source as ready.
-
-			// Mark the source ready after receiving at least one update from the
-			// source. Once all the sources are marked ready, various cleanup
-			// routines will start reclaiming resources. It is important that this
-			// takes place only after kubelet calls the update handler to process
-			// the update to ensure the internal pod cache is up-to-date.
-			kl.sourcesReady.AddSource(u.Source)
-		}
+		kl.sourcesReady.AddSource(u.Source)
 	case e := <-plegCh:
 		if isSyncPodWorthy(e) {
 			// PLEG event for a pod; sync it.
 			if pod, ok := kl.podManager.GetPodByUID(e.ID); ok {
-				glog.V(2).Infof("SyncLoop (PLEG): %q, event: %#v", format.Pod(pod), e)
-				handler.HandlePodSyncs([]*v1.Pod{pod})
+				logger.V(2).Info("SyncLoop (PLEG): event for pod", "pod", klog.KObj(pod), "event", e)
+				handler.HandlePodSyncs(ctx, []*v1.Pod{pod})
 			} else {
 				// If the pod no longer exists, ignore the event.
-				glog.V(4).Infof("SyncLoop (PLEG): ignore irrelevant event: %#v", e)
+				logger.V(4).Info("SyncLoop (PLEG): pod does not exist, ignore irrelevant event", "event", e)
 			}
 		}
 
 		if e.Type == pleg.ContainerDied {
 			if containerID, ok := e.Data.(string); ok {
-				kl.cleanUpContainersInPod(e.ID, containerID)
+				kl.cleanUpContainersInPod(ctx, e.ID, containerID)
 			}
 		}
 	case <-syncCh:
@@ -1870,176 +2838,481 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 		if len(podsToSync) == 0 {
 			break
 		}
-		glog.V(4).Infof("SyncLoop (SYNC): %d pods; %s", len(podsToSync), format.Pods(podsToSync))
-		handler.HandlePodSyncs(podsToSync)
+		logger.V(4).Info("SyncLoop (SYNC) pods", "total", len(podsToSync), "pods", klog.KObjSlice(podsToSync))
+		handler.HandlePodSyncs(ctx, podsToSync)
 	case update := <-kl.livenessManager.Updates():
 		if update.Result == proberesults.Failure {
-			// The liveness manager detected a failure; sync the pod.
+			handleProbeSync(ctx, kl, update, handler, "liveness", "unhealthy")
+		}
+	case update := <-kl.readinessManager.Updates():
+		ready := update.Result == proberesults.Success
+		kl.statusManager.SetContainerReadiness(logger, update.PodUID, update.ContainerID, ready)
 
-			// We should not use the pod from livenessManager, because it is never updated after
-			// initialization.
-			pod, ok := kl.podManager.GetPodByUID(update.PodUID)
-			if !ok {
-				// If the pod no longer exists, ignore the update.
-				glog.V(4).Infof("SyncLoop (container unhealthy): ignore irrelevant update: %#v", update)
-				break
+		status := "not ready"
+		if ready {
+			status = "ready"
+		}
+		handleProbeSync(ctx, kl, update, handler, "readiness", status)
+	case update := <-kl.startupManager.Updates():
+		started := update.Result == proberesults.Success
+		kl.statusManager.SetContainerStartup(logger, update.PodUID, update.ContainerID, started)
+
+		status := "unhealthy"
+		if started {
+			status = "started"
+		}
+		handleProbeSync(ctx, kl, update, handler, "startup", status)
+	case update := <-kl.containerManager.Updates():
+		pods := []*v1.Pod{}
+		for _, p := range update.PodUIDs {
+			if pod, ok := kl.podManager.GetPodByUID(types.UID(p)); ok {
+				logger.V(3).Info("SyncLoop (containermanager): event for pod", "pod", klog.KObj(pod), "event", update)
+				pods = append(pods, pod)
+			} else {
+				// If the pod no longer exists, ignore the event.
+				logger.V(4).Info("SyncLoop (containermanager): pod does not exist, ignore devices updates", "event", update)
 			}
-			glog.V(1).Infof("SyncLoop (container unhealthy): %q", format.Pod(pod))
-			handler.HandlePodSyncs([]*v1.Pod{pod})
+		}
+		if len(pods) > 0 {
+			// Updating the pod by syncing it again
+			// We do not apply the optimization by updating the status directly, but can do it later
+			handler.HandlePodSyncs(ctx, pods)
 		}
 	case <-housekeepingCh:
 		if !kl.sourcesReady.AllReady() {
 			// If the sources aren't ready or volume manager has not yet synced the states,
 			// skip housekeeping, as we may accidentally delete pods from unready sources.
-			glog.V(4).Infof("SyncLoop (housekeeping, skipped): sources aren't ready yet.")
+			logger.V(4).Info("SyncLoop (housekeeping, skipped): sources aren't ready yet")
 		} else {
-			glog.V(4).Infof("SyncLoop (housekeeping)")
-			if err := handler.HandlePodCleanups(); err != nil {
-				glog.Errorf("Failed cleaning pods: %v", err)
+			start := time.Now()
+			logger.V(4).Info("SyncLoop (housekeeping)")
+			if err := handler.HandlePodCleanups(ctx); err != nil {
+				logger.Error(err, "Failed cleaning pods")
 			}
+			duration := time.Since(start)
+			if duration > housekeepingWarningDuration {
+				logger.Error(fmt.Errorf("housekeeping took too long"), "Housekeeping took longer than expected", "expected", housekeepingWarningDuration, "actual", duration.Round(time.Millisecond))
+			}
+			logger.V(4).Info("SyncLoop (housekeeping) end", "duration", duration.Round(time.Millisecond))
 		}
 	}
 	return true
 }
 
-// dispatchWork starts the asynchronous sync of the pod in a pod worker.
-// If the pod is terminated, dispatchWork
-func (kl *Kubelet) dispatchWork(pod *v1.Pod, syncType kubetypes.SyncPodType, mirrorPod *v1.Pod, start time.Time) {
-	if kl.podIsTerminated(pod) {
-		if pod.DeletionTimestamp != nil {
-			// If the pod is in a terminated state, there is no pod worker to
-			// handle the work item. Check if the DeletionTimestamp has been
-			// set, and force a status update to trigger a pod deletion request
-			// to the apiserver.
-			kl.statusManager.TerminatePod(pod)
-		}
+func handleProbeSync(ctx context.Context, kl *Kubelet, update proberesults.Update, handler SyncHandler, probe, status string) {
+	logger := klog.FromContext(ctx)
+	// We should not use the pod from manager, because it is never updated after initialization.
+	pod, ok := kl.podManager.GetPodByUID(update.PodUID)
+	if !ok {
+		// If the pod no longer exists, ignore the update.
+		logger.V(4).Info("SyncLoop (probe): ignore irrelevant update", "probe", probe, "status", status, "update", update)
 		return
 	}
-	// Run the sync in an async worker.
-	kl.podWorkers.UpdatePod(&UpdatePodOptions{
-		Pod:        pod,
-		MirrorPod:  mirrorPod,
-		UpdateType: syncType,
-		OnCompleteFunc: func(err error) {
-			if err != nil {
-				metrics.PodWorkerLatency.WithLabelValues(syncType.String()).Observe(metrics.SinceInMicroseconds(start))
-			}
-		},
-	})
-	// Note the number of containers for new pods.
-	if syncType == kubetypes.SyncPodCreate {
-		metrics.ContainersPerPodCount.Observe(float64(len(pod.Spec.Containers)))
-	}
-}
-
-// TODO: handle mirror pods in a separate component (issue #17251)
-func (kl *Kubelet) handleMirrorPod(mirrorPod *v1.Pod, start time.Time) {
-	// Mirror pod ADD/UPDATE/DELETE operations are considered an UPDATE to the
-	// corresponding static pod. Send update to the pod worker if the static
-	// pod exists.
-	if pod, ok := kl.podManager.GetPodByMirrorPod(mirrorPod); ok {
-		kl.dispatchWork(pod, kubetypes.SyncPodUpdate, mirrorPod, start)
-	}
+	logger.V(1).Info("SyncLoop (probe)", "probe", probe, "status", status, "pod", klog.KObj(pod))
+	handler.HandlePodSyncs(ctx, []*v1.Pod{pod})
 }
 
 // HandlePodAdditions is the callback in SyncHandler for pods being added from
 // a config source.
-func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
+func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
+	logger := klog.FromContext(ctx)
 	sort.Sort(sliceutils.PodsByCreationTime(pods))
+	var pendingResizes []types.UID
 	for _, pod := range pods {
-		existingPods := kl.podManager.GetPods()
 		// Always add the pod to the pod manager. Kubelet relies on the pod
 		// manager as the source of truth for the desired state. If a pod does
 		// not exist in the pod manager, it means that it has been deleted in
 		// the apiserver and no action (other than cleanup) is required.
 		kl.podManager.AddPod(pod)
 
-		if kubepod.IsMirrorPod(pod) {
-			kl.handleMirrorPod(pod, start)
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				logger.V(2).Info("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
+			}
+			kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+				Pod:        pod,
+				MirrorPod:  mirrorPod,
+				UpdateType: kubetypes.SyncPodUpdate,
+				StartTime:  start,
+			})
 			continue
 		}
 
-		if !kl.podIsTerminated(pod) {
-			// Only go through the admission process if the pod is not
-			// terminated.
-
+		// Only go through the admission process if the pod is not requested
+		// for termination by another part of the kubelet. If the pod is already
+		// using resources (previously admitted), the pod worker is going to be
+		// shutting it down. If the pod hasn't started yet, we know that when
+		// the pod worker is invoked it will also avoid setting up the pod, so
+		// we simply avoid doing any work.
+		// We also do not try to admit the pod that is already in terminated state.
+		if !kl.podWorkers.IsPodTerminationRequested(pod.UID) && !podutil.IsPodPhaseTerminal(pod.Status.Phase) {
+			// Check if we can admit the pod; if not, reject it.
 			// We failed pods that we rejected, so activePods include all admitted
 			// pods that are alive.
-			activePods := kl.filterOutTerminatedPods(existingPods)
-
-			// Check if we can admit the pod; if not, reject it.
-			if ok, reason, message := kl.canAdmitPod(activePods, pod); !ok {
-				kl.rejectPod(pod, reason, message)
+			if ok, reason, message := kl.allocationManager.AddPod(ctx, kl.GetActivePods(), pod); !ok {
+				kl.rejectPod(ctx, pod, reason, message)
+				// We avoid recording the metric in canAdmitPod because it's called
+				// repeatedly during a resize, which would inflate the metric.
+				// Instead, we record the metric here in HandlePodAdditions for new pods
+				// and capture resize events separately.
+				recordAdmissionRejection(reason)
 				continue
 			}
+			recordPodLevelResourcesAdmission(pod)
+
+			kl.podCertificateManager.TrackPod(ctx, pod)
+
+			if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+				// Backfill the queue of pending resizes, but only after all the pods have
+				// been added. This ensures that no resizes get resolved until all the
+				// existing pods are added.
+				_, updatedFromAllocation := kl.allocationManager.UpdatePodFromAllocation(pod)
+				if updatedFromAllocation {
+					pendingResizes = append(pendingResizes, pod.UID)
+				}
+			}
 		}
-		mirrorPod, _ := kl.podManager.GetMirrorPodByPod(pod)
-		kl.dispatchWork(pod, kubetypes.SyncPodCreate, mirrorPod, start)
-		kl.probeManager.AddPod(pod)
+		kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+			Pod:        pod,
+			MirrorPod:  mirrorPod,
+			UpdateType: kubetypes.SyncPodCreate,
+			StartTime:  start,
+		})
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		kl.statusManager.BackfillPodResizeConditions(pods)
+		// Admitted pods with DeletionTimestamp set are still pushed here so RetryPendingResizes
+		// clears any backfilled PodResizePending condition with DeferredResizeResolutionTerminated.
+		for _, uid := range pendingResizes {
+			kl.allocationManager.PushPendingResize(logger, uid)
+		}
+		if len(pendingResizes) > 0 {
+			kl.allocationManager.RetryPendingResizes(ctx, allocation.TriggerReasonPodsAdded)
+		}
 	}
 }
 
 // HandlePodUpdates is the callback in the SyncHandler interface for pods
 // being updated from a config source.
-func (kl *Kubelet) HandlePodUpdates(pods []*v1.Pod) {
+func (kl *Kubelet) HandlePodUpdates(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
+	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
+		oldPod, _ := kl.podManager.GetPodByUID(pod.UID)
 		kl.podManager.UpdatePod(pod)
-		if kubepod.IsMirrorPod(pod) {
-			kl.handleMirrorPod(pod, start)
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+			// Skip pods that haven't been allocated yet to avoid counting them against
+			// node capacity before they've been admitted.
+			if !kl.allocationManager.HasPodAllocatedResources(pod.UID) {
+				logger.V(4).Info("Skipping pod update for non-allocated pod", "pod", klog.KObj(pod), "podUID", pod.UID)
+				continue
+			}
+		}
+
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				logger.V(2).Info("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
+			}
+		}
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+			recordResizeOperations(oldPod, pod)
+			_, updatedFromAllocation := kl.allocationManager.UpdatePodFromAllocation(pod)
+			if updatedFromAllocation {
+				if !kl.IsPodTerminatingOrTerminal(pod) {
+					kl.allocationManager.PushPendingResize(logger, pod.UID)
+				}
+				// TODO(natasha41575): If the resize is immediately actuated, it will trigger a pod sync
+				// and we will end up calling UpdatePod twice. Figure out if there is a way to avoid this.
+				kl.allocationManager.RetryPendingResizes(ctx, allocation.TriggerReasonPodUpdated)
+			} else {
+				// We can hit this case if a pending resize has been reverted,
+				// so we need to clear the pending resize condition.
+				kl.statusManager.ClearPodResizePendingCondition(pod.UID, metrics.DeferredResizeResolutionReverted)
+			}
+		}
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures) && oldPod != nil {
+			oldPodInfo := &ndf.PodInfo{Spec: &oldPod.Spec, Status: &oldPod.Status}
+			newPodInfo := &ndf.PodInfo{Spec: &pod.Spec, Status: &pod.Status}
+			reqs, err := kl.nodeDeclaredFeaturesFramework.InferForPodUpdate(oldPodInfo, newPodInfo, kl.version)
+			if err != nil {
+				logger.Error(err, "Failed to infer required features for pod update", "pod", klog.KObj(pod))
+			}
+			if !reqs.IsEmpty() {
+				matchResult, err := kl.nodeDeclaredFeaturesFramework.MatchNodeFeatureSet(reqs, kl.nodeDeclaredFeaturesSet)
+				if err != nil {
+					logger.Error(err, "Failed to match pod features with the node", "pod", klog.KObj(pod))
+
+				}
+				if !matchResult.IsMatch {
+					missingNodeDeclaredFeatures := strings.Join(matchResult.UnsatisfiedRequirements, ", ")
+					logger.Error(nil, "Pod requires node features that are not available", "missingFeatures", missingNodeDeclaredFeatures)
+					kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedNodeDeclaredFeaturesCheck, "Pod requires node features that are not available: %s", missingNodeDeclaredFeatures)
+				}
+			}
+		}
+
+		kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+			Pod:        pod,
+			MirrorPod:  mirrorPod,
+			UpdateType: kubetypes.SyncPodUpdate,
+			StartTime:  start,
+		})
+	}
+}
+
+// recordResizeOperations records the resizes that an update of a pod requests.
+func recordResizeOperations(oldPod, newPod *v1.Pod) {
+	if oldPod == nil {
+		// This should never happen.
+		return
+	}
+
+	recordContainerResizeOperations(oldPod, newPod)
+	recordPodLevelResourceResizeOperations(oldPod, newPod)
+	recordVolumeResizeOperations(oldPod, newPod)
+}
+
+// recordPodLevelResourceResizeOperations records if any of the pod level resources need to be resized.
+func recordPodLevelResourceResizeOperations(oldPod, newPod *v1.Pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		return
+	}
+
+	// TODO(ndixita): add metrics for pod-level resources resize.
+}
+
+// recordContainerResizeOperations records the resizes that an update of a pod requests for its
+// containers.
+func recordContainerResizeOperations(oldPod, newPod *v1.Pod) {
+	for oldContainer, containerType := range podutil.ContainerIter(&oldPod.Spec, podutil.InitContainers|podutil.Containers) {
+		if !allocation.IsResizableContainer(oldContainer, containerType) {
 			continue
 		}
-		// TODO: Evaluate if we need to validate and reject updates.
 
-		mirrorPod, _ := kl.podManager.GetMirrorPodByPod(pod)
-		kl.dispatchWork(pod, kubetypes.SyncPodUpdate, mirrorPod, start)
+		var newContainer *v1.Container
+		for new, newType := range podutil.ContainerIter(&newPod.Spec, podutil.InitContainers|podutil.Containers) {
+			if !allocation.IsResizableContainer(new, newType) {
+				continue
+			}
+			if new.Name == oldContainer.Name && containerType == newType {
+				newContainer = new
+			}
+		}
+
+		newResources := newContainer.Resources
+		oldResources := oldContainer.Resources
+
+		if op := resizeOperationForResources(newResources.Requests.Memory(), oldResources.Requests.Memory()); op != "" {
+			metrics.ContainerRequestedResizes.WithLabelValues("memory", "requests", op).Inc()
+		}
+		if op := resizeOperationForResources(newResources.Limits.Memory(), oldResources.Limits.Memory()); op != "" {
+			metrics.ContainerRequestedResizes.WithLabelValues("memory", "limits", op).Inc()
+		}
+		if op := resizeOperationForResources(newResources.Requests.Cpu(), oldResources.Requests.Cpu()); op != "" {
+			metrics.ContainerRequestedResizes.WithLabelValues("cpu", "requests", op).Inc()
+		}
+		if op := resizeOperationForResources(newResources.Limits.Cpu(), oldResources.Limits.Cpu()); op != "" {
+			metrics.ContainerRequestedResizes.WithLabelValues("cpu", "limits", op).Inc()
+		}
 	}
+}
+
+// recordVolumeResizeOperations records if any of the pod's memory-backed emptyDir volumes needs to be resized.
+func recordVolumeResizeOperations(oldPod, newPod *v1.Pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingMemoryBackedVolumes) {
+		return
+	}
+
+	// TODO(natasha41575): Add metrics for volume resizes.
+}
+
+func resizeOperationForResources(new, old *resource.Quantity) string {
+	if new.IsZero() && !old.IsZero() {
+		return "remove"
+	}
+	if old.IsZero() && !new.IsZero() {
+		return "add"
+	}
+	if new.Cmp(*old) < 0 {
+		return "decrease"
+	}
+	if new.Cmp(*old) > 0 {
+		return "increase"
+	}
+	return ""
 }
 
 // HandlePodRemoves is the callback in the SyncHandler interface for pods
 // being removed from a config source.
-func (kl *Kubelet) HandlePodRemoves(pods []*v1.Pod) {
+func (kl *Kubelet) HandlePodRemoves(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
+	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
-		kl.podManager.DeletePod(pod)
-		if kubepod.IsMirrorPod(pod) {
-			kl.handleMirrorPod(pod, start)
+		kl.podCertificateManager.ForgetPod(ctx, pod)
+		kl.podManager.RemovePod(pod)
+		kl.allocationManager.RemovePod(logger, pod.UID)
+
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				logger.V(2).Info("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
+			}
+			kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+				Pod:        pod,
+				MirrorPod:  mirrorPod,
+				UpdateType: kubetypes.SyncPodUpdate,
+				StartTime:  start,
+			})
 			continue
 		}
+
 		// Deletion is allowed to fail because the periodic cleanup routine
 		// will trigger deletion again.
-		if err := kl.deletePod(pod); err != nil {
-			glog.V(2).Infof("Failed to delete pod %q, err: %v", format.Pod(pod), err)
+		if err := kl.deletePod(ctx, pod); err != nil {
+			logger.V(2).Info("Failed to delete pod", "pod", klog.KObj(pod), "err", err)
 		}
-		kl.probeManager.RemovePod(pod)
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		kl.allocationManager.RetryPendingResizes(ctx, allocation.TriggerReasonPodsRemoved)
 	}
 }
 
 // HandlePodReconcile is the callback in the SyncHandler interface for pods
-// that should be reconciled.
-func (kl *Kubelet) HandlePodReconcile(pods []*v1.Pod) {
+// that should be reconciled. Pods are reconciled when only the status of the
+// pod is updated in the API.
+func (kl *Kubelet) HandlePodReconcile(ctx context.Context, pods []*v1.Pod) {
+	start := kl.clock.Now()
+	logger := klog.FromContext(ctx)
+	retryPendingResizes := false
+	var triggerReason string
+	hasPendingResizes := kl.allocationManager.HasPendingResizes()
 	for _, pod := range pods {
 		// Update the pod in pod manager, status manager will do periodically reconcile according
 		// to the pod manager.
+		oldPod, _ := kl.podManager.GetPodByUID(pod.UID)
 		kl.podManager.UpdatePod(pod)
 
-		// After an evicted pod is synced, all dead containers in the pod can be removed.
-		if eviction.PodIsEvicted(pod.Status) {
-			if podStatus, err := kl.podCache.Get(pod.UID); err == nil {
-				kl.containerDeletor.deleteContainersInPod("", podStatus, true)
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				logger.V(2).Info("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
 			}
+			// Static pods should be reconciled the same way as regular pods
+		}
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+			if hasPendingResizes && !retryPendingResizes && oldPod != nil {
+				// If the pod has reached a terminal phase, we retry all pending resizes.
+				// A terminated pod releases capacity even if its allocation has already
+				// been purged, so check this before the non-allocated skip below.
+				if podutil.IsPodTerminal(pod) && !podutil.IsPodTerminal(oldPod) {
+					retryPendingResizes = true
+					triggerReason = allocation.TriggerReasonPodTerminated
+				}
+
+				// If there are pending resizes, check whether the requests shrank as a result of the status
+				// resources changing.
+				opts := resourcehelper.PodResourcesOptions{
+					UseStatusResources:                             true,
+					SkipPodLevelResources:                          !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+					InPlacePodLevelResourcesVerticalScalingEnabled: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
+					UseDRANodeAllocatableResourceClaimStatus:       utilfeature.DefaultFeatureGate.Enabled(features.DRANodeAllocatableResources),
+				}
+
+				// Ignore desired resources when aggregating the resources.
+				allocatedOldPod, _ := kl.allocationManager.UpdatePodFromAllocation(oldPod)
+				allocatedPod, _ := kl.allocationManager.UpdatePodFromAllocation(pod)
+
+				oldRequest := resourcehelper.PodRequests(allocatedOldPod, opts)
+				newRequest := resourcehelper.PodRequests(allocatedPod, opts)
+
+				// If cpu or memory requests shrank, then retry the pending resizes.
+				if newRequest.Memory().Cmp(*oldRequest.Memory()) < 0 ||
+					newRequest.Cpu().Cmp(*oldRequest.Cpu()) < 0 {
+					retryPendingResizes = true
+					triggerReason = allocation.TriggerReasonPodResized
+				}
+			}
+
+			// Skip further reconciliation for pods that haven't been allocated yet.
+			// We still updated podManager above to keep status in sync with the API server.
+			if !kl.allocationManager.HasPodAllocatedResources(pod.UID) {
+				logger.V(4).Info("Skipping pod reconcile operations for non-allocated pod", "pod", klog.KObj(pod), "podUID", pod.UID)
+				continue
+			}
+		}
+
+		// TODO: reconcile being calculated in the config manager is questionable, and avoiding
+		// extra syncs may no longer be necessary. Reevaluate whether Reconcile and Sync can be
+		// merged (after resolving the next two TODOs).
+
+		// Reconcile Pod "Ready" condition if necessary. Trigger sync pod for reconciliation.
+		// TODO: this should be unnecessary today - determine what is the cause for this to
+		// be different than Sync, or if there is a better place for it. For instance, we have
+		// needsReconcile in kubelet/config, here, and in status_manager.
+		if status.NeedToReconcilePodReadiness(pod) {
+			kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+				Pod:        pod,
+				MirrorPod:  mirrorPod,
+				UpdateType: kubetypes.SyncPodSync,
+				StartTime:  start,
+			})
+		}
+
+		// After an evicted pod is synced, all dead containers in the pod can be removed.
+		// TODO: this is questionable - status read is async and during eviction we already
+		// expect to not have some container info. The pod worker knows whether a pod has
+		// been evicted, so if this is about minimizing the time to react to an eviction we
+		// can do better. If it's about preserving pod status info we can also do better.
+		if eviction.PodIsEvicted(pod.Status) {
+			if podStatus, err := kl.podCache.Get(ctx, pod.UID); err == nil {
+				kl.containerDeletor.deleteContainersInPod(logger, "", podStatus, true)
+			}
+		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		if retryPendingResizes {
+			kl.allocationManager.RetryPendingResizes(ctx, triggerReason)
 		}
 	}
 }
 
 // HandlePodSyncs is the callback in the syncHandler interface for pods
 // that should be dispatched to pod workers for sync.
-func (kl *Kubelet) HandlePodSyncs(pods []*v1.Pod) {
+func (kl *Kubelet) HandlePodSyncs(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
+	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
-		mirrorPod, _ := kl.podManager.GetMirrorPodByPod(pod)
-		kl.dispatchWork(pod, kubetypes.SyncPodSync, mirrorPod, start)
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				logger.V(2).Info("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
+			}
+			// Syncing a mirror pod is a programmer error since the intent of sync is to
+			// batch notify all pending work. We should make it impossible to double sync,
+			// but for now log a programmer error to prevent accidental introduction.
+			logger.V(3).Info("Programmer error, HandlePodSyncs does not expect to receive mirror pods", "podUID", pod.UID, "mirrorPodUID", mirrorPod.UID)
+			continue
+		}
+		kl.podWorkers.UpdatePod(ctx, UpdatePodOptions{
+			Pod:        pod,
+			MirrorPod:  mirrorPod,
+			UpdateType: kubetypes.SyncPodSync,
+			StartTime:  start,
+		})
 	}
 }
 
@@ -2052,61 +3325,68 @@ func (kl *Kubelet) LatestLoopEntryTime() time.Time {
 	return val.(time.Time)
 }
 
+// SyncLoopHealthCheck checks if kubelet's sync loop that updates containers is working.
+func (kl *Kubelet) SyncLoopHealthCheck(req *http.Request) error {
+	duration := kl.resyncInterval * 2
+	minDuration := time.Minute * 5
+	if duration < minDuration {
+		duration = minDuration
+	}
+	enterLoopTime := kl.LatestLoopEntryTime()
+	if !enterLoopTime.IsZero() && time.Now().After(enterLoopTime.Add(duration)) {
+		return fmt.Errorf("sync Loop took longer than expected")
+	}
+	return nil
+}
+
 // updateRuntimeUp calls the container runtime status callback, initializing
 // the runtime dependent modules when the container runtime first comes up,
 // and returns an error if the status check fails.  If the status check is OK,
 // update the container runtime uptime in the kubelet runtimeState.
-func (kl *Kubelet) updateRuntimeUp() {
-	s, err := kl.containerRuntime.Status()
+func (kl *Kubelet) updateRuntimeUp(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	kl.updateRuntimeMux.Lock()
+	defer kl.updateRuntimeMux.Unlock()
+
+	s, err := kl.containerRuntime.Status(ctx)
 	if err != nil {
-		glog.Errorf("Container runtime sanity check failed: %v", err)
+		logger.Error(err, "Container runtime sanity check failed")
 		return
 	}
-	// rkt uses the legacy, non-CRI integration. Don't check the runtime
-	// conditions for it.
-	if kl.containerRuntimeName != kubetypes.RktContainerRuntime {
-		if s == nil {
-			glog.Errorf("Container runtime status is nil")
-			return
-		}
-		// Periodically log the whole runtime status for debugging.
-		// TODO(random-liu): Consider to send node event when optional
-		// condition is unmet.
-		glog.V(4).Infof("Container runtime status: %v", s)
-		networkReady := s.GetRuntimeCondition(kubecontainer.NetworkReady)
-		if networkReady == nil || !networkReady.Status {
-			glog.Errorf("Container runtime network not ready: %v", networkReady)
-			kl.runtimeState.setNetworkState(fmt.Errorf("runtime network not ready: %v", networkReady))
-		} else {
-			// Set nil if the container runtime network is ready.
-			kl.runtimeState.setNetworkState(nil)
-		}
-		// TODO(random-liu): Add runtime error in runtimeState, and update it
-		// when runtime is not ready, so that the information in RuntimeReady
-		// condition will be propagated to NodeReady condition.
-		runtimeReady := s.GetRuntimeCondition(kubecontainer.RuntimeReady)
-		// If RuntimeReady is not set or is false, report an error.
-		if runtimeReady == nil || !runtimeReady.Status {
-			glog.Errorf("Container runtime not ready: %v", runtimeReady)
-			return
-		}
+	if s == nil {
+		logger.Error(nil, "Container runtime status is nil")
+		return
 	}
-	kl.oneTimeInitializer.Do(kl.initializeRuntimeDependentModules)
-	kl.runtimeState.setRuntimeSync(kl.clock.Now())
-}
+	// Periodically log the whole runtime status for debugging.
+	logger.V(4).Info("Container runtime status", "status", s)
+	loggerInfo := logger.Info
+	if !kl.containerRuntimeReadyExpected {
+		loggerInfo = logger.V(4).Info
+	}
+	networkReady := s.GetRuntimeCondition(kubecontainer.NetworkReady)
+	if networkReady == nil || !networkReady.Status {
+		loggerInfo("Container runtime network not ready", "networkReady", networkReady)
+		kl.runtimeState.setNetworkState(fmt.Errorf("container runtime network not ready: %v", networkReady))
+	} else {
+		// Set nil if the container runtime network is ready.
+		kl.runtimeState.setNetworkState(nil)
+	}
+	// information in RuntimeReady condition will be propagated to NodeReady condition.
+	runtimeReady := s.GetRuntimeCondition(kubecontainer.RuntimeReady)
+	// If RuntimeReady is not set or is false, report an error.
+	if runtimeReady == nil || !runtimeReady.Status {
+		loggerInfo("Container runtime not ready", "runtimeReady", runtimeReady)
+		kl.runtimeState.setRuntimeState(fmt.Errorf("container runtime not ready: %v", runtimeReady))
+		return
+	}
 
-// updateCloudProviderFromMachineInfo updates the node's provider ID field
-// from the given cadvisor machine info.
-func (kl *Kubelet) updateCloudProviderFromMachineInfo(node *v1.Node, info *cadvisorapi.MachineInfo) {
-	if info.CloudProvider != cadvisorapi.UnknownProvider &&
-		info.CloudProvider != cadvisorapi.Baremetal {
-		// The cloud providers from pkg/cloudprovider/providers/* that update ProviderID
-		// will use the format of cloudprovider://project/availability_zone/instance_name
-		// here we only have the cloudprovider and the instance name so we leave project
-		// and availability zone empty for compatibility.
-		node.Spec.ProviderID = strings.ToLower(string(info.CloudProvider)) +
-			":////" + string(info.InstanceID)
-	}
+	kl.runtimeState.setRuntimeState(nil)
+	kl.runtimeState.setRuntimeHandlers(s.Handlers)
+	kl.runtimeState.setRuntimeFeatures(s.Features)
+	kl.oneTimeInitializer.Do(func() {
+		kl.initializeRuntimeDependentModules(ctx)
+	})
+	kl.runtimeState.setRuntimeSync(kl.clock.Now())
 }
 
 // GetConfiguration returns the KubeletConfiguration used to configure the kubelet.
@@ -2117,63 +3397,334 @@ func (kl *Kubelet) GetConfiguration() kubeletconfiginternal.KubeletConfiguration
 // BirthCry sends an event that the kubelet has started up.
 func (kl *Kubelet) BirthCry() {
 	// Make an event that kubelet restarted.
-	kl.recorder.Eventf(kl.nodeRef, v1.EventTypeNormal, events.StartingKubelet, "Starting kubelet.")
-}
-
-// StreamingConnectionIdleTimeout returns the timeout for streaming connections to the HTTP server.
-func (kl *Kubelet) StreamingConnectionIdleTimeout() time.Duration {
-	return kl.streamingConnectionIdleTimeout
-}
-
-// ResyncInterval returns the interval used for periodic syncs.
-func (kl *Kubelet) ResyncInterval() time.Duration {
-	return kl.resyncInterval
+	kl.recorder.Eventf(kl.nodeRefWithUID(), v1.EventTypeNormal, events.StartingKubelet, "Starting kubelet.")
 }
 
 // ListenAndServe runs the kubelet HTTP server.
-func (kl *Kubelet) ListenAndServe(address net.IP, port uint, tlsOptions *server.TLSOptions, auth server.AuthInterface, enableDebuggingHandlers, enableContentionProfiling bool) {
-	server.ListenAndServeKubeletServer(kl, kl.resourceAnalyzer, address, port, tlsOptions, auth, enableDebuggingHandlers, enableContentionProfiling, kl.containerRuntime, kl.criHandler)
+func (kl *Kubelet) ListenAndServe(ctx context.Context, kubeCfg *kubeletconfiginternal.KubeletConfiguration, tlsConfig *tls.Config,
+	auth server.AuthInterface, tp trace.TracerProvider) {
+	server.ListenAndServeKubeletServer(ctx, kl, kl.resourceAnalyzer, kl.containerManager.GetHealthCheckers(), kl.flagz, kubeCfg, tlsConfig, auth, tp)
 }
 
 // ListenAndServeReadOnly runs the kubelet HTTP server in read-only mode.
-func (kl *Kubelet) ListenAndServeReadOnly(address net.IP, port uint) {
-	server.ListenAndServeKubeletReadOnlyServer(kl, kl.resourceAnalyzer, address, port, kl.containerRuntime)
+func (kl *Kubelet) ListenAndServeReadOnly(ctx context.Context, address net.IP, port uint, tp trace.TracerProvider) {
+	server.ListenAndServeKubeletReadOnlyServer(ctx, kl, kl.resourceAnalyzer, kl.containerManager.GetHealthCheckers(), kl.flagz, address, port, tp)
+}
+
+type kubeletPodsProvider struct {
+	kl *Kubelet
+}
+
+func (pp *kubeletPodsProvider) GetActivePods() []*v1.Pod {
+	return pp.kl.GetActivePods()
+}
+
+func (pp *kubeletPodsProvider) GetPods() []*v1.Pod {
+	return pp.kl.podManager.GetPods()
+}
+
+func (pp *kubeletPodsProvider) GetPodByName(namespace, name string) (*v1.Pod, bool) {
+	pod, found := pp.kl.podManager.GetPodByName(namespace, name)
+	if !found {
+		return nil, false
+	}
+	// use the same filtering logic as GetActivePods
+	if pp.kl.isPodInactive(pod) {
+		return nil, false
+	}
+	return pod, true
+}
+
+// ListenAndServePodResources runs the kubelet podresources grpc service.
+func (kl *Kubelet) ListenAndServePodResources(ctx context.Context) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPodResourcesGet) {
+		endpoint, err := util.LocalEndpoint(kl.getPodResourcesDir(), podresources.Socket)
+		if err != nil {
+			klog.FromContext(ctx).V(2).Info("Failed to get local endpoint for PodResources endpoint", "err", err)
+			return
+		}
+
+		providers := podresources.PodResourcesProviders{
+			Pods:             &kubeletPodsProvider{kl: kl},
+			Devices:          kl.containerManager,
+			Cpus:             kl.containerManager,
+			Memory:           kl.containerManager,
+			DynamicResources: kl.containerManager,
+		}
+
+		server.ListenAndServePodResources(ctx, endpoint, providers)
+	}
+}
+
+// ListenAndServePod initializes an HTTP server to serve the Pod API.
+func (kl *Kubelet) ListenAndServePods(ctx context.Context) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodsAPI) {
+		endpoint, err := util.LocalEndpoint(kl.getPodsAPIDir(), pods.Socket)
+		if err != nil {
+			klog.FromContext(ctx).Error(err, "Failed to get local endpoint for pod api")
+			return
+		}
+		server.ListenAndServePodsServer(
+			ctx,
+			endpoint,
+			kl.podsServer,
+		)
+	}
 }
 
 // Delete the eligible dead container instances in a pod. Depending on the configuration, the latest dead containers may be kept around.
-func (kl *Kubelet) cleanUpContainersInPod(podID types.UID, exitedContainerID string) {
-	if podStatus, err := kl.podCache.Get(podID); err == nil {
-		removeAll := false
-		if syncedPod, ok := kl.podManager.GetPodByUID(podID); ok {
-			// generate the api status using the cached runtime status to get up-to-date ContainerStatuses
-			apiPodStatus := kl.generateAPIPodStatus(syncedPod, podStatus)
-			// When an evicted or deleted pod has already synced, all containers can be removed.
-			removeAll = eviction.PodIsEvicted(syncedPod.Status) || (syncedPod.DeletionTimestamp != nil && notRunning(apiPodStatus.ContainerStatuses))
-		}
-		kl.containerDeletor.deleteContainersInPod(exitedContainerID, podStatus, removeAll)
+func (kl *Kubelet) cleanUpContainersInPod(ctx context.Context, podID types.UID, exitedContainerID string) {
+	if podStatus, err := kl.podCache.Get(ctx, podID); err == nil {
+		// When an evicted or deleted pod has already synced, all containers can be removed.
+		removeAll := kl.podWorkers.ShouldPodContentBeRemoved(podID)
+		kl.containerDeletor.deleteContainersInPod(klog.FromContext(ctx), exitedContainerID, podStatus, removeAll)
 	}
+}
+
+// fastStatusUpdateOnce starts a loop that checks if the current state of kubelet + container runtime
+// would be able to turn the node ready, and sync the ready state to the apiserver as soon as possible.
+// Function returns after the node status update after such event, or when the node is already ready.
+// Function is executed only during Kubelet start which improves latency to ready node by updating
+// kubelet state, runtime status and node statuses ASAP.
+func (kl *Kubelet) fastStatusUpdateOnce(ctx context.Context) {
+	start := kl.clock.Now()
+	stopCh := make(chan struct{})
+
+	// Keep trying to make fast node status update until either timeout is reached or an update is successful.
+	wait.Until(func() {
+		// fastNodeStatusUpdate returns true when it succeeds or when the grace period has expired
+		// (status was not updated within nodeReadyGracePeriod and the second argument below gets true),
+		// then we close the channel and abort the loop.
+		if kl.fastNodeStatusUpdate(ctx, kl.clock.Since(start) >= nodeReadyGracePeriod) {
+			close(stopCh)
+		}
+	}, 100*time.Millisecond, stopCh)
+}
+
+// CheckpointContainer tries to checkpoint a container. The parameters are used to
+// look up the specified container. If the container specified by the given parameters
+// cannot be found an error is returned. If the container is found the container
+// engine will be asked to checkpoint the given container into the kubelet's default
+// checkpoint directory.
+func (kl *Kubelet) CheckpointContainer(
+	ctx context.Context,
+	podUID types.UID,
+	podFullName,
+	containerName string,
+	options *runtimeapi.CheckpointContainerRequest,
+) error {
+	container, err := kl.findContainer(ctx, podFullName, podUID, containerName)
+	if err != nil {
+		return err
+	}
+	if container == nil {
+		return fmt.Errorf("container %v not found", containerName)
+	}
+
+	options.Location = filepath.Join(
+		kl.getCheckpointsDir(),
+		fmt.Sprintf(
+			"checkpoint-%s-%s-%s.tar",
+			podFullName,
+			containerName,
+			time.Now().Format(time.RFC3339),
+		),
+	)
+
+	options.ContainerId = string(container.ID.ID)
+
+	if err := kl.containerRuntime.CheckpointContainer(ctx, options); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ListMetricDescriptors gets the descriptors for the metrics that will be returned in ListPodSandboxMetrics.
+func (kl *Kubelet) ListMetricDescriptors(ctx context.Context) ([]*runtimeapi.MetricDescriptor, error) {
+	return kl.containerRuntime.ListMetricDescriptors(ctx)
+}
+
+// ListPodSandboxMetrics retrieves the metrics for all pod sandboxes.
+func (kl *Kubelet) ListPodSandboxMetrics(ctx context.Context) ([]*runtimeapi.PodSandboxMetrics, error) {
+	return kl.containerRuntime.ListPodSandboxMetrics(ctx)
+}
+
+func (kl *Kubelet) supportLocalStorageCapacityIsolation() bool {
+	return kl.GetConfiguration().LocalStorageCapacityIsolation
 }
 
 // isSyncPodWorthy filters out events that are not worthy of pod syncing
 func isSyncPodWorthy(event *pleg.PodLifecycleEvent) bool {
-	// ContatnerRemoved doesn't affect pod state
+	// ContainerRemoved doesn't affect pod state
 	return event.Type != pleg.ContainerRemoved
 }
 
-// Gets the streaming server configuration to use with in-process CRI shims.
-func getStreamingConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies) *streaming.Config {
-	config := &streaming.Config{
-		// Use a relative redirect (no scheme or host).
-		BaseURL: &url.URL{
-			Path: "/cri/",
-		},
-		StreamIdleTimeout:               kubeCfg.StreamingConnectionIdleTimeout.Duration,
-		StreamCreationTimeout:           streaming.DefaultConfig.StreamCreationTimeout,
-		SupportedRemoteCommandProtocols: streaming.DefaultConfig.SupportedRemoteCommandProtocols,
-		SupportedPortForwardProtocols:   streaming.DefaultConfig.SupportedPortForwardProtocols,
+// PrepareDynamicResources calls the container Manager PrepareDynamicResources API
+// This method implements the RuntimeHelper interface
+func (kl *Kubelet) PrepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
+	return kl.containerManager.PrepareDynamicResources(ctx, pod)
+}
+
+// UnprepareDynamicResources calls the container Manager UnprepareDynamicResources API
+// This method implements the RuntimeHelper interface
+func (kl *Kubelet) UnprepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
+	return kl.containerManager.UnprepareDynamicResources(ctx, pod)
+}
+
+// Ensure Mirror Pod for Static Pod exists and matches the current pod definition.
+// The function logs and ignores any errors.
+func (kl *Kubelet) tryReconcileMirrorPods(ctx context.Context, staticPod, mirrorPod *v1.Pod) {
+	logger := klog.FromContext(ctx)
+	if !kubetypes.IsStaticPod(staticPod) {
+		return
 	}
-	if kubeDeps.TLSOptions != nil {
-		config.TLSConfig = kubeDeps.TLSOptions.Config
+	deleted := false
+	if mirrorPod != nil {
+		if mirrorPod.DeletionTimestamp != nil || !kubepod.IsMirrorPodOf(mirrorPod, staticPod) {
+			// The mirror pod is semantically different from the static pod. Remove
+			// it. The mirror pod will get recreated later.
+			logger.Info("Trying to delete pod", "pod", klog.KObj(mirrorPod), "podUID", mirrorPod.UID)
+			podFullName := kubecontainer.GetPodFullName(staticPod)
+			if ok, err := kl.mirrorPodClient.DeleteMirrorPod(ctx, podFullName, &mirrorPod.UID); err != nil {
+				logger.Error(err, "Failed deleting mirror pod", "pod", klog.KObj(mirrorPod))
+			} else if ok {
+				deleted = ok
+				logger.Info("Deleted mirror pod as it didn't match the static Pod", "pod", klog.KObj(mirrorPod))
+			}
+		}
 	}
-	return config
+	if mirrorPod == nil || deleted {
+		node, err := kl.GetNode(ctx)
+		if err != nil {
+			logger.Error(err, "No need to create a mirror pod, since failed to get node info from the cluster", "node", klog.KRef("", string(kl.nodeName)))
+		} else if node.DeletionTimestamp != nil {
+			logger.Info("No need to create a mirror pod, since node has been removed from the cluster", "node", klog.KRef("", string(kl.nodeName)))
+		} else {
+			logger.Info("Creating a mirror pod for static pod", "pod", klog.KObj(staticPod))
+			if err := kl.mirrorPodClient.CreateMirrorPod(ctx, staticPod); err != nil {
+				logger.Error(err, "Failed creating a mirror pod", "pod", klog.KObj(staticPod))
+			}
+		}
+	}
+}
+
+// Ensure Mirror Pod for Static Pod exists as soon as node is registered.
+func (kl *Kubelet) fastStaticPodsRegistration(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	if err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+		_, err := kl.GetNode(ctx)
+		if err == nil {
+			return true, nil
+		}
+
+		logger.Error(err, "Unable to register mirror pod because node is not registered yet", "node", klog.KRef("", string(kl.nodeName)))
+		return false, nil
+	}); err != nil {
+		logger.Error(err, "Failed to wait until node is registered", "node", klog.KRef("", string(kl.nodeName)))
+	}
+
+	staticPodToMirrorPodMap := kl.podManager.GetStaticPodToMirrorPodMap()
+	for staticPod, mirrorPod := range staticPodToMirrorPodMap {
+		kl.tryReconcileMirrorPods(ctx, staticPod, mirrorPod)
+	}
+}
+
+func (kl *Kubelet) RequestPodReinspect(podUID types.UID) {
+	kl.pleg.RequestReinspect(podUID)
+}
+
+func (kl *Kubelet) RequestPodRelist(logger klog.Logger, podUID types.UID) {
+	kl.pleg.RequestRelist(logger, podUID)
+}
+
+var _ allocation.PodProvider = &Kubelet{}
+
+// SyncPodNow triggers an immediate pod sync and on-demand PLEG relist.
+func (kl *Kubelet) SyncPodNow(ctx context.Context, pod *v1.Pod) {
+	kl.HandlePodSyncs(ctx, []*v1.Pod{pod})
+	kl.RequestPodRelist(klog.FromContext(ctx), pod.UID)
+}
+
+// OnPodSandboxReady is the callback implementation invoked by the container runtime after
+// all three requirements (sandbox, networking, volumes) are ready to immediately update
+// the `PodReadyToStartContainers` pod status condition to `True`.
+// This method implements the RuntimeHelper interface.
+// Ref: https://github.com/kubernetes/kubernetes/issues/134460
+func (kl *Kubelet) OnPodSandboxReady(ctx context.Context, pod *v1.Pod) error {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodReadyToStartContainersCondition) {
+		return nil
+	}
+
+	logger := klog.FromContext(ctx)
+	logger.V(3).Info("OnPodSandboxReady callback invoked", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// update the status asynchronously to avoid blocking the SyncPod flow
+	go func() {
+		existingStatus, ok := kl.statusManager.GetPodStatus(pod.UID)
+		if !ok {
+			existingStatus = pod.Status
+		}
+
+		cachedStatus := existingStatus.DeepCopy()
+
+		readySandboxCondition := v1.PodCondition{
+			Type:               v1.PodReadyToStartContainers,
+			Status:             v1.ConditionTrue,
+			ObservedGeneration: podutil.CalculatePodConditionObservedGeneration(cachedStatus, pod.Generation, v1.PodReadyToStartContainers),
+		}
+
+		cachedStatus.Conditions = utilpod.ReplaceOrAppendPodCondition(cachedStatus.Conditions, &readySandboxCondition)
+
+		kl.statusManager.SetPodStatus(logger, pod, *cachedStatus)
+
+		logger.V(3).Info("Successfully updated PodReadyToStartContainers condition after sandbox creation",
+			"pod", klog.KObj(pod),
+			"podUID", pod.UID)
+	}()
+
+	return nil
+}
+
+// allocatedPodManager decorates the base volumemanager.PodManager to intercept pod lookups
+// and return their active allocated state as computed by the allocationManager.
+//
+// This should be used as the pod manager for any components that need to be aware only of the
+// allocated pod.
+type allocatedPodManager struct {
+	baseManager       volumemanager.PodManager
+	allocationManager allocation.Manager
+}
+
+func (a *allocatedPodManager) getAllocatedPod(pod *v1.Pod) (*v1.Pod, bool) {
+	// TODO: Should this be a public method on the allocation manager?
+	if pod == nil {
+		return nil, false
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		if allocatedPod, ok := a.allocationManager.UpdatePodFromAllocation(pod); ok {
+			return allocatedPod, true
+		}
+	}
+	// When the feature gate is disabled or there is no allocation stored for this pod, return the pod as-is.
+	return pod, true
+}
+
+func (a *allocatedPodManager) GetPodByUID(uid types.UID) (*v1.Pod, bool) {
+	pod, found := a.baseManager.GetPodByUID(uid)
+	if !found || pod == nil {
+		return pod, found
+	}
+	return a.getAllocatedPod(pod)
+}
+
+func (a *allocatedPodManager) GetPods() []*v1.Pod {
+	pods := a.baseManager.GetPods()
+	var allocatedPods []*v1.Pod
+	for _, pod := range pods {
+		if allocatedPod, podFound := a.getAllocatedPod(pod); podFound {
+			allocatedPods = append(allocatedPods, allocatedPod)
+		}
+	}
+	return allocatedPods
 }

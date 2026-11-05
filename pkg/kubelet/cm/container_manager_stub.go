@@ -17,24 +17,44 @@ limitations under the License.
 package cm
 
 import (
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
+	"context"
+	"fmt"
 
-	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apiserver/pkg/server/healthz"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
+	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/status"
-	"k8s.io/kubernetes/pkg/scheduler/schedulercache"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
-type containerManagerStub struct{}
+type containerManagerStub struct {
+	shouldResetExtendedResourceCapacity bool
+	extendedPluginResources             v1.ResourceList
+	memoryManager                       memorymanager.Manager
+	cpuManager                          cpumanager.Manager
+}
 
 var _ ContainerManager = &containerManagerStub{}
 
-func (cm *containerManagerStub) Start(_ *v1.Node, _ ActivePodsFunc, _ config.SourcesReady, _ status.PodStatusProvider, _ internalapi.RuntimeService) error {
-	glog.V(2).Infof("Starting stub container manager")
+func (cm *containerManagerStub) Start(ctx context.Context, _ *v1.Node, _ ActivePodsFunc, _ GetNodeFunc, _ config.SourcesReady, _ status.PodStatusProvider, _ internalapi.RuntimeService, _ bool) error {
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Starting stub container manager")
+	cm.memoryManager = memorymanager.NewFakeManager(logger)
+	cm.cpuManager = cpumanager.NewFakeManager(logger)
 	return nil
 }
 
@@ -54,7 +74,7 @@ func (cm *containerManagerStub) GetQOSContainersInfo() QOSContainersInfo {
 	return QOSContainersInfo{}
 }
 
-func (cm *containerManagerStub) UpdateQOSCgroups() error {
+func (cm *containerManagerStub) UpdateQOSCgroups(_ klog.Logger) error {
 	return nil
 }
 
@@ -66,30 +86,160 @@ func (cm *containerManagerStub) GetNodeAllocatableReservation() v1.ResourceList 
 	return nil
 }
 
-func (cm *containerManagerStub) GetCapacity() v1.ResourceList {
+func (cm *containerManagerStub) GetCapacity(_ klog.Logger, localStorageCapacityIsolation bool) v1.ResourceList {
+	if !localStorageCapacityIsolation {
+		return v1.ResourceList{}
+	}
+	c := v1.ResourceList{
+		v1.ResourceEphemeralStorage: *resource.NewQuantity(
+			int64(0),
+			resource.BinarySI),
+	}
+	return c
+}
+
+func (cm *containerManagerStub) GetPluginRegistrationHandlers() map[string]cache.PluginHandler {
 	return nil
 }
 
-func (cm *containerManagerStub) GetDevicePluginResourceCapacity() (v1.ResourceList, []string) {
-	return nil, []string{}
+func (cm *containerManagerStub) GetHealthCheckers() []healthz.HealthChecker {
+	return []healthz.HealthChecker{}
+}
+
+func (cm *containerManagerStub) GetDevicePluginResourceCapacity(_ klog.Logger) (v1.ResourceList, v1.ResourceList, []string) {
+	return cm.extendedPluginResources, cm.extendedPluginResources, []string{}
+}
+
+func (m *podContainerManagerStub) GetPodCgroupConfig(_ *v1.Pod, _ v1.ResourceName) (*ResourceConfig, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (m *podContainerManagerStub) SetPodCgroupConfig(_ klog.Logger, _ *v1.Pod, _ *ResourceConfig) error {
+	return fmt.Errorf("not implemented")
 }
 
 func (cm *containerManagerStub) NewPodContainerManager() PodContainerManager {
 	return &podContainerManagerStub{}
 }
 
-func (cm *containerManagerStub) GetResources(pod *v1.Pod, container *v1.Container) (*kubecontainer.RunContainerOptions, error) {
+func (cm *containerManagerStub) GetResources(_ context.Context, _ *v1.Pod, _ *v1.Container) (*kubecontainer.RunContainerOptions, error) {
 	return &kubecontainer.RunContainerOptions{}, nil
 }
 
-func (cm *containerManagerStub) UpdatePluginResources(*schedulercache.NodeInfo, *lifecycle.PodAdmitAttributes) error {
+func (cm *containerManagerStub) UpdatePluginResources(*schedulerframework.NodeInfo, *lifecycle.PodAdmitAttributes) error {
 	return nil
 }
 
-func (cm *containerManagerStub) InternalContainerLifecycle() InternalContainerLifecycle {
-	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager()}
+func (cm *containerManagerStub) InternalContainerLifecycle(logger klog.Logger) InternalContainerLifecycle {
+	return &internalContainerLifecycleImpl{cm.cpuManager, cm.memoryManager, topologymanager.NewFakeManager(logger)}
+}
+
+func (cm *containerManagerStub) GetPodCgroupRoot() string {
+	return ""
+}
+
+func (cm *containerManagerStub) GetDevices(_, _ string) []*podresourcesapi.ContainerDevices {
+	return nil
+}
+
+func (cm *containerManagerStub) GetAllocatableDevices(_ klog.Logger) []*podresourcesapi.ContainerDevices {
+	return nil
+}
+
+func (cm *containerManagerStub) ShouldResetExtendedResourceCapacity() bool {
+	return cm.shouldResetExtendedResourceCapacity
+}
+
+func (cm *containerManagerStub) GetAllocateResourcesPodAdmitHandler(logger klog.Logger) lifecycle.PodAdmitHandler {
+	return topologymanager.NewFakeManager(logger)
+}
+
+func (cm *containerManagerStub) UpdateAllocatedDevices(_ klog.Logger) {
+	return
+}
+
+func (cm *containerManagerStub) GetCPUs(_ *v1.Pod, _ *v1.Container) []int64 {
+	return nil
+}
+
+func (cm *containerManagerStub) GetPodCPUs(_ string) []int64 {
+	return nil
+}
+
+func (cm *containerManagerStub) GetAllocatableCPUs() []int64 {
+	return nil
+}
+
+func (cm *containerManagerStub) GetMemory(_ klog.Logger, _ *v1.Pod, _ *v1.Container) []*podresourcesapi.ContainerMemory {
+	return nil
+}
+
+func (cm *containerManagerStub) GetPodMemory(_ klog.Logger, _ string) []*podresourcesapi.ContainerMemory {
+	return nil
+}
+
+func (cm *containerManagerStub) GetAllocatableMemory(_ klog.Logger) []*podresourcesapi.ContainerMemory {
+	return nil
+}
+
+func (cm *containerManagerStub) GetDynamicResources(_ klog.Logger, _ *v1.Pod, _ *v1.Container) []*podresourcesapi.DynamicResource {
+	return nil
+}
+
+func (cm *containerManagerStub) GetNodeAllocatableAbsolute() v1.ResourceList {
+	return nil
+}
+
+func (cm *containerManagerStub) PrepareDynamicResources(_ context.Context, _ *v1.Pod) error {
+	return nil
+}
+
+func (cm *containerManagerStub) UnprepareDynamicResources(_ context.Context, _ *v1.Pod) error {
+	return nil
+}
+
+func (cm *containerManagerStub) PodMightNeedToUnprepareResources(_ types.UID) bool {
+	return false
+}
+
+func (cm *containerManagerStub) UpdateAllocatedResourcesStatus(_ klog.Logger, _ *v1.Pod, _ *v1.PodStatus) {
+}
+
+func (cm *containerManagerStub) Updates() <-chan resourceupdates.Update {
+	return nil
+}
+
+func (cm *containerManagerStub) PodHasExclusiveCPUs(_ klog.Logger, _ *v1.Pod) bool {
+	return false
+}
+
+func (cm *containerManagerStub) ContainerHasExclusiveCPUs(_ klog.Logger, _ *v1.Pod, _ *v1.Container) bool {
+	return false
+}
+
+func (cm *containerManagerStub) AllocationMode(res v1.ResourceName) ResourceAllocationMode {
+	// run from the cheapest to the most expensive, mimicing production code
+	if cm.cpuManager.CanAllocateExclusively(res) || cm.memoryManager.CanAllocateExclusively(res) {
+		return ResourceAllocationModeExclusive
+	}
+	if res == v1.ResourceCPU || res == v1.ResourceMemory || v1helper.IsHugePageResourceName(res) {
+		return ResourceAllocationModeShared
+	}
+	// devices not supported - no fake device manager
+	return ResourceAllocationModeUnsupported
 }
 
 func NewStubContainerManager() ContainerManager {
-	return &containerManagerStub{}
+	return &containerManagerStub{shouldResetExtendedResourceCapacity: false}
+}
+
+func NewStubContainerManagerWithExtendedResource(shouldResetExtendedResourceCapacity bool) ContainerManager {
+	return &containerManagerStub{shouldResetExtendedResourceCapacity: shouldResetExtendedResourceCapacity}
+}
+
+func NewStubContainerManagerWithDevicePluginResource(extendedPluginResources v1.ResourceList) ContainerManager {
+	return &containerManagerStub{
+		shouldResetExtendedResourceCapacity: false,
+		extendedPluginResources:             extendedPluginResources,
+	}
 }

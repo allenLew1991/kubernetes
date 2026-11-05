@@ -1,0 +1,162 @@
+/*
+Copyright 2019 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package etcd3
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+)
+
+func TestParseEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		etcdEvent     *clientv3.Event
+		expectedEvent *event
+		expectPrevKV  bool
+		expectedErr   string
+	}{
+		{
+			name: "successful create",
+			etcdEvent: &clientv3.Event{
+				Type:   clientv3.EventTypePut,
+				PrevKv: nil,
+				Kv: &mvccpb.KeyValue{
+					// key is the key in bytes. An empty key is not allowed.
+					Key:            []byte("key"),
+					ModRevision:    1,
+					CreateRevision: 1,
+					Value:          []byte("value"),
+				},
+			},
+			expectedEvent: &event{
+				key:       "key",
+				value:     []byte("value"),
+				prevValue: nil,
+				rev:       1,
+				isDeleted: false,
+				isCreated: true,
+			},
+			expectPrevKV: true,
+			expectedErr:  "",
+		},
+		{
+			name: "unsuccessful delete",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_DELETE,
+				PrevKv: nil,
+				Kv: &mvccpb.KeyValue{
+					Key:            []byte("key"),
+					CreateRevision: 1,
+					ModRevision:    2,
+					Value:          nil,
+				},
+			},
+			expectPrevKV: true,
+			expectedErr:  "etcd event received with PrevKv=nil",
+		},
+		{
+			name: "delete without previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_DELETE,
+				PrevKv: nil,
+				Kv: &mvccpb.KeyValue{
+					Key:            []byte("key"),
+					CreateRevision: 1,
+					ModRevision:    2,
+					Value:          nil,
+				},
+			},
+			expectPrevKV: false,
+			expectedEvent: &event{
+				key:       "key",
+				value:     nil,
+				prevValue: nil,
+				rev:       2,
+				isDeleted: true,
+				isCreated: false,
+			},
+			expectedErr: "",
+		},
+		{
+			name: "successful delete",
+			etcdEvent: &clientv3.Event{
+				Type: mvccpb.Event_DELETE,
+				PrevKv: &mvccpb.KeyValue{
+					Key:            []byte("key"),
+					CreateRevision: 1,
+					ModRevision:    1,
+					Value:          []byte("value"),
+				},
+				Kv: &mvccpb.KeyValue{
+					Key:            []byte("key"),
+					CreateRevision: 1,
+					ModRevision:    2,
+					Value:          nil,
+				},
+			},
+			expectedEvent: &event{
+				key:       "key",
+				value:     nil,
+				prevValue: []byte("value"),
+				rev:       2,
+				isDeleted: true,
+				isCreated: false,
+			},
+			expectPrevKV: true,
+			expectedErr:  "",
+		},
+		{
+			name: "update ignoring previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_PUT,
+				Kv:     &mvccpb.KeyValue{Key: []byte("key"), CreateRevision: 1, ModRevision: 2, Value: []byte("current")},
+				PrevKv: &mvccpb.KeyValue{Value: []byte("previous")},
+			},
+			expectedEvent: &event{
+				key: "key", value: []byte("current"), rev: 2,
+			},
+		},
+		{
+			name: "delete ignoring previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_DELETE,
+				Kv:     &mvccpb.KeyValue{Key: []byte("key"), CreateRevision: 1, ModRevision: 2},
+				PrevKv: &mvccpb.KeyValue{Value: []byte("previous")},
+			},
+			expectedEvent: &event{
+				key: "key", rev: 2, isDeleted: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actualEvent, err := parseEvent(tc.etcdEvent, tc.expectPrevKV)
+			if tc.expectedErr != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tc.expectedErr)
+			} else {
+				require.NoError(t, err)
+				actualEvent.recordTime = time.Time{}
+				assert.Equal(t, tc.expectedEvent, actualEvent)
+			}
+		})
+	}
+}

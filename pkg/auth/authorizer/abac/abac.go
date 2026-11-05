@@ -14,25 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package abac authorizes Kubernetes API actions using an Attribute-based access control scheme.
 package abac
-
-// Policy authorizes Kubernetes API actions using an Attribute-based access
-// control scheme.
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/kubernetes/pkg/apis/abac"
+
+	// Import latest API for init/side-effects
 	_ "k8s.io/kubernetes/pkg/apis/abac/latest"
-	"k8s.io/kubernetes/pkg/apis/abac/v0"
+	v0 "k8s.io/kubernetes/pkg/apis/abac/v0"
 )
 
 type policyLoadError struct {
@@ -49,11 +50,17 @@ func (p policyLoadError) Error() string {
 	return fmt.Sprintf("error reading policy file %s: %v", p.path, p.err)
 }
 
-type policyList []*abac.Policy
+var _ = authorizer.Authorizer(PolicyList{})
+var _ = authorizer.RuleResolver(PolicyList{})
 
+// PolicyList is simply a slice of Policy structs.
+type PolicyList []*abac.Policy
+
+// NewFromFile attempts to create a policy list from the given file.
+//
 // TODO: Have policies be created via an API call and stored in REST storage.
-func NewFromFile(path string) (policyList, error) {
-	// File format is one map per line.  This allows easy concatentation of files,
+func NewFromFile(path string) (PolicyList, error) {
+	// File format is one map per line.  This allows easy concatenation of files,
 	// comments in files, and identification of errors by line number.
 	file, err := os.Open(path)
 	if err != nil {
@@ -62,7 +69,7 @@ func NewFromFile(path string) (policyList, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	pl := make(policyList, 0)
+	pl := make(PolicyList, 0)
 
 	decoder := abac.Codecs.UniversalDecoder()
 
@@ -105,7 +112,7 @@ func NewFromFile(path string) (policyList, error) {
 	}
 
 	if unversionedLines > 0 {
-		glog.Warningf("Policy file %s contained unversioned rules. See docs/admin/authorization.md#abac-mode for ABAC file format details.", path)
+		klog.Warningf("Policy file %s contained unversioned rules. See docs/admin/authorization.md#abac-mode for ABAC file format details.", path)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -160,6 +167,7 @@ func subjectMatches(p abac.Policy, user user.Info) bool {
 			for _, group := range groups {
 				if p.Spec.Group == group {
 					matched = true
+					break
 				}
 			}
 			if !matched {
@@ -220,8 +228,8 @@ func resourceMatches(p abac.Policy, a authorizer.Attributes) bool {
 	return false
 }
 
-// Authorizer implements authorizer.Authorize
-func (pl policyList) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+// Authorize implements authorizer.Authorize
+func (pl PolicyList) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	for _, p := range pl {
 		if matches(*p, a) {
 			return authorizer.DecisionAllow, "", nil
@@ -233,7 +241,18 @@ func (pl policyList) Authorize(a authorizer.Attributes) (authorizer.Decision, st
 	// Then, add Caching only if needed.
 }
 
-func (pl policyList) RulesFor(user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (pl PolicyList) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(pl.Authorize(ctx, a))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (PolicyList) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}
+
+// RulesFor returns rules for the given user and namespace.
+func (pl PolicyList) RulesFor(ctx context.Context, user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
 	var (
 		resourceRules    []authorizer.ResourceRuleInfo
 		nonResourceRules []authorizer.NonResourceRuleInfo

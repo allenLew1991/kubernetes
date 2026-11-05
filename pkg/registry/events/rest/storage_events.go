@@ -19,7 +19,7 @@ package rest
 import (
 	"time"
 
-	eventsapiv1beta1 "k8s.io/api/events/v1beta1"
+	eventsapiv1 "k8s.io/api/events/v1"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -33,28 +33,33 @@ type RESTStorageProvider struct {
 	TTL time.Duration
 }
 
-func (p RESTStorageProvider) NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (genericapiserver.APIGroupInfo, bool) {
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(events.GroupName, legacyscheme.Registry, legacyscheme.Scheme, legacyscheme.ParameterCodec, legacyscheme.Codecs)
+func (p RESTStorageProvider) NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (genericapiserver.APIGroupInfo, error) {
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(events.GroupName, legacyscheme.Scheme, legacyscheme.ParameterCodec, legacyscheme.Codecs)
 	// If you add a version here, be sure to add an entry in `k8s.io/kubernetes/cmd/kube-apiserver/app/aggregator.go with specific priorities.
 	// TODO refactor the plumbing to provide the information in the APIGroupInfo
 
-	if apiResourceConfigSource.AnyResourcesForVersionEnabled(eventsapiv1beta1.SchemeGroupVersion) {
-		apiGroupInfo.VersionedResourcesStorageMap[eventsapiv1beta1.SchemeGroupVersion.Version] = p.v1beta1Storage(apiResourceConfigSource, restOptionsGetter)
-		apiGroupInfo.GroupMeta.GroupVersion = eventsapiv1beta1.SchemeGroupVersion
+	if storageMap, err := p.v1Storage(apiResourceConfigSource, restOptionsGetter); err != nil {
+		return genericapiserver.APIGroupInfo{}, err
+	} else if len(storageMap) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap[eventsapiv1.SchemeGroupVersion.Version] = storageMap
 	}
 
-	return apiGroupInfo, true
+	return apiGroupInfo, nil
 }
 
-func (p RESTStorageProvider) v1beta1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) map[string]rest.Storage {
-	version := eventsapiv1beta1.SchemeGroupVersion
-
+func (p RESTStorageProvider) v1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (map[string]rest.Storage, error) {
 	storage := map[string]rest.Storage{}
-	if apiResourceConfigSource.ResourceEnabled(version.WithResource("events")) {
-		eventsStorage := eventstore.NewREST(restOptionsGetter, uint64(p.TTL.Seconds()))
-		storage["events"] = eventsStorage
+
+	// events
+	if resource := "events"; apiResourceConfigSource.ResourceEnabled(eventsapiv1.SchemeGroupVersion.WithResource(resource)) {
+		eventsStorage, err := eventstore.NewREST(restOptionsGetter, uint64(p.TTL.Seconds()))
+		if err != nil {
+			return storage, err
+		}
+		storage[resource] = eventsStorage
 	}
-	return storage
+
+	return storage, nil
 }
 
 func (p RESTStorageProvider) GroupName() string {

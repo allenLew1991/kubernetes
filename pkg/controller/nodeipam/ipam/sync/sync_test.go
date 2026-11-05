@@ -24,16 +24,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/cidrset"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/test"
+	netutils "k8s.io/utils/net"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 var (
-	_, clusterCIDRRange, _ = net.ParseCIDR("10.1.0.0/16")
+	_, clusterCIDRRange, _ = netutils.ParseCIDRSloppy("10.1.0.0/16")
 )
 
 type fakeEvent struct {
@@ -56,15 +58,17 @@ type fakeAPIs struct {
 	calls   []string
 	events  []fakeEvent
 	results []error
+
+	logger klog.Logger
 }
 
-func (f *fakeAPIs) Alias(ctx context.Context, nodeName string) (*net.IPNet, error) {
-	f.calls = append(f.calls, fmt.Sprintf("alias %v", nodeName))
+func (f *fakeAPIs) Alias(ctx context.Context, node *v1.Node) (*net.IPNet, error) {
+	f.calls = append(f.calls, fmt.Sprintf("alias %v", node.Name))
 	return f.aliasRange, f.aliasErr
 }
 
-func (f *fakeAPIs) AddAlias(ctx context.Context, nodeName string, cidrRange *net.IPNet) error {
-	f.calls = append(f.calls, fmt.Sprintf("addAlias %v %v", nodeName, cidrRange))
+func (f *fakeAPIs) AddAlias(ctx context.Context, node *v1.Node, cidrRange *net.IPNet) error {
+	f.calls = append(f.calls, fmt.Sprintf("addAlias %v %v", node.Name, cidrRange))
 	return f.addAliasErr
 }
 
@@ -88,7 +92,7 @@ func (f *fakeAPIs) EmitNodeWarningEvent(nodeName, reason, fmtStr string, args ..
 }
 
 func (f *fakeAPIs) ReportResult(err error) {
-	glog.V(2).Infof("ReportResult %v", err)
+	f.logger.V(2).Info("ReportResult", "err", err)
 	f.results = append(f.results, err)
 	if f.reportChan != nil {
 		f.reportChan <- struct{}{}
@@ -104,7 +108,7 @@ func (f *fakeAPIs) ResyncTimeout() time.Duration {
 
 func (f *fakeAPIs) dumpTrace() {
 	for i, x := range f.calls {
-		glog.Infof("trace %v: %v", i, x)
+		f.logger.Info("trace", "index", i, "call", x)
 	}
 }
 
@@ -194,12 +198,14 @@ func TestNodeSyncUpdate(t *testing.T) {
 			wantError: false,
 		},
 	} {
+		logger, _ := ktesting.NewTestContext(t)
 		cidr, _ := cidrset.NewCIDRSet(clusterCIDRRange, 24)
+		tc.fake.logger = logger
 		sync := New(&tc.fake, &tc.fake, &tc.fake, tc.mode, "node1", cidr)
 		doneChan := make(chan struct{})
 
 		// Do a single step of the loop.
-		go sync.Loop(doneChan)
+		go sync.Loop(logger, doneChan)
 		sync.Update(tc.node)
 		close(sync.opChan)
 		<-doneChan
@@ -221,22 +227,24 @@ func TestNodeSyncUpdate(t *testing.T) {
 }
 
 func TestNodeSyncResync(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	fake := &fakeAPIs{
 		nodeRet:       nodeWithCIDRRange,
 		resyncTimeout: time.Millisecond,
-		reportChan:    make(chan struct{}),
+		// Allow one extra resync notification to land while the test is
+		// closing the loop down.
+		reportChan: make(chan struct{}, 1),
+		logger:     logger,
 	}
 	cidr, _ := cidrset.NewCIDRSet(clusterCIDRRange, 24)
 	sync := New(fake, fake, fake, SyncFromCluster, "node1", cidr)
 	doneChan := make(chan struct{})
-
-	go sync.Loop(doneChan)
+	go sync.Loop(logger, doneChan)
+	// Wait for the first resync to complete
 	<-fake.reportChan
+	// Close the operation channel to stop the loop
 	close(sync.opChan)
-	// Unblock loop().
-	go func() {
-		<-fake.reportChan
-	}()
+	// Wait for the loop to complete
 	<-doneChan
 	fake.dumpTrace()
 }
@@ -269,12 +277,14 @@ func TestNodeSyncDelete(t *testing.T) {
 			},
 		},
 	} {
+		logger, _ := ktesting.NewTestContext(t)
 		cidr, _ := cidrset.NewCIDRSet(clusterCIDRRange, 24)
+		tc.fake.logger = logger
 		sync := New(&tc.fake, &tc.fake, &tc.fake, tc.mode, "node1", cidr)
 		doneChan := make(chan struct{})
 
 		// Do a single step of the loop.
-		go sync.Loop(doneChan)
+		go sync.Loop(logger, doneChan)
 		sync.Delete(tc.node)
 		<-doneChan
 		tc.fake.dumpTrace()

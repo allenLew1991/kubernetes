@@ -17,8 +17,13 @@ limitations under the License.
 package validation
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
+	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/apis/policy"
@@ -32,7 +37,7 @@ func TestValidatePodDisruptionBudgetSpec(t *testing.T) {
 		MinAvailable:   &minAvailable,
 		MaxUnavailable: &maxUnavailable,
 	}
-	errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+	errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 	if len(errs) == 0 {
 		t.Errorf("unexpected success for %v", spec)
 	}
@@ -43,15 +48,15 @@ func TestValidateMinAvailablePodDisruptionBudgetSpec(t *testing.T) {
 		intstr.FromString("0%"),
 		intstr.FromString("1%"),
 		intstr.FromString("100%"),
-		intstr.FromInt(0),
-		intstr.FromInt(1),
-		intstr.FromInt(100),
+		intstr.FromInt32(0),
+		intstr.FromInt32(1),
+		intstr.FromInt32(100),
 	}
 	for _, c := range successCases {
 		spec := policy.PodDisruptionBudgetSpec{
 			MinAvailable: &c,
 		}
-		errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+		errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 		if len(errs) != 0 {
 			t.Errorf("unexpected failure %v for %v", errs, spec)
 		}
@@ -62,13 +67,13 @@ func TestValidateMinAvailablePodDisruptionBudgetSpec(t *testing.T) {
 		intstr.FromString("nope"),
 		intstr.FromString("-1%"),
 		intstr.FromString("101%"),
-		intstr.FromInt(-1),
+		intstr.FromInt32(-1),
 	}
 	for _, c := range failureCases {
 		spec := policy.PodDisruptionBudgetSpec{
 			MinAvailable: &c,
 		}
-		errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+		errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 		if len(errs) == 0 {
 			t.Errorf("unexpected success for %v", spec)
 		}
@@ -77,147 +82,261 @@ func TestValidateMinAvailablePodDisruptionBudgetSpec(t *testing.T) {
 
 func TestValidateMinAvailablePodAndMaxUnavailableDisruptionBudgetSpec(t *testing.T) {
 	c1 := intstr.FromString("10%")
-	c2 := intstr.FromInt(1)
+	c2 := intstr.FromInt32(1)
 
 	spec := policy.PodDisruptionBudgetSpec{
 		MinAvailable:   &c1,
 		MaxUnavailable: &c2,
 	}
-	errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+	errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 	if len(errs) == 0 {
 		t.Errorf("unexpected success for %v", spec)
 	}
 }
 
-func TestValidatePodDisruptionBudgetStatus(t *testing.T) {
-	successCases := []policy.PodDisruptionBudgetStatus{
-		{PodDisruptionsAllowed: 10},
-		{CurrentHealthy: 5},
-		{DesiredHealthy: 3},
-		{ExpectedPods: 2}}
-	for _, c := range successCases {
-		errors := ValidatePodDisruptionBudgetStatus(c, field.NewPath("status"))
-		if len(errors) > 0 {
-			t.Errorf("unexpected failure %v for %v", errors, c)
-		}
+func TestValidateUnhealthyPodEvictionPolicyDisruptionBudgetSpec(t *testing.T) {
+	c1 := intstr.FromString("10%")
+	alwaysAllowPolicy := policy.AlwaysAllow
+	invalidPolicy := policy.UnhealthyPodEvictionPolicyType("Invalid")
+
+	testCases := []struct {
+		name      string
+		pdbSpec   policy.PodDisruptionBudgetSpec
+		expectErr bool
+	}{{
+		name: "valid nil UnhealthyPodEvictionPolicy",
+		pdbSpec: policy.PodDisruptionBudgetSpec{
+			MinAvailable:               &c1,
+			UnhealthyPodEvictionPolicy: nil,
+		},
+		expectErr: false,
+	}, {
+		name: "valid UnhealthyPodEvictionPolicy",
+		pdbSpec: policy.PodDisruptionBudgetSpec{
+			MinAvailable:               &c1,
+			UnhealthyPodEvictionPolicy: &alwaysAllowPolicy,
+		},
+		expectErr: false,
+	}, {
+		name: "empty UnhealthyPodEvictionPolicy",
+		pdbSpec: policy.PodDisruptionBudgetSpec{
+			MinAvailable:               &c1,
+			UnhealthyPodEvictionPolicy: new(policy.UnhealthyPodEvictionPolicyType),
+		},
+		expectErr: true,
+	}, {
+		name: "invalid UnhealthyPodEvictionPolicy",
+		pdbSpec: policy.PodDisruptionBudgetSpec{
+			MinAvailable:               &c1,
+			UnhealthyPodEvictionPolicy: &invalidPolicy,
+		},
+		expectErr: true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidatePodDisruptionBudgetSpec(tc.pdbSpec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
+			if len(errs) == 0 && tc.expectErr {
+				t.Errorf("unexpected success for %v", tc.pdbSpec)
+			}
+			if len(errs) != 0 && !tc.expectErr {
+				t.Errorf("unexpected failure for %v", tc.pdbSpec)
+			}
+		})
 	}
-	failureCases := []policy.PodDisruptionBudgetStatus{
-		{PodDisruptionsAllowed: -10},
-		{CurrentHealthy: -5},
-		{DesiredHealthy: -3},
-		{ExpectedPods: -2}}
-	for _, c := range failureCases {
-		errors := ValidatePodDisruptionBudgetStatus(c, field.NewPath("status"))
-		if len(errors) == 0 {
-			t.Errorf("unexpected success for %v", c)
+}
+
+func TestValidatePodDisruptionBudgetStatus(t *testing.T) {
+	const expectNoErrors = false
+	const expectErrors = true
+	testCases := []struct {
+		name                string
+		pdbStatus           policy.PodDisruptionBudgetStatus
+		expectErrForVersion map[schema.GroupVersion]bool
+	}{{
+		name: "DisruptionsAllowed: 10",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: 10,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectNoErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "CurrentHealthy: 5",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			CurrentHealthy: 5,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectNoErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "DesiredHealthy: 3",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			DesiredHealthy: 3,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectNoErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "ExpectedPods: 2",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			ExpectedPods: 2,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectNoErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "DisruptionsAllowed: -10",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: -10,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "CurrentHealthy: -5",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			CurrentHealthy: -5,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "DesiredHealthy: -3",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			DesiredHealthy: -3,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "ExpectedPods: -2",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			ExpectedPods: -2,
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "Conditions valid",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			Conditions: []metav1.Condition{{
+				Type:   policyv1beta1.DisruptionAllowedCondition,
+				Status: metav1.ConditionTrue,
+				LastTransitionTime: metav1.Time{
+					Time: time.Now().Add(-5 * time.Minute),
+				},
+				Reason:             policyv1beta1.SufficientPodsReason,
+				Message:            "message",
+				ObservedGeneration: 3,
+			}},
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectNoErrors,
+			policyv1beta1.SchemeGroupVersion: expectNoErrors,
+		},
+	}, {
+		name: "Conditions not valid",
+		pdbStatus: policy.PodDisruptionBudgetStatus{
+			Conditions: []metav1.Condition{{
+				Type:   policyv1beta1.DisruptionAllowedCondition,
+				Status: metav1.ConditionTrue,
+			}, {
+				Type:   policyv1beta1.DisruptionAllowedCondition,
+				Status: metav1.ConditionFalse,
+			}},
+		},
+		expectErrForVersion: map[schema.GroupVersion]bool{
+			policy.SchemeGroupVersion:        expectErrors,
+			policyv1beta1.SchemeGroupVersion: expectErrors,
+		},
+	}}
+
+	for _, tc := range testCases {
+		for apiVersion, expectErrors := range tc.expectErrForVersion {
+			t.Run(fmt.Sprintf("apiVersion: %s, %s", apiVersion.String(), tc.name), func(t *testing.T) {
+				errors := ValidatePodDisruptionBudgetStatusUpdate(tc.pdbStatus, policy.PodDisruptionBudgetStatus{},
+					field.NewPath("status"), apiVersion)
+				errCount := len(errors)
+
+				if errCount > 0 && !expectErrors {
+					t.Errorf("unexpected failure %v for %v", errors, tc.pdbStatus)
+				}
+
+				if errCount == 0 && expectErrors {
+					t.Errorf("expected errors but didn't one for %v", tc.pdbStatus)
+				}
+			})
 		}
 	}
 }
 
-func TestValidatePodDisruptionBudgetUpdate(t *testing.T) {
-	c1 := intstr.FromString("10%")
-	c2 := intstr.FromInt(1)
-	c3 := intstr.FromInt(2)
-	oldPdb := &policy.PodDisruptionBudget{}
-	pdb := &policy.PodDisruptionBudget{}
-	testCases := []struct {
-		generations []int64
-		name        string
-		specs       []policy.PodDisruptionBudgetSpec
-		status      []policy.PodDisruptionBudgetStatus
-		ok          bool
-	}{
-		{
-			name:        "only update status",
-			generations: []int64{int64(2), int64(3)},
-			specs: []policy.PodDisruptionBudgetSpec{
-				{
-					MinAvailable:   &c1,
-					MaxUnavailable: &c2,
-				},
-				{
-					MinAvailable:   &c1,
-					MaxUnavailable: &c2,
-				},
-			},
-			status: []policy.PodDisruptionBudgetStatus{
-				{
-					PodDisruptionsAllowed: 10,
-					CurrentHealthy:        5,
-					ExpectedPods:          2,
-				},
-				{
-					PodDisruptionsAllowed: 8,
-					CurrentHealthy:        5,
-					DesiredHealthy:        3,
-				},
-			},
-			ok: true,
-		},
-		{
-			name:        "only update pdb spec",
-			generations: []int64{int64(2), int64(3)},
-			specs: []policy.PodDisruptionBudgetSpec{
-				{
-					MaxUnavailable: &c2,
-				},
-				{
-					MinAvailable:   &c1,
-					MaxUnavailable: &c3,
-				},
-			},
-			status: []policy.PodDisruptionBudgetStatus{
-				{
-					PodDisruptionsAllowed: 10,
-				},
-				{
-					PodDisruptionsAllowed: 10,
-				},
-			},
-			ok: false,
-		},
-		{
-			name:        "update spec and status",
-			generations: []int64{int64(2), int64(3)},
-			specs: []policy.PodDisruptionBudgetSpec{
-				{
-					MaxUnavailable: &c2,
-				},
-				{
-					MinAvailable:   &c1,
-					MaxUnavailable: &c3,
-				},
-			},
-			status: []policy.PodDisruptionBudgetStatus{
-				{
-					PodDisruptionsAllowed: 10,
-					CurrentHealthy:        5,
-					ExpectedPods:          2,
-				},
-				{
-					PodDisruptionsAllowed: 8,
-					CurrentHealthy:        5,
-					DesiredHealthy:        3,
-				},
-			},
-			ok: false,
-		},
+func TestIsValidSysctlPattern(t *testing.T) {
+	valid := []string{
+		"a.b.c.d",
+		"a",
+		"a_b",
+		"a-b",
+		"abc",
+		"abc.def",
+		"*",
+		"a.*",
+		"*",
+		"abc*",
+		"a.abc*",
+		"a.b.*",
+		"a/b/c/d",
+		"a/*",
+		"a/b/*",
+		"a.b/c*",
+		"a.b/c.d",
+		"a/b.c/d",
 	}
-
-	for i, tc := range testCases {
-		oldPdb.Spec = tc.specs[0]
-		oldPdb.Generation = tc.generations[0]
-		oldPdb.Status = tc.status[0]
-
-		pdb.Spec = tc.specs[1]
-		pdb.Generation = tc.generations[1]
-		oldPdb.Status = tc.status[1]
-
-		errs := ValidatePodDisruptionBudgetUpdate(oldPdb, pdb)
-		if tc.ok && len(errs) > 0 {
-			t.Errorf("[%d:%s] unexpected errors: %v", i, tc.name, errs)
-		} else if !tc.ok && len(errs) == 0 {
-			t.Errorf("[%d:%s] expected errors: %v", i, tc.name, errs)
+	invalid := []string{
+		"",
+		"ä",
+		"a_",
+		"_",
+		"_a",
+		"_a._b",
+		"__",
+		"-",
+		".",
+		"a.",
+		".a",
+		"a.b.",
+		"a*.b",
+		"a*b",
+		"*a",
+		"Abc",
+		"/",
+		"a/",
+		"/a",
+		"a*/b",
+		func(n int) string {
+			x := make([]byte, n)
+			for i := range x {
+				x[i] = byte('a')
+			}
+			return string(x)
+		}(256),
+	}
+	for _, s := range valid {
+		if !IsValidSysctlPattern(s) {
+			t.Errorf("%q expected to be a valid sysctl pattern", s)
+		}
+	}
+	for _, s := range invalid {
+		if IsValidSysctlPattern(s) {
+			t.Errorf("%q expected to be an invalid sysctl pattern", s)
 		}
 	}
 }

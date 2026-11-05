@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2017 The Kubernetes Authors.
 #
@@ -18,21 +18,20 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
 source "${KUBE_ROOT}/hack/lib/util.sh"
 
 CLEAN_PATTERNS=(
   "_tmp"
   "doc_tmp"
-  ".*/zz_generated.openapi.go"
   "test/e2e/generated/bindata.go"
 )
 
-for pattern in ${CLEAN_PATTERNS[@]}; do
-  for match in $(find "${KUBE_ROOT}" -iregex "^${KUBE_ROOT}/${pattern}$"); do
-    echo "Removing ${match#${KUBE_ROOT}\/} .."
-    rm -rf "${match#${KUBE_ROOT}\/}"
-  done
+for item in "${CLEAN_PATTERNS[@]}"; do
+  # Shellcheck wants the ":?" because of paranoia about 'rm -rf /'. It will
+  # cause an error if unset, which is already true because of "nounset", but
+  # belts AND suspenders is fine for this.
+  rm -rf "${KUBE_ROOT:?}/${item:?}"
 done
 
 # ex: ts=2 sw=2 et filetype=sh

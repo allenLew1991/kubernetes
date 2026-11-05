@@ -17,18 +17,22 @@ limitations under the License.
 package customresourcedefinition
 
 import (
+	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	crdtable "k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition/tableconvertor"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	storageerr "k8s.io/apiserver/pkg/storage/errors"
+	"k8s.io/apiserver/pkg/util/dryrun"
 )
 
 // rest implements a RESTStorage for API services against etcd
@@ -37,24 +41,28 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against API services.
-func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) *REST {
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*REST, error) {
 	strategy := NewStrategy(scheme)
 
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &apiextensions.CustomResourceDefinition{} },
-		NewListFunc:              func() runtime.Object { return &apiextensions.CustomResourceDefinitionList{} },
-		PredicateFunc:            MatchCustomResourceDefinition,
-		DefaultQualifiedResource: apiextensions.Resource("customresourcedefinitions"),
+		NewFunc:                   func() runtime.Object { return &apiextensions.CustomResourceDefinition{} },
+		NewListFunc:               func() runtime.Object { return &apiextensions.CustomResourceDefinitionList{} },
+		PredicateFunc:             MatchCustomResourceDefinition,
+		DefaultQualifiedResource:  apiextensions.Resource("customresourcedefinitions"),
+		SingularQualifiedResource: apiextensions.Resource("customresourcedefinition"),
 
-		CreateStrategy: strategy,
-		UpdateStrategy: strategy,
-		DeleteStrategy: strategy,
+		CreateStrategy:      strategy,
+		UpdateStrategy:      strategy,
+		DeleteStrategy:      strategy,
+		ResetFieldsStrategy: strategy,
+
+		TableConvertor: crdtable.New(),
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, err
 	}
-	return &REST{store}
+	return &REST{store}, nil
 }
 
 // Implement ShortNamesProvider
@@ -62,11 +70,19 @@ var _ rest.ShortNamesProvider = &REST{}
 
 // ShortNames implements the ShortNamesProvider interface. Returns a list of short names for a resource.
 func (r *REST) ShortNames() []string {
-	return []string{"crd"}
+	return []string{"crd", "crds"}
+}
+
+// Implement CategoriesProvider
+var _ rest.CategoriesProvider = &REST{}
+
+// Categories implements the CategoriesProvider interface. Returns a list of categories a resource is part of.
+func (r *REST) Categories() []string {
+	return []string{"api-extensions"}
 }
 
 // Delete adds the CRD finalizer to the list
-func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
+func (r *REST) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
 	obj, err := r.Get(ctx, name, &metav1.GetOptions{})
 	if err != nil {
 		return nil, false, err
@@ -87,7 +103,15 @@ func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav
 		err = apierrors.NewConflict(
 			apiextensions.Resource("customresourcedefinitions"),
 			name,
-			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", *options.Preconditions.UID, crd.UID),
+			fmt.Errorf("precondition failed: UID in precondition: %v, UID in object meta: %v", *options.Preconditions.UID, crd.UID),
+		)
+		return nil, false, err
+	}
+	if options.Preconditions.ResourceVersion != nil && *options.Preconditions.ResourceVersion != crd.ResourceVersion {
+		err = apierrors.NewConflict(
+			apiextensions.Resource("customresourcedefinitions"),
+			name,
+			fmt.Errorf("precondition failed: ResourceVersion in precondition: %v, ResourceVersion in object meta: %v", *options.Preconditions.ResourceVersion, crd.ResourceVersion),
 		)
 		return nil, false, err
 	}
@@ -99,7 +123,7 @@ func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav
 			return nil, false, err
 		}
 
-		preconditions := storage.Preconditions{UID: options.Preconditions.UID}
+		preconditions := storage.Preconditions{UID: options.Preconditions.UID, ResourceVersion: options.Preconditions.ResourceVersion}
 
 		out := r.Store.NewFunc()
 		err = r.Store.Storage.GuaranteedUpdate(
@@ -109,6 +133,9 @@ func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav
 				if !ok {
 					// wrong type
 					return nil, fmt.Errorf("expected *apiextensions.CustomResourceDefinition, got %v", existing)
+				}
+				if err := deleteValidation(ctx, existingCRD); err != nil {
+					return nil, err
 				}
 
 				// Set the deletion timestamp if needed
@@ -129,6 +156,8 @@ func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav
 				})
 				return existingCRD, nil
 			}),
+			dryrun.IsDryRun(options.DryRun),
+			nil,
 		)
 
 		if err != nil {
@@ -143,7 +172,7 @@ func (r *REST) Delete(ctx genericapirequest.Context, name string, options *metav
 		return out, false, nil
 	}
 
-	return r.Store.Delete(ctx, name, options)
+	return r.Store.Delete(ctx, name, deleteValidation, options)
 }
 
 // NewStatusREST makes a RESTStorage for status that has more limited options.
@@ -152,7 +181,9 @@ func NewStatusREST(scheme *runtime.Scheme, rest *REST) *StatusREST {
 	statusStore := *rest.Store
 	statusStore.CreateStrategy = nil
 	statusStore.DeleteStrategy = nil
-	statusStore.UpdateStrategy = NewStatusStrategy(scheme)
+	statusStrategy := NewStatusStrategy(scheme)
+	statusStore.UpdateStrategy = statusStrategy
+	statusStore.ResetFieldsStrategy = statusStrategy
 	return &StatusREST{store: &statusStore}
 }
 
@@ -160,13 +191,31 @@ type StatusREST struct {
 	store *genericregistry.Store
 }
 
-var _ = rest.Updater(&StatusREST{})
+var _ = rest.Patcher(&StatusREST{})
 
 func (r *StatusREST) New() runtime.Object {
 	return &apiextensions.CustomResourceDefinition{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
+}
+
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }

@@ -18,6 +18,7 @@ limitations under the License.
 package meta
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -28,30 +29,15 @@ import (
 
 // Implements RESTScope interface
 type restScope struct {
-	name             RESTScopeName
-	paramName        string
-	argumentName     string
-	paramDescription string
+	name RESTScopeName
 }
 
 func (r *restScope) Name() RESTScopeName {
 	return r.name
 }
-func (r *restScope) ParamName() string {
-	return r.paramName
-}
-func (r *restScope) ArgumentName() string {
-	return r.argumentName
-}
-func (r *restScope) ParamDescription() string {
-	return r.paramDescription
-}
 
 var RESTScopeNamespace = &restScope{
-	name:             RESTScopeNameNamespace,
-	paramName:        "namespaces",
-	argumentName:     "namespace",
-	paramDescription: "object name and auth scope, such as for teams and projects",
+	name: RESTScopeNameNamespace,
 }
 
 var RESTScopeRoot = &restScope{
@@ -77,26 +63,25 @@ type DefaultRESTMapper struct {
 	kindToScope          map[schema.GroupVersionKind]RESTScope
 	singularToPlural     map[schema.GroupVersionResource]schema.GroupVersionResource
 	pluralToSingular     map[schema.GroupVersionResource]schema.GroupVersionResource
-
-	interfacesFunc VersionInterfacesFunc
 }
 
 func (m *DefaultRESTMapper) String() string {
+	if m == nil {
+		return "<nil>"
+	}
 	return fmt.Sprintf("DefaultRESTMapper{kindToPluralResource=%v}", m.kindToPluralResource)
 }
 
 var _ RESTMapper = &DefaultRESTMapper{}
-
-// VersionInterfacesFunc returns the appropriate typer, and metadata accessor for a
-// given api version, or an error if no such api version exists.
-type VersionInterfacesFunc func(version schema.GroupVersion) (*VersionInterfaces, error)
+var _ RESTMapperWithContext = &DefaultRESTMapper{}
+var _ fmt.Stringer = &DefaultRESTMapper{}
 
 // NewDefaultRESTMapper initializes a mapping between Kind and APIVersion
 // to a resource name and back based on the objects in a runtime.Scheme
 // and the Kubernetes API conventions. Takes a group name, a priority list of the versions
 // to search when an object has no default version (set empty to return an error),
 // and a function that retrieves the correct metadata for a given version.
-func NewDefaultRESTMapper(defaultGroupVersions []schema.GroupVersion, f VersionInterfacesFunc) *DefaultRESTMapper {
+func NewDefaultRESTMapper(defaultGroupVersions []schema.GroupVersion) *DefaultRESTMapper {
 	resourceToKind := make(map[schema.GroupVersionResource]schema.GroupVersionKind)
 	kindToPluralResource := make(map[schema.GroupVersionKind]schema.GroupVersionResource)
 	kindToScope := make(map[schema.GroupVersionKind]RESTScope)
@@ -111,7 +96,6 @@ func NewDefaultRESTMapper(defaultGroupVersions []schema.GroupVersion, f VersionI
 		defaultGroupVersions: defaultGroupVersions,
 		singularToPlural:     singularToPlural,
 		pluralToSingular:     pluralToSingular,
-		interfacesFunc:       f,
 	}
 }
 
@@ -196,6 +180,10 @@ func (m *DefaultRESTMapper) ResourceSingularizer(resourceType string) (string, e
 	}
 
 	return singular.Resource, nil
+}
+
+func (m *DefaultRESTMapper) ResourceSingularizerWithContext(_ context.Context, resourceType string) (string, error) {
+	return m.ResourceSingularizer(resourceType)
 }
 
 // coerceResourceForMatching makes the resource lower case and converts internal versions to unspecified (legacy behavior)
@@ -295,6 +283,10 @@ func (m *DefaultRESTMapper) ResourcesFor(input schema.GroupVersionResource) ([]s
 	return ret, nil
 }
 
+func (m *DefaultRESTMapper) ResourcesForWithContext(_ context.Context, input schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	return m.ResourcesFor(input)
+}
+
 func (m *DefaultRESTMapper) ResourceFor(resource schema.GroupVersionResource) (schema.GroupVersionResource, error) {
 	resources, err := m.ResourcesFor(resource)
 	if err != nil {
@@ -305,6 +297,10 @@ func (m *DefaultRESTMapper) ResourceFor(resource schema.GroupVersionResource) (s
 	}
 
 	return schema.GroupVersionResource{}, &AmbiguousResourceError{PartialResource: resource, MatchingResources: resources}
+}
+
+func (m *DefaultRESTMapper) ResourceForWithContext(_ context.Context, resource schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	return m.ResourceFor(resource)
 }
 
 func (m *DefaultRESTMapper) KindsFor(input schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
@@ -374,6 +370,10 @@ func (m *DefaultRESTMapper) KindsFor(input schema.GroupVersionResource) ([]schem
 	return ret, nil
 }
 
+func (m *DefaultRESTMapper) KindsForWithContext(_ context.Context, input schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	return m.KindsFor(input)
+}
+
 func (m *DefaultRESTMapper) KindFor(resource schema.GroupVersionResource) (schema.GroupVersionKind, error) {
 	kinds, err := m.KindsFor(resource)
 	if err != nil {
@@ -384,6 +384,10 @@ func (m *DefaultRESTMapper) KindFor(resource schema.GroupVersionResource) (schem
 	}
 
 	return schema.GroupVersionKind{}, &AmbiguousResourceError{PartialResource: resource, MatchingKinds: kinds}
+}
+
+func (m *DefaultRESTMapper) KindForWithContext(_ context.Context, resource schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	return m.KindFor(resource)
 }
 
 type kindByPreferredGroupVersion struct {
@@ -480,6 +484,10 @@ func (m *DefaultRESTMapper) RESTMapping(gk schema.GroupKind, versions ...string)
 	return mappings[0], nil
 }
 
+func (m *DefaultRESTMapper) RESTMappingWithContext(_ context.Context, gk schema.GroupKind, versions ...string) (*RESTMapping, error) {
+	return m.RESTMapping(gk, versions...)
+}
+
 // RESTMappings returns the RESTMappings for the provided group kind. If a version search order
 // is not provided, the search order provided to DefaultRESTMapper will be used.
 func (m *DefaultRESTMapper) RESTMappings(gk schema.GroupKind, versions ...string) ([]*RESTMapping, error) {
@@ -526,18 +534,10 @@ func (m *DefaultRESTMapper) RESTMappings(gk schema.GroupKind, versions ...string
 			return nil, fmt.Errorf("the provided version %q and kind %q cannot be mapped to a supported scope", gvk.GroupVersion(), gvk.Kind)
 		}
 
-		interfaces, err := m.interfacesFunc(gvk.GroupVersion())
-		if err != nil {
-			return nil, fmt.Errorf("the provided version %q has no relevant versions: %v", gvk.GroupVersion().String(), err)
-		}
-
 		mappings = append(mappings, &RESTMapping{
-			Resource:         res.Resource,
+			Resource:         res,
 			GroupVersionKind: gvk,
 			Scope:            scope,
-
-			ObjectConvertor:  interfaces.ObjectConvertor,
-			MetadataAccessor: interfaces.MetadataAccessor,
 		})
 	}
 
@@ -545,4 +545,35 @@ func (m *DefaultRESTMapper) RESTMappings(gk schema.GroupKind, versions ...string
 		return nil, &NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: gk.Group, Resource: gk.Kind}}
 	}
 	return mappings, nil
+}
+
+func (m *DefaultRESTMapper) RESTMappingsWithContext(_ context.Context, gk schema.GroupKind, versions ...string) ([]*RESTMapping, error) {
+	return m.RESTMappings(gk, versions...)
+}
+
+// MaybeResetRESTMapper calls Reset() on the mapper if it is a ResettableRESTMapper or
+// ResetWithContext() if it is a ResettableRESTMapperWithContext.
+//
+// MaybeResetRESTMapperWithContext is a better alternative because it supports contextual logging and cancellation.
+//
+// Contextual logging: Use MaybeResetRESTMapperWithContext instead.
+func MaybeResetRESTMapper(mapper RESTMapper) {
+	maybeReset(context.Background(), mapper)
+}
+
+// MaybeResetRESTMapperWithContext calls Reset() on the mapper if it is a ResettableRESTMapper or
+// ResetWithContext() if it is a ResettableRESTMapperWithContext.
+func MaybeResetRESTMapperWithContext(ctx context.Context, mapper RESTMapperWithContext) {
+	maybeReset(ctx, mapper)
+}
+
+func maybeReset(ctx context.Context, mapper any) {
+	if m, ok := mapper.(ResettableRESTMapperWithContext); ok {
+		m.ResetWithContext(ctx)
+		return
+	}
+	if m, ok := mapper.(ResettableRESTMapper); ok {
+		m.Reset()
+		return
+	}
 }

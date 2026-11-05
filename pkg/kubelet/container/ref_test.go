@@ -19,9 +19,8 @@ package container
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
 
@@ -47,7 +46,7 @@ func TestFieldPath(t *testing.T) {
 
 	for name, item := range table {
 		res, err := fieldPath(item.pod, item.container)
-		if item.success == false {
+		if !item.success {
 			if err == nil {
 				t.Errorf("%v: unexpected non-error", name)
 			}
@@ -68,14 +67,13 @@ func TestGenerateContainerRef(t *testing.T) {
 		okPod = v1.Pod{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "Pod",
-				APIVersion: legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+				APIVersion: "v1",
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            "ok",
 				Namespace:       "test-ns",
 				UID:             "bar",
 				ResourceVersion: "42",
-				SelfLink:        "/api/" + legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() + "/pods/foo",
 			},
 			Spec: v1.PodSpec{
 				Containers: []v1.Container{
@@ -86,13 +84,7 @@ func TestGenerateContainerRef(t *testing.T) {
 				},
 			},
 		}
-		noSelfLinkPod        = okPod
-		defaultedSelfLinkPod = okPod
 	)
-	noSelfLinkPod.Kind = ""
-	noSelfLinkPod.APIVersion = ""
-	noSelfLinkPod.ObjectMeta.SelfLink = ""
-	defaultedSelfLinkPod.ObjectMeta.SelfLink = "/api/" + legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() + "/pods/ok"
 
 	cases := []struct {
 		name      string
@@ -109,7 +101,7 @@ func TestGenerateContainerRef(t *testing.T) {
 			},
 			expected: &v1.ObjectReference{
 				Kind:            "Pod",
-				APIVersion:      legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+				APIVersion:      "v1",
 				Name:            "ok",
 				Namespace:       "test-ns",
 				UID:             "bar",
@@ -124,36 +116,12 @@ func TestGenerateContainerRef(t *testing.T) {
 			container: &v1.Container{},
 			expected: &v1.ObjectReference{
 				Kind:            "Pod",
-				APIVersion:      legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+				APIVersion:      "v1",
 				Name:            "ok",
 				Namespace:       "test-ns",
 				UID:             "bar",
 				ResourceVersion: "42",
 				FieldPath:       ".spec.containers[1]",
-			},
-			success: true,
-		},
-		{
-			name:      "no-selflink",
-			pod:       &noSelfLinkPod,
-			container: &v1.Container{},
-			expected:  nil,
-			success:   false,
-		},
-		{
-			name: "defaulted-selflink",
-			pod:  &defaultedSelfLinkPod,
-			container: &v1.Container{
-				Name: "by-name",
-			},
-			expected: &v1.ObjectReference{
-				Kind:            "Pod",
-				APIVersion:      legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
-				Name:            "ok",
-				Namespace:       "test-ns",
-				UID:             "bar",
-				ResourceVersion: "42",
-				FieldPath:       ".spec.containers{by-name}",
 			},
 			success: true,
 		},
@@ -165,7 +133,7 @@ func TestGenerateContainerRef(t *testing.T) {
 			},
 			expected: &v1.ObjectReference{
 				Kind:            "Pod",
-				APIVersion:      legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+				APIVersion:      "v1",
 				Name:            "ok",
 				Namespace:       "test-ns",
 				UID:             "bar",

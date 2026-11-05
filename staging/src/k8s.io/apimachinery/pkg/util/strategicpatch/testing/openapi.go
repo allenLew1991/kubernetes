@@ -17,14 +17,10 @@ limitations under the License.
 package testing
 
 import (
-	"io/ioutil"
 	"os"
 	"sync"
 
-	"gopkg.in/yaml.v2"
-
-	"github.com/googleapis/gnostic/OpenAPIv2"
-	"github.com/googleapis/gnostic/compiler"
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
 	openapi "k8s.io/kube-openapi/pkg/util/proto"
 )
 
@@ -46,23 +42,17 @@ func (f *Fake) OpenAPISchema() (*openapi_v2.Document, error) {
 			f.err = err
 			return
 		}
-		spec, err := ioutil.ReadFile(f.Path)
+		spec, err := os.ReadFile(f.Path)
 		if err != nil {
 			f.err = err
 			return
 		}
-		var info yaml.MapSlice
-		err = yaml.Unmarshal(spec, &info)
-		if err != nil {
-			f.err = err
-			return
-		}
-		f.document, f.err = openapi_v2.NewDocument(info, compiler.NewContext("$root", nil))
+		f.document, f.err = openapi_v2.ParseDocument(spec)
 	})
 	return f.document, f.err
 }
 
-func getSchema(f Fake, model string) (openapi.Schema, error) {
+func getSchema(f *Fake, model string) (openapi.Schema, error) {
 	s, err := f.OpenAPISchema()
 	if err != nil {
 		return nil, err
@@ -74,8 +64,8 @@ func getSchema(f Fake, model string) (openapi.Schema, error) {
 	return m.LookupModel(model), nil
 }
 
-// GetSchemaOrDie returns returns the openapi schema.
-func GetSchemaOrDie(f Fake, model string) openapi.Schema {
+// GetSchemaOrDie returns the openapi schema.
+func GetSchemaOrDie(f *Fake, model string) openapi.Schema {
 	s, err := getSchema(f, model)
 	if err != nil {
 		panic(err)

@@ -17,28 +17,33 @@ limitations under the License.
 package app
 
 import (
-	"github.com/golang/glog"
-	"golang.org/x/exp/inotify"
+	"context"
+
+	"k8s.io/klog/v2"
+	"k8s.io/utils/inotify"
 )
 
-func watchForLockfileContention(path string, done chan struct{}) error {
+func watchForLockfileContention(ctx context.Context, path string, done chan struct{}) error {
+	logger := klog.FromContext(ctx)
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
-		glog.Errorf("unable to create watcher for lockfile: %v", err)
+		logger.Error(err, "Unable to create watcher for lockfile")
 		return err
 	}
-	if err = watcher.AddWatch(path, inotify.IN_OPEN|inotify.IN_DELETE_SELF); err != nil {
-		glog.Errorf("unable to watch lockfile: %v", err)
+	if err = watcher.AddWatch(path, inotify.InOpen|inotify.InDeleteSelf); err != nil {
+		logger.Error(err, "Unable to watch lockfile")
+		watcher.Close()
 		return err
 	}
 	go func() {
 		select {
 		case ev := <-watcher.Event:
-			glog.Infof("inotify event: %v", ev)
+			logger.Info("Inotify event", "event", ev)
 		case err = <-watcher.Error:
-			glog.Errorf("inotify watcher error: %v", err)
+			logger.Error(err, "inotify watcher error")
 		}
 		close(done)
+		watcher.Close()
 	}()
 	return nil
 }

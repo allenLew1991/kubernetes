@@ -27,9 +27,17 @@ build the image on Minikube:
 If you are not using Minikube, you should build this image and push it to a registry
 that your Kubernetes cluster can pull from.
 
+If you have RBAC enabled on your cluster, use the following
+snippet to create role binding which will grant the default service account view
+permissions.
+
+```
+kubectl create clusterrolebinding default-view --clusterrole=view --serviceaccount=default:default
+```
+
 Then, run the image in a Pod with a single instance Deployment:
 
-    $ kubectl run --rm -i demo --image=in-cluster --image-pull-policy=Never
+    kubectl run --rm -i demo --image=in-cluster
 
     There are 4 pods in the cluster
     There are 4 pods in the cluster
@@ -46,5 +54,5 @@ the `kubectl run` command and then run:
 
     kubectl delete deployment demo
 
-[sa]: https://kubernetes.io/docs/admin/authentication/#service-account-tokens
+[sa]: https://kubernetes.io/docs/reference/access-authn-authz/authentication/#service-account-tokens
 [mk]: https://kubernetes.io/docs/getting-started-guides/minikube/

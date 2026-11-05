@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,329 +17,246 @@ limitations under the License.
 package cmd
 
 import (
-	"errors"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
-	"k8s.io/utils/exec"
-	fakeexec "k8s.io/utils/exec/testing"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
-func assertExists(t *testing.T, path string) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("file/directory does not exist; error: %s", err)
-		t.Errorf("file/directory does not exist: %s", path)
-	}
-}
+var defaultURLScheme = kubeadmapiv1.DefaultContainerRuntimeURLScheme
+var testResetConfig = fmt.Sprintf(`apiVersion: %s
+kind: ResetConfiguration
+force: true
+dryRun: true
+cleanupTmpDir: true
+criSocket: %s:///var/run/fake.sock
+certificatesDir: /etc/kubernetes/pki2
+ignorePreflightErrors:
+- a
+- b
+`, kubeadmapiv1.SchemeGroupVersion.String(), defaultURLScheme)
 
-func assertNotExists(t *testing.T, path string) {
-	if _, err := os.Stat(path); err == nil {
-		t.Errorf("file/dir exists: %s", path)
+func TestNewResetData(t *testing.T) {
+	// create temp directory
+	tmpDir, err := os.MkdirTemp("", "kubeadm-reset-test")
+	if err != nil {
+		t.Errorf("Unable to create temporary directory: %v", err)
 	}
-}
+	defer os.RemoveAll(tmpDir)
 
-// assertDirEmpty verifies a directory either does not exist, or is empty.
-func assertDirEmpty(t *testing.T, path string) {
-	dac := preflight.DirAvailableCheck{Path: path}
-	_, errors := dac.Check()
-	if len(errors) != 0 {
-		t.Errorf("directory not empty: [%v]", errors)
+	// create config file
+	configFilePath := filepath.Join(tmpDir, "test-config-file")
+	cfgFile, err := os.Create(configFilePath)
+	if err != nil {
+		t.Errorf("Unable to create file %q: %v", configFilePath, err)
 	}
-}
+	defer cfgFile.Close()
+	if _, err = cfgFile.WriteString(testResetConfig); err != nil {
+		t.Fatalf("Unable to write file %q: %v", configFilePath, err)
+	}
 
-func TestConfigDirCleaner(t *testing.T) {
-	tests := map[string]struct {
-		setupDirs       []string
-		setupFiles      []string
-		verifyExists    []string
-		verifyNotExists []string
+	testCases := []struct {
+		name        string
+		args        []string
+		flags       map[string]string
+		validate    func(*testing.T, *resetData)
+		expectError string
+		data        *resetData
 	}{
-		"simple reset": {
-			setupDirs: []string{
-				"manifests",
-				"pki",
+		{
+			name: "flags parsed correctly",
+			flags: map[string]string{
+				options.CertificatesDir:       "/tmp",
+				options.NodeCRISocket:         constants.CRISocketCRIO,
+				options.IgnorePreflightErrors: "all",
+				options.Force:                 "true",
+				options.DryRun:                "true",
+				options.CleanupTmpDir:         "true",
 			},
-			setupFiles: []string{
-				"manifests/etcd.yaml",
-				"manifests/kube-apiserver.yaml",
-				"pki/ca.pem",
-				kubeadmconstants.AdminKubeConfigFileName,
-				kubeadmconstants.KubeletKubeConfigFileName,
-			},
-			verifyExists: []string{
-				"manifests",
-				"pki",
-			},
-		},
-		"partial reset": {
-			setupDirs: []string{
-				"pki",
-			},
-			setupFiles: []string{
-				"pki/ca.pem",
-				kubeadmconstants.KubeletKubeConfigFileName,
-			},
-			verifyExists: []string{
-				"pki",
-			},
-			verifyNotExists: []string{
-				"manifests",
+			data: &resetData{
+				certificatesDir:       "/tmp",
+				criSocketPath:         constants.CRISocketCRIO,
+				ignorePreflightErrors: sets.New("all"),
+				forceReset:            true,
+				dryRun:                true,
+				cleanupTmpDir:         true,
+				// resetCfg holds the value passed from flags except the value of ignorePreflightErrors
+				resetCfg: &kubeadmapi.ResetConfiguration{
+					TypeMeta:        metav1.TypeMeta{Kind: "", APIVersion: ""},
+					Force:           true,
+					CertificatesDir: "/tmp",
+					CRISocket:       constants.CRISocketCRIO,
+					DryRun:          true,
+					CleanupTmpDir:   true,
+				},
 			},
 		},
-		"preserve cloud-config": {
-			setupDirs: []string{
-				"manifests",
-				"pki",
+		{
+			name: "fails if preflight ignores all but has individual check",
+			flags: map[string]string{
+				options.IgnorePreflightErrors: "all,something-else",
+				options.NodeCRISocket:         fmt.Sprintf("%s:///var/run/crio/crio.sock", defaultURLScheme),
 			},
-			setupFiles: []string{
-				"manifests/etcd.yaml",
-				"manifests/kube-apiserver.yaml",
-				"pki/ca.pem",
-				kubeadmconstants.AdminKubeConfigFileName,
-				kubeadmconstants.KubeletKubeConfigFileName,
-				"cloud-config",
+			expectError: "don't specify individual checks if 'all' is used",
+		},
+		{
+			name: "pre-flights errors from CLI args",
+			flags: map[string]string{
+				options.IgnorePreflightErrors: "a,b",
+				options.NodeCRISocket:         fmt.Sprintf("%s:///var/run/crio/crio.sock", defaultURLScheme),
 			},
-			verifyExists: []string{
-				"manifests",
-				"pki",
-				"cloud-config",
+			validate: expectedResetIgnorePreflightErrors(sets.New("a", "b")),
+		},
+		// Start the testcases with config file
+		{
+			name: "Pass with config from file",
+			flags: map[string]string{
+				options.CfgPath: configFilePath,
+			},
+			data: &resetData{
+				certificatesDir:       "/etc/kubernetes/pki2",                                   // cover the case that default is overridden as well
+				criSocketPath:         fmt.Sprintf("%s:///var/run/fake.sock", defaultURLScheme), // cover the case that default is overridden as well
+				ignorePreflightErrors: sets.New("a", "b"),
+				forceReset:            true,
+				dryRun:                true,
+				cleanupTmpDir:         true,
+				resetCfg: &kubeadmapi.ResetConfiguration{
+					TypeMeta:              metav1.TypeMeta{Kind: "", APIVersion: ""},
+					Force:                 true,
+					CertificatesDir:       "/etc/kubernetes/pki2",
+					CRISocket:             fmt.Sprintf("%s:///var/run/fake.sock", defaultURLScheme),
+					IgnorePreflightErrors: []string{"a", "b"},
+					CleanupTmpDir:         true,
+					DryRun:                true,
+				},
 			},
 		},
-		"preserve hidden files and directories": {
-			setupDirs: []string{
-				"manifests",
-				"pki",
-				".mydir",
+		{
+			name: "force from config file overrides default",
+			flags: map[string]string{
+				options.CfgPath: configFilePath,
 			},
-			setupFiles: []string{
-				"manifests/etcd.yaml",
-				"manifests/kube-apiserver.yaml",
-				"pki/ca.pem",
-				kubeadmconstants.AdminKubeConfigFileName,
-				kubeadmconstants.KubeletKubeConfigFileName,
-				".cloud-config",
-				".mydir/.myfile",
-			},
-			verifyExists: []string{
-				"manifests",
-				"pki",
-				".cloud-config",
-				".mydir",
-				".mydir/.myfile",
+			validate: func(t *testing.T, data *resetData) {
+				// validate that the default value is overwritten
+				if data.forceReset != true {
+					t.Error("Invalid forceReset")
+				}
 			},
 		},
-		"no-op reset": {
-			verifyNotExists: []string{
-				"pki",
-				"manifests",
+		{
+			name: "dryRun configured in the config file only",
+			flags: map[string]string{
+				options.CfgPath: configFilePath,
 			},
+			validate: func(t *testing.T, data *resetData) {
+				if data.dryRun != true {
+					t.Error("Invalid dryRun")
+				}
+			},
+		},
+		{
+			name: "--cert-dir flag is not allowed to mix with config",
+			flags: map[string]string{
+				options.CfgPath:         configFilePath,
+				options.CertificatesDir: "/tmp",
+			},
+			expectError: "can not mix '--config' with arguments",
+		},
+		{
+			name: "--cri-socket flag is not allowed to mix with config",
+			flags: map[string]string{
+				options.CfgPath:       configFilePath,
+				options.NodeCRISocket: fmt.Sprintf("%s:///var/run/bogus.sock", defaultURLScheme),
+			},
+			expectError: "can not mix '--config' with arguments",
+		},
+		{
+			name: "--force flag is not allowed to mix with config",
+			flags: map[string]string{
+				options.CfgPath: configFilePath,
+				options.Force:   "false",
+			},
+			expectError: "can not mix '--config' with arguments",
+		},
+		{
+			name: "--cleanup-tmp-dir flag is not allowed to mix with config",
+			flags: map[string]string{
+				options.CfgPath:       configFilePath,
+				options.CleanupTmpDir: "true",
+			},
+			expectError: "can not mix '--config' with arguments",
+		},
+		{
+			name: "pre-flights errors from ResetConfiguration only",
+			flags: map[string]string{
+				options.CfgPath: configFilePath,
+			},
+			validate: expectedResetIgnorePreflightErrors(sets.New("a", "b")),
+		},
+		{
+			name: "pre-flights errors from both CLI args and ResetConfiguration",
+			flags: map[string]string{
+				options.CfgPath:               configFilePath,
+				options.IgnorePreflightErrors: "c,d",
+			},
+			validate: expectedResetIgnorePreflightErrors(sets.New("a", "b", "c", "d")),
 		},
 	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// initialize an external reset option and inject it to the reset cmd
+			resetOptions := newResetOptions()
+			cmd := newCmdReset(nil, nil, resetOptions)
 
-	for name, test := range tests {
-		t.Logf("Running test: %s", name)
+			// make sure all cases use dry-run as we are not constructing a kubeconfig
+			tc.flags[options.DryRun] = "true"
 
-		// Create a temporary directory for our fake config dir:
-		tmpDir, err := ioutil.TempDir("", "kubeadm-reset-test")
-		if err != nil {
-			t.Errorf("Unable to create temporary directory: %s", err)
-		}
-		defer os.RemoveAll(tmpDir)
-
-		for _, createDir := range test.setupDirs {
-			err := os.Mkdir(filepath.Join(tmpDir, createDir), 0700)
-			if err != nil {
-				t.Errorf("Unable to setup test config directory: %s", err)
+			// sets cmd flags (that will be reflected on the reset options)
+			for f, v := range tc.flags {
+				cmd.Flags().Set(f, v)
 			}
-		}
 
-		for _, createFile := range test.setupFiles {
-			fullPath := filepath.Join(tmpDir, createFile)
-			f, err := os.Create(fullPath)
-			if err != nil {
-				t.Errorf("Unable to create test file: %s", err)
+			// test newResetData method
+			data, err := newResetData(cmd, resetOptions, nil, nil, true)
+			if err != nil && !strings.Contains(err.Error(), tc.expectError) {
+				t.Fatalf("newResetData returned unexpected error, expected: %s, got %v", tc.expectError, err)
 			}
-			defer f.Close()
+			if err == nil && len(tc.expectError) != 0 {
+				t.Fatalf("newResetData didn't return error expected %s", tc.expectError)
+			}
+
+			if tc.data != nil {
+				if diff := cmp.Diff(tc.data, data, cmp.AllowUnexported(resetData{}), cmpopts.IgnoreFields(resetData{}, "client", "resetCfg.Timeouts")); diff != "" {
+					t.Fatalf("newResetData returned data (-want,+got):\n%s", diff)
+				}
+			}
+			// exec additional validation on the returned value
+			if tc.validate != nil {
+				tc.validate(t, data)
+			}
+		})
+	}
+}
+
+func expectedResetIgnorePreflightErrors(expected sets.Set[string]) func(t *testing.T, data *resetData) {
+	return func(t *testing.T, data *resetData) {
+		if !expected.Equal(data.ignorePreflightErrors) {
+			t.Errorf("Invalid ignore preflight errors. Expected: %v. Actual: %v", sets.List(expected), sets.List(data.ignorePreflightErrors))
 		}
-
-		resetConfigDir(tmpDir, filepath.Join(tmpDir, "pki"))
-
-		// Verify the files we cleanup implicitly in every test:
-		assertExists(t, tmpDir)
-		assertNotExists(t, filepath.Join(tmpDir, kubeadmconstants.AdminKubeConfigFileName))
-		assertNotExists(t, filepath.Join(tmpDir, kubeadmconstants.KubeletKubeConfigFileName))
-		assertDirEmpty(t, filepath.Join(tmpDir, "manifests"))
-		assertDirEmpty(t, filepath.Join(tmpDir, "pki"))
-
-		// Verify the files as requested by the test:
-		for _, path := range test.verifyExists {
-			assertExists(t, filepath.Join(tmpDir, path))
+		if data.cfg != nil && !expected.HasAll(data.cfg.NodeRegistration.IgnorePreflightErrors...) {
+			t.Errorf("Invalid ignore preflight errors in InitConfiguration. Expected: %v. Actual: %v", sets.List(expected), data.cfg.NodeRegistration.IgnorePreflightErrors)
 		}
-		for _, path := range test.verifyNotExists {
-			assertNotExists(t, filepath.Join(tmpDir, path))
-		}
-	}
-}
-
-type fakeDockerChecker struct {
-	warnings []error
-	errors   []error
-}
-
-func (c *fakeDockerChecker) Check() (warnings, errors []error) {
-	return c.warnings, c.errors
-}
-
-func (c *fakeDockerChecker) Name() string {
-	return "FakeDocker"
-}
-
-func newFakeDockerChecker(warnings, errors []error) preflight.Checker {
-	return &fakeDockerChecker{warnings: warnings, errors: errors}
-}
-
-func TestResetWithDocker(t *testing.T) {
-	fcmd := fakeexec.FakeCmd{
-		RunScript: []fakeexec.FakeRunAction{
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, errors.New("docker error") },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-		},
-	}
-	fexec := fakeexec.FakeExec{
-		CommandScript: []fakeexec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-		},
-	}
-	resetWithDocker(&fexec, newFakeDockerChecker(nil, nil))
-	if fcmd.RunCalls != 1 {
-		t.Errorf("expected 1 call to Run, got %d", fcmd.RunCalls)
-	}
-	resetWithDocker(&fexec, newFakeDockerChecker(nil, nil))
-	if fcmd.RunCalls != 2 {
-		t.Errorf("expected 2 calls to Run, got %d", fcmd.RunCalls)
-	}
-	resetWithDocker(&fexec, newFakeDockerChecker(nil, []error{errors.New("test error")}))
-	if fcmd.RunCalls != 2 {
-		t.Errorf("expected 2 calls to Run, got %d", fcmd.RunCalls)
-	}
-}
-
-func TestResetWithCrictl(t *testing.T) {
-	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			// 2: socket path provided, not runnning with crictl (1x CombinedOutput, 2x Run)
-			func() ([]byte, error) { return []byte("1"), nil },
-			// 3: socket path provided, crictl fails, reset with docker (1x CombinedOuput fail, 1x Run)
-			func() ([]byte, error) { return nil, errors.New("crictl list err") },
-		},
-		RunScript: []fakeexec.FakeRunAction{
-			// 1: socket path not provided, running with docker
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			// 2: socket path provided, now runnning with crictl (1x CombinedOutput, 2x Run)
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			// 3: socket path provided, crictl fails, reset with docker (1x CombinedOuput, 1x Run)
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			// 4: running with no socket and docker fails (1x Run)
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-		},
-	}
-	fexec := fakeexec.FakeExec{
-		CommandScript: []fakeexec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-		},
-	}
-
-	// 1: socket path not provided, running with docker
-	resetWithCrictl(&fexec, newFakeDockerChecker(nil, nil), "", "crictl")
-	if fcmd.RunCalls != 1 {
-		t.Errorf("expected 1 call to Run, got %d", fcmd.RunCalls)
-	}
-	if !strings.Contains(fcmd.RunLog[0][2], "docker") {
-		t.Errorf("expected a call to docker, got %v", fcmd.RunLog[0])
-	}
-
-	// 2: socket path provided, now runnning with crictl (1x CombinedOutput, 2x Run)
-	resetWithCrictl(&fexec, newFakeDockerChecker(nil, nil), "/test.sock", "crictl")
-	if fcmd.RunCalls != 3 {
-		t.Errorf("expected 3 calls to Run, got %d", fcmd.RunCalls)
-	}
-	if !strings.Contains(fcmd.RunLog[1][2], "crictl") {
-		t.Errorf("expected a call to crictl, got %v", fcmd.RunLog[0])
-	}
-	if !strings.Contains(fcmd.RunLog[2][2], "crictl") {
-		t.Errorf("expected a call to crictl, got %v", fcmd.RunLog[0])
-	}
-
-	// 3: socket path provided, crictl fails, reset with docker
-	resetWithCrictl(&fexec, newFakeDockerChecker(nil, nil), "/test.sock", "crictl")
-	if fcmd.RunCalls != 4 {
-		t.Errorf("expected 4 calls to Run, got %d", fcmd.RunCalls)
-	}
-	if !strings.Contains(fcmd.RunLog[3][2], "docker") {
-		t.Errorf("expected a call to docker, got %v", fcmd.RunLog[0])
-	}
-
-	// 4: running with no socket and docker fails (1x Run)
-	resetWithCrictl(&fexec, newFakeDockerChecker(nil, []error{errors.New("test error")}), "", "crictl")
-	if fcmd.RunCalls != 4 {
-		t.Errorf("expected 4 calls to Run, got %d", fcmd.RunCalls)
-	}
-}
-
-func TestReset(t *testing.T) {
-	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte("1"), nil },
-			func() ([]byte, error) { return []byte("1"), nil },
-			func() ([]byte, error) { return []byte("1"), nil },
-		},
-		RunScript: []fakeexec.FakeRunAction{
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-		},
-	}
-	fexec := fakeexec.FakeExec{
-		CommandScript: []fakeexec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-		},
-		LookPathFunc: func(cmd string) (string, error) { return cmd, nil },
-	}
-
-	reset(&fexec, newFakeDockerChecker(nil, nil), "/test.sock")
-	if fcmd.RunCalls != 2 {
-		t.Errorf("expected 2 call to Run, got %d", fcmd.RunCalls)
-	}
-	if !strings.Contains(fcmd.RunLog[0][2], "crictl") {
-		t.Errorf("expected a call to crictl, got %v", fcmd.RunLog[0])
-	}
-
-	fexec.LookPathFunc = func(cmd string) (string, error) { return "", errors.New("no crictl") }
-	reset(&fexec, newFakeDockerChecker(nil, nil), "/test.sock")
-	if fcmd.RunCalls != 3 {
-		t.Errorf("expected 3 calls to Run, got %d", fcmd.RunCalls)
-	}
-	if !strings.Contains(fcmd.RunLog[2][2], "docker") {
-		t.Errorf("expected a call to docker, got %v", fcmd.RunLog[0])
 	}
 }

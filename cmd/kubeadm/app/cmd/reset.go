@@ -20,245 +20,313 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
+	"path"
 
+	"github.com/lithammer/dedent"
 	"github.com/spf13/cobra"
+	flag "github.com/spf13/pflag"
 
 	"k8s.io/apimachinery/pkg/util/sets"
-	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
+	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/reset"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
+	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
-	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
-	"k8s.io/kubernetes/pkg/util/initsystem"
-	utilsexec "k8s.io/utils/exec"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
+	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+	utilruntime "k8s.io/kubernetes/cmd/kubeadm/app/util/runtime"
+	staticpodutil "k8s.io/kubernetes/cmd/kubeadm/app/util/staticpod"
 )
 
 var (
-	crictlSandboxesParamsFormat = "%s -r %s sandboxes --quiet | xargs -r"
-	crictlStopParamsFormat      = "%s -r %s stops %s"
-	crictlRemoveParamsFormat    = "%s -r %s rms %s"
+	manualCleanupInstructions = dedent.Dedent(`
+		The reset process does not perform cleanup of CNI plugin configuration,
+		network filtering rules and kubeconfig files.
+
+		For information on how to perform this cleanup manually, please see:
+		    https://k8s.io/docs/reference/setup-tools/kubeadm/kubeadm-reset/
+
+	`)
 )
 
-// NewCmdReset returns the "kubeadm reset" command
-func NewCmdReset(out io.Writer) *cobra.Command {
-	var skipPreFlight bool
-	var certsDir string
-	var criSocketPath string
-	var ignorePreflightErrors []string
+// resetOptions defines all the options exposed via flags by kubeadm reset.
+type resetOptions struct {
+	kubeconfigPath        string
+	cfgPath               string
+	ignorePreflightErrors []string
+	externalcfg           *kubeadmapiv1.ResetConfiguration
+	skipCRIDetect         bool
+}
+
+// resetData defines all the runtime information used when running the kubeadm reset workflow;
+// this data is shared across all the phases that are included in the workflow.
+type resetData struct {
+	certificatesDir       string
+	client                clientset.Interface
+	criSocketPath         string
+	forceReset            bool
+	ignorePreflightErrors sets.Set[string]
+	inputReader           io.Reader
+	outputWriter          io.Writer
+	cfg                   *kubeadmapi.InitConfiguration
+	resetCfg              *kubeadmapi.ResetConfiguration
+	dryRun                bool
+	cleanupTmpDir         bool
+}
+
+// newResetOptions returns a struct ready for being used for creating cmd join flags.
+func newResetOptions() *resetOptions {
+	// initialize the public kubeadm config API by applying defaults
+	externalcfg := &kubeadmapiv1.ResetConfiguration{}
+	// Apply defaults
+	kubeadmscheme.Scheme.Default(externalcfg)
+	return &resetOptions{
+		kubeconfigPath: kubeadmconstants.GetAdminKubeConfigPath(),
+		externalcfg:    externalcfg,
+	}
+}
+
+// newResetData returns a new resetData struct to be used for the execution of the kubeadm reset workflow.
+func newResetData(cmd *cobra.Command, opts *resetOptions, in io.Reader, out io.Writer, allowExperimental bool) (*resetData, error) {
+	// Validate the mixed arguments with --config and return early on errors
+	if err := validation.ValidateMixedArguments(cmd.Flags()); err != nil {
+		return nil, err
+	}
+
+	var (
+		initCfg *kubeadmapi.InitConfiguration
+		client  clientset.Interface
+	)
+
+	// Either use the config file if specified, or convert public kubeadm API to the internal ResetConfiguration and validates cfg.
+	resetCfg, err := configutil.LoadOrDefaultResetConfiguration(opts.cfgPath, opts.externalcfg, configutil.LoadOrDefaultConfigurationOptions{
+		AllowExperimental: allowExperimental,
+		SkipCRIDetect:     opts.skipCRIDetect,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dryRunFlag := cmdutil.ValueFromFlagsOrConfig(cmd.Flags(), options.DryRun, resetCfg.DryRun, opts.externalcfg.DryRun).(bool)
+	if dryRunFlag {
+		dryRun := apiclient.NewDryRun().WithDefaultMarshalFunction().WithWriter(os.Stdout)
+		dryRun.AppendReactor(dryRun.GetKubeadmConfigReactor()).
+			AppendReactor(dryRun.GetKubeletConfigReactor()).
+			AppendReactor(dryRun.GetKubeProxyConfigReactor())
+		client = dryRun.FakeClient()
+		_, err = os.Stat(opts.kubeconfigPath)
+		if err == nil {
+			err = dryRun.WithKubeConfigFile(opts.kubeconfigPath)
+		}
+	} else {
+		client, err = kubeconfigutil.ClientSetFromFile(opts.kubeconfigPath)
+	}
+
+	if err == nil {
+		klog.V(1).Infof("[reset] Loaded client set from kubeconfig file: %s", opts.kubeconfigPath)
+		getNodeRegistration := true
+		getAPIEndpoint := staticpodutil.IsControlPlaneNode()
+		getComponentConfigs := true
+		initCfg, err = configutil.FetchInitConfigurationFromCluster(client, nil, "reset", getNodeRegistration, getAPIEndpoint, getComponentConfigs, true)
+		if err != nil {
+			klog.Warningf("[reset] Unable to fetch the kubeadm-config ConfigMap from cluster: %v", err)
+		}
+	} else {
+		klog.V(1).Infof("[reset] Could not obtain a client set from the kubeconfig file: %s", opts.kubeconfigPath)
+	}
+
+	ignorePreflightErrorsSet, err := validation.ValidateIgnorePreflightErrors(opts.ignorePreflightErrors, resetCfg.IgnorePreflightErrors)
+	if err != nil {
+		return nil, err
+	}
+	if initCfg != nil {
+		// Also set the union of pre-flight errors to InitConfiguration, to provide a consistent view of the runtime configuration:
+		initCfg.NodeRegistration.IgnorePreflightErrors = sets.List(ignorePreflightErrorsSet)
+	}
+
+	criSocketPath := opts.externalcfg.CRISocket
+	if criSocketPath == "" {
+		criSocketPath, err = resetDetectCRISocket(resetCfg, initCfg)
+		if err != nil {
+			return nil, err
+		}
+		klog.V(1).Infof("[reset] Using specified CRI socket: %s", criSocketPath)
+	}
+
+	certificatesDir := kubeadmapiv1.DefaultCertificatesDir
+	if cmd.Flags().Changed(options.CertificatesDir) { // flag is specified
+		certificatesDir = opts.externalcfg.CertificatesDir
+	} else if len(resetCfg.CertificatesDir) > 0 { // configured in the ResetConfiguration
+		certificatesDir = resetCfg.CertificatesDir
+	} else if initCfg != nil && len(initCfg.ClusterConfiguration.CertificatesDir) > 0 { // fetch from cluster
+		certificatesDir = initCfg.ClusterConfiguration.CertificatesDir
+	}
+
+	return &resetData{
+		certificatesDir:       certificatesDir,
+		client:                client,
+		criSocketPath:         criSocketPath,
+		ignorePreflightErrors: ignorePreflightErrorsSet,
+		inputReader:           in,
+		outputWriter:          out,
+		cfg:                   initCfg,
+		resetCfg:              resetCfg,
+		dryRun:                dryRunFlag,
+		forceReset:            cmdutil.ValueFromFlagsOrConfig(cmd.Flags(), options.Force, resetCfg.Force, opts.externalcfg.Force).(bool),
+		cleanupTmpDir:         cmdutil.ValueFromFlagsOrConfig(cmd.Flags(), options.CleanupTmpDir, resetCfg.CleanupTmpDir, opts.externalcfg.CleanupTmpDir).(bool),
+	}, nil
+}
+
+// AddResetFlags adds reset flags
+func AddResetFlags(flagSet *flag.FlagSet, resetOptions *resetOptions) {
+	flagSet.StringVar(
+		&resetOptions.externalcfg.CertificatesDir, options.CertificatesDir, kubeadmapiv1.DefaultCertificatesDir,
+		`The path to the directory where the certificates are stored. If specified, clean this directory.`,
+	)
+	flagSet.BoolVarP(
+		&resetOptions.externalcfg.Force, options.Force, "f", resetOptions.externalcfg.Force,
+		"Reset the node without prompting for confirmation.",
+	)
+	flagSet.BoolVar(
+		&resetOptions.externalcfg.DryRun, options.DryRun, resetOptions.externalcfg.DryRun,
+		"Don't apply any changes; just output what would be done.",
+	)
+	flagSet.BoolVar(
+		&resetOptions.externalcfg.CleanupTmpDir, options.CleanupTmpDir, resetOptions.externalcfg.CleanupTmpDir,
+		fmt.Sprintf("Cleanup the %q directory", path.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.TempDir)),
+	)
+	options.AddKubeConfigFlag(flagSet, &resetOptions.kubeconfigPath)
+	options.AddConfigFlag(flagSet, &resetOptions.cfgPath)
+	options.AddIgnorePreflightErrorsFlag(flagSet, &resetOptions.ignorePreflightErrors)
+	cmdutil.AddCRISocketFlag(flagSet, &resetOptions.externalcfg.CRISocket)
+}
+
+// newCmdReset returns the "kubeadm reset" command
+func newCmdReset(in io.Reader, out io.Writer, resetOptions *resetOptions) *cobra.Command {
+	if resetOptions == nil {
+		resetOptions = newResetOptions()
+	}
+	resetRunner := workflow.NewRunner()
 
 	cmd := &cobra.Command{
 		Use:   "reset",
-		Short: "Run this to revert any changes made to this host by 'kubeadm init' or 'kubeadm join'.",
-		Run: func(cmd *cobra.Command, args []string) {
-			ignorePreflightErrorsSet, err := validation.ValidateIgnorePreflightErrors(ignorePreflightErrors, skipPreFlight)
-			kubeadmutil.CheckErr(err)
+		Short: "Performs a best effort revert of changes made to this host by 'kubeadm init' or 'kubeadm join'",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := resetRunner.InitData(args)
+			if err != nil {
+				return err
+			}
+			if _, ok := data.(*resetData); !ok {
+				return errors.New("invalid data struct")
+			}
+			if err := resetRunner.Run(args); err != nil {
+				return err
+			}
 
-			r, err := NewReset(ignorePreflightErrorsSet, certsDir, criSocketPath)
-			kubeadmutil.CheckErr(err)
-			kubeadmutil.CheckErr(r.Run(out))
+			fmt.Print(manualCleanupInstructions)
+			return nil
 		},
 	}
 
-	cmd.PersistentFlags().StringSliceVar(
-		&ignorePreflightErrors, "ignore-preflight-errors", ignorePreflightErrors,
-		"A list of checks whose errors will be shown as warnings. Example: 'IsPrivilegedUser,Swap'. Value 'all' ignores errors from all checks.",
-	)
-	cmd.PersistentFlags().BoolVar(
-		&skipPreFlight, "skip-preflight-checks", false,
-		"Skip preflight checks which normally run before modifying the system.",
-	)
-	cmd.PersistentFlags().MarkDeprecated("skip-preflight-checks", "it is now equivalent to --ignore-preflight-errors=all")
+	AddResetFlags(cmd.Flags(), resetOptions)
+	// initialize the workflow runner with the list of phases
+	resetRunner.AppendPhase(phases.NewPreflightPhase())
+	resetRunner.AppendPhase(phases.NewRemoveETCDMemberPhase())
+	resetRunner.AppendPhase(phases.NewCleanupNodePhase())
 
-	cmd.PersistentFlags().StringVar(
-		&certsDir, "cert-dir", kubeadmapiext.DefaultCertificatesDir,
-		"The path to the directory where the certificates are stored. If specified, clean this directory.",
-	)
+	// sets the data builder function, that will be used by the runner
+	// both when running the entire workflow or single phases
+	resetRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
+		if cmd.Flags().Lookup(options.NodeCRISocket) == nil {
+			// skip CRI detection
+			// assume that the command execution does not depend on CRISocket when --cri-socket flag is not set
+			resetOptions.skipCRIDetect = true
+		}
+		data, err := newResetData(cmd, resetOptions, in, out, true)
+		if err != nil {
+			return nil, err
+		}
+		// If the flag for skipping phases was empty, use the values from config
+		if len(resetRunner.Options.SkipPhases) == 0 {
+			resetRunner.Options.SkipPhases = data.resetCfg.SkipPhases
+		}
+		return data, nil
+	})
 
-	cmd.PersistentFlags().StringVar(
-		&criSocketPath, "cri-socket", "/var/run/dockershim.sock",
-		"The path to the CRI socket to use with crictl when cleaning up containers.",
-	)
+	// binds the Runner to kubeadm reset command by altering
+	// command help, adding --skip-phases flag and by adding phases subcommands
+	resetRunner.BindToCommand(cmd)
 
 	return cmd
 }
 
-// Reset defines struct used for kubeadm reset command
-type Reset struct {
-	certsDir      string
-	criSocketPath string
+// ResetCfg returns the ResetConfiguration.
+func (r *resetData) ResetCfg() *kubeadmapi.ResetConfiguration {
+	return r.resetCfg
 }
 
-// NewReset instantiate Reset struct
-func NewReset(ignorePreflightErrors sets.String, certsDir, criSocketPath string) (*Reset, error) {
-	fmt.Println("[preflight] Running pre-flight checks.")
-
-	if err := preflight.RunRootCheckOnly(ignorePreflightErrors); err != nil {
-		return nil, err
-	}
-
-	return &Reset{
-		certsDir:      certsDir,
-		criSocketPath: criSocketPath,
-	}, nil
+// Cfg returns the InitConfiguration.
+func (r *resetData) Cfg() *kubeadmapi.InitConfiguration {
+	return r.cfg
 }
 
-// Run reverts any changes made to this host by "kubeadm init" or "kubeadm join".
-func (r *Reset) Run(out io.Writer) error {
-
-	// Try to stop the kubelet service
-	initSystem, err := initsystem.GetInitSystem()
-	if err != nil {
-		fmt.Println("[reset] WARNING: The kubelet service could not be stopped by kubeadm. Unable to detect a supported init system!")
-		fmt.Println("[reset] WARNING: Please ensure kubelet is stopped manually.")
-	} else {
-		fmt.Println("[reset] Stopping the kubelet service.")
-		if err := initSystem.ServiceStop("kubelet"); err != nil {
-			fmt.Printf("[reset] WARNING: The kubelet service could not be stopped by kubeadm: [%v]\n", err)
-			fmt.Println("[reset] WARNING: Please ensure kubelet is stopped manually.")
-		}
-	}
-
-	// Try to unmount mounted directories under /var/lib/kubelet in order to be able to remove the /var/lib/kubelet directory later
-	fmt.Printf("[reset] Unmounting mounted directories in %q\n", "/var/lib/kubelet")
-	umountDirsCmd := "awk '$2 ~ path {print $2}' path=/var/lib/kubelet /proc/mounts | xargs -r umount"
-	umountOutputBytes, err := exec.Command("sh", "-c", umountDirsCmd).Output()
-	if err != nil {
-		fmt.Printf("[reset] Failed to unmount mounted directories in /var/lib/kubelet: %s\n", string(umountOutputBytes))
-	}
-
-	fmt.Println("[reset] Removing kubernetes-managed containers.")
-	dockerCheck := preflight.ServiceCheck{Service: "docker", CheckIfActive: true}
-	execer := utilsexec.New()
-
-	reset(execer, dockerCheck, r.criSocketPath)
-
-	dirsToClean := []string{"/var/lib/kubelet", "/etc/cni/net.d", "/var/lib/dockershim", "/var/run/kubernetes"}
-
-	// Only clear etcd data when the etcd manifest is found. In case it is not found, we must assume that the user
-	// provided external etcd endpoints. In that case, it is his own responsibility to reset etcd
-	etcdManifestPath := filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.ManifestsSubDirName, "etcd.yaml")
-	if _, err := os.Stat(etcdManifestPath); err == nil {
-		dirsToClean = append(dirsToClean, "/var/lib/etcd")
-	} else {
-		fmt.Printf("[reset] No etcd manifest found in %q. Assuming external etcd.\n", etcdManifestPath)
-	}
-
-	// Then clean contents from the stateful kubelet, etcd and cni directories
-	fmt.Printf("[reset] Deleting contents of stateful directories: %v\n", dirsToClean)
-	for _, dir := range dirsToClean {
-		cleanDir(dir)
-	}
-
-	// Remove contents from the config and pki directories
-	if r.certsDir != kubeadmapiext.DefaultCertificatesDir {
-		fmt.Printf("[reset] WARNING: Cleaning a non-default certificates directory: %q\n", r.certsDir)
-	}
-	resetConfigDir(kubeadmconstants.KubernetesDir, r.certsDir)
-
-	return nil
+// DryRun returns the dryRun flag.
+func (r *resetData) DryRun() bool {
+	return r.dryRun
 }
 
-func reset(execer utilsexec.Interface, dockerCheck preflight.Checker, criSocketPath string) {
-	crictlPath, err := execer.LookPath("crictl")
-	if err == nil {
-		resetWithCrictl(execer, dockerCheck, criSocketPath, crictlPath)
-	} else {
-		resetWithDocker(execer, dockerCheck)
-	}
+// CleanupTmpDir returns the cleanupTmpDir flag.
+func (r *resetData) CleanupTmpDir() bool {
+	return r.cleanupTmpDir
 }
 
-func resetWithDocker(execer utilsexec.Interface, dockerCheck preflight.Checker) {
-	if _, errors := dockerCheck.Check(); len(errors) == 0 {
-		if err := execer.Command("sh", "-c", "docker ps -a --filter name=k8s_ -q | xargs -r docker rm --force --volumes").Run(); err != nil {
-			fmt.Println("[reset] Failed to stop the running containers.")
-		}
-	} else {
-		fmt.Println("[reset] Docker doesn't seem to be running. Skipping the removal of running Kubernetes containers.")
-	}
+// CertificatesDir returns the CertificatesDir.
+func (r *resetData) CertificatesDir() string {
+	return r.certificatesDir
 }
 
-func resetWithCrictl(execer utilsexec.Interface, dockerCheck preflight.Checker, criSocketPath, crictlPath string) {
-	if criSocketPath != "" {
-		fmt.Printf("[reset] Cleaning up running containers using crictl with socket %s\n", criSocketPath)
-		listcmd := fmt.Sprintf(crictlSandboxesParamsFormat, crictlPath, criSocketPath)
-		output, err := execer.Command("sh", "-c", listcmd).CombinedOutput()
-		if err != nil {
-			fmt.Println("[reset] Failed to list running pods using crictl. Trying using docker instead.")
-			resetWithDocker(execer, dockerCheck)
-			return
-		}
-		sandboxes := strings.Split(string(output), " ")
-		for _, s := range sandboxes {
-			stopcmd := fmt.Sprintf(crictlStopParamsFormat, crictlPath, criSocketPath, s)
-			if err := execer.Command("sh", "-c", stopcmd).Run(); err != nil {
-				fmt.Println("[reset] Failed to stop the running containers using crictl. Trying using docker instead.")
-				resetWithDocker(execer, dockerCheck)
-				return
-			}
-			removecmd := fmt.Sprintf(crictlRemoveParamsFormat, crictlPath, criSocketPath, s)
-			if err := execer.Command("sh", "-c", removecmd).Run(); err != nil {
-				fmt.Println("[reset] Failed to remove the running containers using crictl. Trying using docker instead.")
-				resetWithDocker(execer, dockerCheck)
-				return
-			}
-		}
-	} else {
-		fmt.Println("[reset] CRI socket path not provided for crictl. Trying docker instead.")
-		resetWithDocker(execer, dockerCheck)
-	}
+// Client returns the Client for accessing the cluster.
+func (r *resetData) Client() clientset.Interface {
+	return r.client
 }
 
-// cleanDir removes everything in a directory, but not the directory itself
-func cleanDir(filePath string) error {
-	// If the directory doesn't even exist there's nothing to do, and we do
-	// not consider this an error
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return nil
-	}
-
-	d, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return err
-	}
-	for _, name := range names {
-		if err = os.RemoveAll(filepath.Join(filePath, name)); err != nil {
-			return err
-		}
-	}
-	return nil
+// ForceReset returns the forceReset flag.
+func (r *resetData) ForceReset() bool {
+	return r.forceReset
 }
 
-// resetConfigDir is used to cleanup the files kubeadm writes in /etc/kubernetes/.
-func resetConfigDir(configPathDir, pkiPathDir string) {
-	dirsToClean := []string{
-		filepath.Join(configPathDir, kubeadmconstants.ManifestsSubDirName),
-		pkiPathDir,
+// InputReader returns the io.reader used to read messages.
+func (r *resetData) InputReader() io.Reader {
+	return r.inputReader
+}
+
+// IgnorePreflightErrors returns the list of preflight errors to ignore.
+func (r *resetData) IgnorePreflightErrors() sets.Set[string] {
+	return r.ignorePreflightErrors
+}
+
+// CRISocketPath returns the criSocketPath.
+func (r *resetData) CRISocketPath() string {
+	return r.criSocketPath
+}
+
+func resetDetectCRISocket(resetCfg *kubeadmapi.ResetConfiguration, initCfg *kubeadmapi.InitConfiguration) (string, error) {
+	if resetCfg != nil && len(resetCfg.CRISocket) > 0 {
+		return resetCfg.CRISocket, nil
 	}
-	fmt.Printf("[reset] Deleting contents of config directories: %v\n", dirsToClean)
-	for _, dir := range dirsToClean {
-		if err := cleanDir(dir); err != nil {
-			fmt.Printf("[reset] Failed to remove directory: %q [%v]\n", dir, err)
-		}
+	if initCfg != nil && len(initCfg.NodeRegistration.CRISocket) > 0 {
+		return initCfg.NodeRegistration.CRISocket, nil
 	}
 
-	filesToClean := []string{
-		filepath.Join(configPathDir, kubeadmconstants.AdminKubeConfigFileName),
-		filepath.Join(configPathDir, kubeadmconstants.KubeletKubeConfigFileName),
-		filepath.Join(configPathDir, kubeadmconstants.ControllerManagerKubeConfigFileName),
-		filepath.Join(configPathDir, kubeadmconstants.SchedulerKubeConfigFileName),
-	}
-	fmt.Printf("[reset] Deleting files: %v\n", filesToClean)
-	for _, path := range filesToClean {
-		if err := os.RemoveAll(path); err != nil {
-			fmt.Printf("[reset] Failed to remove file: %q [%v]\n", path, err)
-		}
-	}
+	// try to detect it on host
+	return utilruntime.DetectCRISocket()
 }

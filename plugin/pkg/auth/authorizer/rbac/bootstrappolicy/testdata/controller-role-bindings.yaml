@@ -5,7 +5,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:attachdetach-controller
@@ -22,7 +21,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:certificate-controller
@@ -39,7 +37,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:clusterrole-aggregation-controller
@@ -56,7 +53,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:cronjob-controller
@@ -73,7 +69,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:daemon-set-controller
@@ -90,7 +85,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:deployment-controller
@@ -107,7 +101,22 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:device-taint-eviction-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:device-taint-eviction-controller
+  subjects:
+  - kind: ServiceAccount
+    name: device-taint-eviction-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:disruption-controller
@@ -124,7 +133,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:endpoint-controller
@@ -141,7 +149,70 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:endpointslice-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:endpointslice-controller
+  subjects:
+  - kind: ServiceAccount
+    name: endpointslice-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:endpointslicemirroring-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:endpointslicemirroring-controller
+  subjects:
+  - kind: ServiceAccount
+    name: endpointslicemirroring-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:ephemeral-volume-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:ephemeral-volume-controller
+  subjects:
+  - kind: ServiceAccount
+    name: ephemeral-volume-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:expand-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:expand-controller
+  subjects:
+  - kind: ServiceAccount
+    name: expand-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:generic-garbage-collector
@@ -158,7 +229,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:horizontal-pod-autoscaler
@@ -175,7 +245,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:job-controller
@@ -192,7 +261,38 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:kube-apiserver-serving-clustertrustbundle-publisher
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:kube-apiserver-serving-clustertrustbundle-publisher
+  subjects:
+  - kind: ServiceAccount
+    name: kube-apiserver-serving-clustertrustbundle-publisher
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:legacy-service-account-token-cleaner
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:legacy-service-account-token-cleaner
+  subjects:
+  - kind: ServiceAccount
+    name: legacy-service-account-token-cleaner
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:namespace-controller
@@ -209,7 +309,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:node-controller
@@ -226,7 +325,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:persistent-volume-binder
@@ -243,7 +341,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:pod-garbage-collector
@@ -260,7 +357,54 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:podcertificaterequestcleaner
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:podcertificaterequestcleaner
+  subjects:
+  - kind: ServiceAccount
+    name: podcertificaterequestcleaner
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:pv-protection-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:pv-protection-controller
+  subjects:
+  - kind: ServiceAccount
+    name: pv-protection-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:pvc-protection-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:pvc-protection-controller
+  subjects:
+  - kind: ServiceAccount
+    name: pvc-protection-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:replicaset-controller
@@ -277,7 +421,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:replication-controller
@@ -294,7 +437,22 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:resource-claim-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:resource-claim-controller
+  subjects:
+  - kind: ServiceAccount
+    name: resource-claim-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:resourcequota-controller
@@ -311,7 +469,22 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:root-ca-cert-publisher
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:root-ca-cert-publisher
+  subjects:
+  - kind: ServiceAccount
+    name: root-ca-cert-publisher
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:route-controller
@@ -328,7 +501,22 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:selinux-warning-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:selinux-warning-controller
+  subjects:
+  - kind: ServiceAccount
+    name: selinux-warning-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:service-account-controller
@@ -345,7 +533,22 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:service-cidrs-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:service-cidrs-controller
+  subjects:
+  - kind: ServiceAccount
+    name: service-cidrs-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:service-controller
@@ -362,7 +565,6 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:statefulset-controller
@@ -379,7 +581,38 @@ items:
   metadata:
     annotations:
       rbac.authorization.kubernetes.io/autoupdate: "true"
-    creationTimestamp: null
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:storage-version-migrator-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:storage-version-migrator-controller
+  subjects:
+  - kind: ServiceAccount
+    name: storage-version-migrator-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:ttl-after-finished-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:ttl-after-finished-controller
+  subjects:
+  - kind: ServiceAccount
+    name: ttl-after-finished-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
     labels:
       kubernetes.io/bootstrapping: rbac-defaults
     name: system:controller:ttl-controller
@@ -390,6 +623,38 @@ items:
   subjects:
   - kind: ServiceAccount
     name: ttl-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:validatingadmissionpolicy-status-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:validatingadmissionpolicy-status-controller
+  subjects:
+  - kind: ServiceAccount
+    name: validatingadmissionpolicy-status-controller
+    namespace: kube-system
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+    labels:
+      kubernetes.io/bootstrapping: rbac-defaults
+    name: system:controller:volumeattributesclass-protection-controller
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:controller:volumeattributesclass-protection-controller
+  subjects:
+  - kind: ServiceAccount
+    name: volumeattributesclass-protection-controller
     namespace: kube-system
 kind: List
 metadata: {}

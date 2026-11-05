@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+Copyright 2019 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,153 +14,284 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package main provides a tool that scans kubernetes e2e test source code
-// looking for conformance test declarations, which it emits on stdout.  It
-// also looks for legacy, manually added "[Conformance]" tags and reports an
-// error if it finds any.
-//
-// This approach is not air tight, but it will serve our purpose as a
-// pre-submit check.
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
+	"log"
 	"os"
-	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"text/template"
+
+	"github.com/onsi/ginkgo/v2/types"
+
+	yaml "go.yaml.in/yaml/v2"
 )
 
-type visitor struct {
-	FileSet *token.FileSet
+// ConformanceData describes the structure of the conformance.yaml file
+type ConformanceData struct {
+	// A URL to the line of code in the kube src repo for the test. Omitted from the YAML to avoid exposing line number.
+	URL string `yaml:"-"`
+	// Extracted from the "Testname:" comment before the test
+	TestName string
+	// CodeName is taken from the actual ginkgo descriptions, e.g. `[sig-apps] Foo should bar [Conformance]`
+	CodeName string
+	// Extracted from the "Description:" comment before the test
+	Description string
+	// Version when this test is added or modified ex: v1.12, v1.13
+	Release string
+	// File is the filename where the test is defined. We intentionally don't save the line here to avoid meaningless changes.
+	File string
 }
 
-func newVisitor() *visitor {
-	return &visitor{
-		FileSet: token.NewFileSet(),
-	}
-}
+var (
+	baseURL = flag.String("url", "https://github.com/kubernetes/kubernetes/tree/master/", "location of the current source")
+	k8sPath = flag.String("source", "", "location of the current source on the current machine")
+	confDoc = flag.Bool("docs", false, "write a conformance document")
+	version = flag.String("version", "v1.9", "version of this conformance document")
+	label   = flag.String("label", "Conformance", "test label to match")
 
-func (v *visitor) isConformanceCall(call *ast.CallExpr) bool {
-	switch fun := call.Fun.(type) {
-	case *ast.SelectorExpr:
-		if fun.Sel != nil {
-			return fun.Sel.Name == "ConformanceIt"
-		}
-	}
-	return false
-}
+	// If a test name contains any of these tags, it is ineligible for promotion to conformance
+	regexIneligibleTags = regexp.MustCompile(`\[(Alpha|Feature:[^\]]+|Flaky)\]`)
 
-func (v *visitor) isLegacyItCall(call *ast.CallExpr) bool {
-	switch fun := call.Fun.(type) {
-	case *ast.Ident:
-		if fun.Name != "It" {
-			return false
-		}
-		if len(call.Args) < 1 {
-			v.failf(call, "Not enough arguments to It()")
-		}
-	default:
-		return false
-	}
+	// Conformance comments should be within this number of lines to the call itself.
+	// Allowing for more than one in case a spare comment or two is below it.
+	conformanceCommentsLineWindow = 5
 
-	switch arg := call.Args[0].(type) {
-	case *ast.BasicLit:
-		if arg.Kind != token.STRING {
-			v.failf(arg, "Unexpected non-string argument to It()")
-		}
-		if strings.Contains(arg.Value, "[Conformance]") {
-			return true
-		}
-	default:
-		// non-literal argument to It()... we just ignore these even though they could be a way to "sneak in" a conformance test
-	}
+	seenLines map[string]struct{}
+)
 
-	return false
-}
-
-func (v *visitor) failf(expr ast.Expr, format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	fmt.Fprintf(os.Stderr, "ERROR at %v: %s\n", v.FileSet.Position(expr.Pos()), msg)
-	os.Exit(65)
-}
-
-func (v *visitor) emit(arg ast.Expr) {
-	switch at := arg.(type) {
-	case *ast.BasicLit:
-		if at.Kind != token.STRING {
-			v.failf(at, "framework.ConformanceIt() called with non-string argument")
-			return
-		}
-		fmt.Printf("%s: %s\n", v.FileSet.Position(at.Pos()).Filename, at.Value)
-	default:
-		v.failf(at, "framework.ConformanceIt() called with non-literal argument")
-		fmt.Fprintf(os.Stderr, "ERROR: non-literal argument %v at %v\n", arg, v.FileSet.Position(arg.Pos()))
-	}
-}
-
-// Visit visits each node looking for either calls to framework.ConformanceIt,
-// which it will emit in its list of conformance tests, or legacy calls to
-// It() with a manually embedded [Conformance] tag, which it will complain
-// about.
-func (v *visitor) Visit(node ast.Node) (w ast.Visitor) {
-	switch t := node.(type) {
-	case *ast.CallExpr:
-		if v.isConformanceCall(t) {
-			v.emit(t.Args[0])
-		} else if v.isLegacyItCall(t) {
-			v.failf(t, "Using It() with manual [Conformance] tag is no longer allowed.  Use framework.ConformanceIt() instead.")
-			return nil
-		}
-	}
-	return v
-}
-
-func scandir(dir string) {
-	v := newVisitor()
-	pkg, err := parser.ParseDir(v.FileSet, dir, nil, 0)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, p := range pkg {
-		ast.Walk(v, p)
-	}
-}
-
-func scanfile(path string) {
-	v := newVisitor()
-	file, err := parser.ParseFile(v.FileSet, path, nil, 0)
-	if err != nil {
-		panic(err)
-	}
-
-	ast.Walk(v, file)
+type frame struct {
+	// File and Line are the file name and line number of the
+	// location in this frame. For non-leaf frames, this will be
+	// the location of a call. These may be the empty string and
+	// zero, respectively, if not known.
+	File string
+	Line int
 }
 
 func main() {
-	args := os.Args[1:]
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "USAGE: %s <DIR or FILE> [...]\n", os.Args[0])
-		os.Exit(64)
-	}
+	flag.Parse()
 
-	for _, arg := range args {
-		filepath.Walk(arg, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if info.IsDir() {
-				scandir(path)
-			} else {
-				// TODO(mml): Remove this once we have all-go-srcs build rules.  See https://github.com/kubernetes/repo-infra/pull/45
-				if strings.HasSuffix(path, ".go") {
-					scanfile(path)
+	if len(flag.Args()) < 1 {
+		log.Fatalln("Requires the name of the test details file as first and only argument.")
+	}
+	testDetailsFile := flag.Args()[0]
+	f, err := os.Open(testDetailsFile)
+	if err != nil {
+		log.Fatalf("Failed to open file %v: %v", testDetailsFile, err)
+	}
+	defer f.Close()
+
+	seenLines = map[string]struct{}{}
+	dec := json.NewDecoder(f)
+	testInfos := []*ConformanceData{}
+	for {
+		var spec *types.SpecReport
+		if err := dec.Decode(&spec); err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatal(err)
+		}
+
+		if shouldOutput(spec) {
+			testInfo := getTestInfo(spec)
+			if testInfo != nil {
+				testInfos = append(testInfos, testInfo)
+				if err := validateTestName(testInfo.CodeName); err != nil {
+					log.Fatal(err)
 				}
 			}
-			return nil
-		})
+		}
 	}
+
+	sort.Slice(testInfos, func(i, j int) bool { return testInfos[i].CodeName < testInfos[j].CodeName })
+	saveAllTestInfo(testInfos)
+}
+
+func shouldOutput(spec *types.SpecReport) bool {
+	return strings.Contains(getTestName(spec), "["+*label+"]")
+}
+
+func getTestInfo(spec *types.SpecReport) *ConformanceData {
+	var c *ConformanceData
+	var err error
+	// The key to this working is that we don't need to parse every file or walk
+	// every types.CodeLocation. The LeafNodeLocation is going to be file:line which
+	// attached to the comment that we want.
+	leafNodeLocation := spec.LeafNodeLocation
+	frame := frame{
+		File: leafNodeLocation.FileName,
+		Line: leafNodeLocation.LineNumber,
+	}
+	c, err = getConformanceData(frame)
+	if err != nil {
+		log.Printf("Error looking for conformance data: %v", err)
+	}
+	if c == nil {
+		log.Printf("Did not find test info for spec: %#v\n", getTestName(spec))
+		return nil
+	}
+	c.CodeName = getTestName(spec)
+	return c
+}
+
+func getTestName(spec *types.SpecReport) string {
+	return strings.Join(spec.ContainerHierarchyTexts[0:], " ") + " " + spec.LeafNodeText
+}
+
+func saveAllTestInfo(dataSet []*ConformanceData) {
+	if *confDoc {
+		// Note: this assumes that you're running from the root of the kube src repo
+		templ, err := template.ParseFiles("./test/conformance/cf_header.md")
+		if err != nil {
+			fmt.Printf("Error reading the Header file information: %s\n\n", err)
+		}
+		data := struct {
+			Version string
+		}{
+			Version: *version,
+		}
+		templ.Execute(os.Stdout, data)
+
+		for _, data := range dataSet {
+			fmt.Printf("## [%s](%s)\n\n", data.TestName, data.URL)
+			fmt.Printf("- Added to conformance in release %s\n", data.Release)
+			fmt.Printf("- Defined in code as: %s\n\n", data.CodeName)
+			fmt.Printf("%s\n\n", data.Description)
+		}
+		return
+	}
+
+	// Serialize the list as a whole. Generally meant to end up as conformance.txt which tracks the set of tests.
+	b, err := yaml.Marshal(dataSet)
+	if err != nil {
+		log.Printf("Error marshalling data into YAML: %v", err)
+	}
+	fmt.Println(string(b))
+}
+
+func getConformanceData(targetFrame frame) (*ConformanceData, error) {
+	root := *k8sPath
+	if !strings.HasSuffix(root, string(os.PathSeparator)) {
+		root += string(os.PathSeparator)
+	}
+
+	trimmedFile := strings.TrimPrefix(targetFrame.File, root)
+	targetFrame.File = trimmedFile
+
+	freader, err := os.Open(targetFrame.File)
+	if err != nil {
+		return nil, err
+	}
+	defer freader.Close()
+
+	cd, err := scanFileForFrame(targetFrame.File, freader, targetFrame)
+	if err != nil {
+		return nil, err
+	}
+	if cd != nil {
+		return cd, nil
+	}
+
+	return nil, nil
+}
+
+// scanFileForFrame will scan the target and look for a conformance comment attached to the function
+// described by the target frame. If the comment can't be found then nil, nil is returned.
+func scanFileForFrame(filename string, src interface{}, targetFrame frame) (*ConformanceData, error) {
+	fset := token.NewFileSet() // positions are relative to fset
+	f, err := parser.ParseFile(fset, filename, src, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	cmap := ast.NewCommentMap(fset, f, f.Comments)
+	for _, cs := range cmap {
+		for _, c := range cs {
+			if cd := tryCommentGroupAndFrame(fset, c, targetFrame); cd != nil {
+				return cd, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func validateTestName(s string) error {
+	matches := regexIneligibleTags.FindAllString(s, -1)
+	if matches != nil {
+		return fmt.Errorf("'%s' cannot have invalid tags %v", s, strings.Join(matches, ","))
+	}
+	return nil
+}
+
+func tryCommentGroupAndFrame(fset *token.FileSet, cg *ast.CommentGroup, f frame) *ConformanceData {
+	if !shouldProcessCommentGroup(fset, cg, f) {
+		return nil
+	}
+
+	// Each file/line will either be some helper function (not a conformance comment) or apply to just a single test. Don't revisit.
+	if seenLines != nil {
+		seenLines[fmt.Sprintf("%v:%v", f.File, f.Line)] = struct{}{}
+	}
+	cd := commentToConformanceData(cg.Text())
+	if cd == nil {
+		return nil
+	}
+
+	cd.URL = fmt.Sprintf("%s%s#L%d", *baseURL, f.File, f.Line)
+	cd.File = f.File
+	return cd
+}
+
+func shouldProcessCommentGroup(fset *token.FileSet, cg *ast.CommentGroup, f frame) bool {
+	lineDiff := f.Line - fset.Position(cg.End()).Line
+	return lineDiff > 0 && lineDiff <= conformanceCommentsLineWindow
+}
+
+func commentToConformanceData(comment string) *ConformanceData {
+	lines := strings.Split(comment, "\n")
+	descLines := []string{}
+	cd := &ConformanceData{}
+	var curLine string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if sline := regexp.MustCompile("^Testname\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Testname"
+			cd.TestName = sline[1]
+			continue
+		}
+		if sline := regexp.MustCompile("^Release\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Release"
+			cd.Release = sline[1]
+			continue
+		}
+		if sline := regexp.MustCompile("^Description\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Description"
+			descLines = append(descLines, sline[1])
+			continue
+		}
+
+		// Line has no header
+		if curLine == "Description" {
+			descLines = append(descLines, line)
+		}
+	}
+	if cd.TestName == "" {
+		return nil
+	}
+
+	cd.Description = strings.Join(descLines, " ")
+	return cd
 }

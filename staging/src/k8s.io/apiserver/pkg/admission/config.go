@@ -20,20 +20,18 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 
-	"github.com/ghodss/yaml"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/yaml"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/apis/apiserver"
-	apiserverv1alpha1 "k8s.io/apiserver/pkg/apis/apiserver/v1alpha1"
+	apiserverv1 "k8s.io/apiserver/pkg/apis/apiserver/v1"
 )
 
 func makeAbs(path, base string) (string, error) {
@@ -61,11 +59,11 @@ func ReadAdmissionConfiguration(pluginNames []string, configFilePath string, con
 		return configProvider{config: &apiserver.AdmissionConfiguration{}}, nil
 	}
 	// a file was provided, so we just read it.
-	data, err := ioutil.ReadFile(configFilePath)
+	data, err := os.ReadFile(configFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read admission control configuration from %q [%v]", configFilePath, err)
 	}
-	codecs := serializer.NewCodecFactory(configScheme)
+	codecs := serializer.NewCodecFactory(configScheme, serializer.EnableStrict)
 	decoder := codecs.UniversalDecoder()
 	decodedObj, err := runtime.Decode(decoder, data)
 	// we were able to decode the file successfully
@@ -88,23 +86,34 @@ func ReadAdmissionConfiguration(pluginNames []string, configFilePath string, con
 		}
 		return configProvider{
 			config: decodedConfig,
-			scheme: configScheme,
 		}, nil
 	}
 	// we got an error where the decode wasn't related to a missing type
 	if !(runtime.IsMissingVersion(err) || runtime.IsMissingKind(err) || runtime.IsNotRegisteredError(err)) {
 		return nil, err
 	}
+
+	// Only tolerate load errors if the file appears to be one of the two legacy plugin configs
+	unstructuredData := map[string]interface{}{}
+	if err2 := yaml.Unmarshal(data, &unstructuredData); err2 != nil {
+		return nil, err
+	}
+	_, isLegacyImagePolicy := unstructuredData["imagePolicy"]
+	_, isLegacyPodNodeSelector := unstructuredData["podNodeSelectorPluginConfig"]
+	if !isLegacyImagePolicy && !isLegacyPodNodeSelector {
+		return nil, err
+	}
+
 	// convert the legacy format to the new admission control format
 	// in order to preserve backwards compatibility, we set plugins that
 	// previously read input from a non-versioned file configuration to the
 	// current input file.
-	legacyPluginsWithUnversionedConfig := sets.NewString("ImagePolicyWebhook", "PodNodeSelector")
-	externalConfig := &apiserverv1alpha1.AdmissionConfiguration{}
+	legacyPluginsWithUnversionedConfig := sets.New[string]("ImagePolicyWebhook", "PodNodeSelector")
+	externalConfig := &apiserverv1.AdmissionConfiguration{}
 	for _, pluginName := range pluginNames {
 		if legacyPluginsWithUnversionedConfig.Has(pluginName) {
 			externalConfig.Plugins = append(externalConfig.Plugins,
-				apiserverv1alpha1.AdmissionPluginConfiguration{
+				apiserverv1.AdmissionPluginConfiguration{
 					Name: pluginName,
 					Path: configFilePath})
 		}
@@ -116,32 +125,24 @@ func ReadAdmissionConfiguration(pluginNames []string, configFilePath string, con
 	}
 	return configProvider{
 		config: internalConfig,
-		scheme: configScheme,
 	}, nil
 }
 
 type configProvider struct {
 	config *apiserver.AdmissionConfiguration
-	scheme *runtime.Scheme
 }
 
 // GetAdmissionPluginConfigurationFor returns a reader that holds the admission plugin configuration.
-func GetAdmissionPluginConfigurationFor(pluginCfg apiserver.AdmissionPluginConfiguration, scheme *runtime.Scheme) (io.Reader, error) {
-	// if there is nothing nested in the object, we return the named location
-	obj := pluginCfg.Configuration
-	if obj != nil {
-		// serialize the configuration and build a reader for it
-		content, err := writeYAML(obj, scheme)
-		if err != nil {
-			return nil, err
-		}
-		return bytes.NewBuffer(content), nil
+func GetAdmissionPluginConfigurationFor(pluginCfg apiserver.AdmissionPluginConfiguration) (io.Reader, error) {
+	// if there is a nest object, return it directly
+	if pluginCfg.Configuration != nil {
+		return bytes.NewBuffer(pluginCfg.Configuration.Raw), nil
 	}
 	// there is nothing nested, so we delegate to path
 	if pluginCfg.Path != "" {
-		content, err := ioutil.ReadFile(pluginCfg.Path)
+		content, err := os.ReadFile(pluginCfg.Path)
 		if err != nil {
-			glog.Fatalf("Couldn't open admission plugin configuration %s: %#v", pluginCfg.Path, err)
+			klog.Fatalf("Couldn't open admission plugin configuration %s: %#v", pluginCfg.Path, err)
 			return nil, err
 		}
 		return bytes.NewBuffer(content), nil
@@ -162,7 +163,7 @@ func (p configProvider) ConfigFor(pluginName string) (io.Reader, error) {
 		if pluginName != pluginCfg.Name {
 			continue
 		}
-		pluginConfig, err := GetAdmissionPluginConfigurationFor(pluginCfg, p.scheme)
+		pluginConfig, err := GetAdmissionPluginConfigurationFor(pluginCfg)
 		if err != nil {
 			return nil, err
 		}
@@ -170,27 +171,4 @@ func (p configProvider) ConfigFor(pluginName string) (io.Reader, error) {
 	}
 	// there is no registered config that matches on plugin name.
 	return nil, nil
-}
-
-// writeYAML writes the specified object to a byte array as yaml.
-func writeYAML(obj runtime.Object, scheme *runtime.Scheme) ([]byte, error) {
-	gvks, _, err := scheme.ObjectKinds(obj)
-	if err != nil {
-		return nil, err
-	}
-	gvs := []schema.GroupVersion{}
-	for _, gvk := range gvks {
-		gvs = append(gvs, gvk.GroupVersion())
-	}
-	codecs := serializer.NewCodecFactory(scheme)
-	json, err := runtime.Encode(codecs.LegacyCodec(gvs...), obj)
-	if err != nil {
-		return nil, err
-	}
-
-	content, err := yaml.JSONToYAML(json)
-	if err != nil {
-		return nil, err
-	}
-	return content, err
 }

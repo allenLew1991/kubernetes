@@ -17,16 +17,17 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
-
-	"github.com/golang/glog"
+	"runtime/debug"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/server/healthz"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 )
 
 // PostStartHookFunc is a function that is called after the server has started.
@@ -35,6 +36,7 @@ import (
 //  2. conflicts between the different processes all trying to perform the same action
 //  3. partially complete work (API server crashes while running your hook)
 //  4. API server access **BEFORE** your hook has completed
+//
 // Think of it like a mini-controller that is super privileged and gets to run in-process
 // If you use this feature, tag @deads2k on github who has promised to review code for anyone's PostStartHook
 // until it becomes easier to use.
@@ -47,8 +49,8 @@ type PreShutdownHookFunc func() error
 type PostStartHookContext struct {
 	// LoopbackClientConfig is a config for a privileged loopback connection to the API server
 	LoopbackClientConfig *restclient.Config
-	// StopCh is the channel that will be closed when the server stops
-	StopCh <-chan struct{}
+	// Context gets cancelled when the server stops.
+	context.Context
 }
 
 // PostStartHookProvider is an interface in addition to provide a post start hook for the api server
@@ -58,9 +60,19 @@ type PostStartHookProvider interface {
 
 type postStartHookEntry struct {
 	hook PostStartHookFunc
+	// originatingStack holds the stack that registered postStartHooks. This allows us to show a more helpful message
+	// for duplicate registration.
+	originatingStack string
 
 	// done will be closed when the postHook is finished
 	done chan struct{}
+}
+
+type PostStartHookConfigEntry struct {
+	hook PostStartHookFunc
+	// originatingStack holds the stack that registered postStartHooks. This allows us to show a more helpful message
+	// for duplicate registration.
+	originatingStack string
 }
 
 type preShutdownHookEntry struct {
@@ -73,9 +85,10 @@ func (s *GenericAPIServer) AddPostStartHook(name string, hook PostStartHookFunc)
 		return fmt.Errorf("missing name")
 	}
 	if hook == nil {
-		return nil
+		return fmt.Errorf("hook func may not be nil: %q", name)
 	}
 	if s.disabledPostStartHooks.Has(name) {
+		klog.V(1).Infof("skipping %q because it was explicitly disabled", name)
 		return nil
 	}
 
@@ -85,15 +98,18 @@ func (s *GenericAPIServer) AddPostStartHook(name string, hook PostStartHookFunc)
 	if s.postStartHooksCalled {
 		return fmt.Errorf("unable to add %q because PostStartHooks have already been called", name)
 	}
-	if _, exists := s.postStartHooks[name]; exists {
-		return fmt.Errorf("unable to add %q because it is already registered", name)
+	if postStartHook, exists := s.postStartHooks[name]; exists {
+		// this is programmer error, but it can be hard to debug
+		return fmt.Errorf("unable to add %q because it was already registered by: %s", name, postStartHook.originatingStack)
 	}
 
 	// done is closed when the poststarthook is finished.  This is used by the health check to be able to indicate
 	// that the poststarthook is finished
 	done := make(chan struct{})
-	s.AddHealthzChecks(postStartHookHealthz{name: "poststarthook/" + name, done: done})
-	s.postStartHooks[name] = postStartHookEntry{hook: hook, done: done}
+	if err := s.AddBootSequenceHealthChecks(postStartHookHealthz{name: "poststarthook/" + name, done: done}); err != nil {
+		return err
+	}
+	s.postStartHooks[name] = postStartHookEntry{hook: hook, originatingStack: string(debug.Stack()), done: done}
 
 	return nil
 }
@@ -101,7 +117,7 @@ func (s *GenericAPIServer) AddPostStartHook(name string, hook PostStartHookFunc)
 // AddPostStartHookOrDie allows you to add a PostStartHook, but dies on failure
 func (s *GenericAPIServer) AddPostStartHookOrDie(name string, hook PostStartHookFunc) {
 	if err := s.AddPostStartHook(name, hook); err != nil {
-		glog.Fatalf("Error registering PostStartHook %q: %v", name, err)
+		klog.Fatalf("Error registering PostStartHook %q: %v", name, err)
 	}
 }
 
@@ -132,19 +148,19 @@ func (s *GenericAPIServer) AddPreShutdownHook(name string, hook PreShutdownHookF
 // AddPreShutdownHookOrDie allows you to add a PostStartHook, but dies on failure
 func (s *GenericAPIServer) AddPreShutdownHookOrDie(name string, hook PreShutdownHookFunc) {
 	if err := s.AddPreShutdownHook(name, hook); err != nil {
-		glog.Fatalf("Error registering PreShutdownHook %q: %v", name, err)
+		klog.Fatalf("Error registering PreShutdownHook %q: %v", name, err)
 	}
 }
 
-// RunPostStartHooks runs the PostStartHooks for the server
-func (s *GenericAPIServer) RunPostStartHooks(stopCh <-chan struct{}) {
+// RunPostStartHooks runs the PostStartHooks for the server.
+func (s *GenericAPIServer) RunPostStartHooks(ctx context.Context) {
 	s.postStartHookLock.Lock()
 	defer s.postStartHookLock.Unlock()
 	s.postStartHooksCalled = true
 
 	context := PostStartHookContext{
 		LoopbackClientConfig: s.LoopbackClientConfig,
-		StopCh:               stopCh,
+		Context:              ctx,
 	}
 
 	for hookName, hookEntry := range s.postStartHooks {
@@ -179,13 +195,12 @@ func (s *GenericAPIServer) isPostStartHookRegistered(name string) bool {
 func runPostStartHook(name string, entry postStartHookEntry, context PostStartHookContext) {
 	var err error
 	func() {
-		// don't let the hook *accidentally* panic and kill the server
-		defer utilruntime.HandleCrash()
+		defer utilruntime.HandleCrashWithContext(context)
 		err = entry.hook(context)
 	}()
 	// if the hook intentionally wants to kill server, let it.
 	if err != nil {
-		glog.Fatalf("PostStartHook %q failed: %v", name, err)
+		klog.Fatalf("PostStartHook %q failed: %v", name, err)
 	}
 	close(entry.done)
 }
@@ -212,19 +227,19 @@ type postStartHookHealthz struct {
 	done chan struct{}
 }
 
-var _ healthz.HealthzChecker = postStartHookHealthz{}
+var _ healthz.HealthChecker = postStartHookHealthz{}
 
 func (h postStartHookHealthz) Name() string {
 	return h.name
 }
 
-var hookNotFinished = errors.New("not finished")
+var errHookNotFinished = errors.New("not finished")
 
 func (h postStartHookHealthz) Check(req *http.Request) error {
 	select {
 	case <-h.done:
 		return nil
 	default:
-		return hookNotFinished
+		return errHookNotFinished
 	}
 }

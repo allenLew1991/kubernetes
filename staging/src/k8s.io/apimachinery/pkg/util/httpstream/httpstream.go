@@ -17,6 +17,7 @@ limitations under the License.
 package httpstream
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -78,6 +79,8 @@ type Connection interface {
 	// SetIdleTimeout sets the amount of time the connection may remain idle before
 	// it is automatically closed.
 	SetIdleTimeout(timeout time.Duration)
+	// RemoveStreams can be used to remove a set of streams from the Connection.
+	RemoveStreams(streams ...Stream)
 }
 
 // Stream represents a bidirectional communications channel that is part of an
@@ -91,6 +94,35 @@ type Stream interface {
 	Headers() http.Header
 	// Identifier returns the stream's ID.
 	Identifier() uint32
+}
+
+// UpgradeFailureError encapsulates the cause for why the streaming
+// upgrade request failed. Implements error interface.
+type UpgradeFailureError struct {
+	Cause error
+}
+
+func (u *UpgradeFailureError) Error() string {
+	return fmt.Sprintf("unable to upgrade streaming request: %s", u.Cause)
+}
+
+// IsUpgradeFailure returns true if the passed error is (or wrapped error contains)
+// the UpgradeFailureError.
+func IsUpgradeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upgradeErr *UpgradeFailureError
+	return errors.As(err, &upgradeErr)
+}
+
+// isHTTPSProxyError returns true if error is Gorilla/Websockets HTTPS Proxy dial error;
+// false otherwise (see https://github.com/kubernetes/kubernetes/issues/126134).
+func IsHTTPSProxyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "proxy: unknown scheme: https")
 }
 
 // IsUpgradeRequest returns true if the given request is a connection upgrade request
@@ -114,34 +146,54 @@ func negotiateProtocol(clientProtocols, serverProtocols []string) string {
 	return ""
 }
 
+func commaSeparatedHeaderValues(header []string) []string {
+	var parsedClientProtocols []string
+	for i := range header {
+		for _, clientProtocol := range strings.Split(header[i], ",") {
+			if proto := strings.Trim(clientProtocol, " "); len(proto) > 0 {
+				parsedClientProtocols = append(parsedClientProtocols, proto)
+			}
+		}
+	}
+	return parsedClientProtocols
+}
+
 // Handshake performs a subprotocol negotiation. If the client did request a
 // subprotocol, Handshake will select the first common value found in
-// serverProtocols. If a match is found, Handshake adds a response header
-// indicating the chosen subprotocol. If no match is found, HTTP forbidden is
-// returned, along with a response header containing the list of protocols the
-// server can accept.
+// serverProtocols, otherwise it will return an error and write an HTTP BadRequest to the response.
+// If a match is found, Handshake adds a response header indicating the chosen subprotocol.
+// If no match is found, HTTP forbidden is returned, along with a response header containing
+// the list of protocols the server can accept.
 func Handshake(req *http.Request, w http.ResponseWriter, serverProtocols []string) (string, error) {
-	clientProtocols := req.Header[http.CanonicalHeaderKey(HeaderProtocolVersion)]
-	if len(clientProtocols) == 0 {
-		// Kube 1.0 clients didn't support subprotocol negotiation.
-		// TODO require clientProtocols once Kube 1.0 is no longer supported
-		return "", nil
-	}
-
 	if len(serverProtocols) == 0 {
-		// Kube 1.0 servers didn't support subprotocol negotiation. This is mainly for testing.
-		// TODO require serverProtocols once Kube 1.0 is no longer supported
-		return "", nil
+		panic(fmt.Errorf("unable to upgrade: serverProtocols is required"))
+	}
+	values, ok := req.Header[http.CanonicalHeaderKey(HeaderProtocolVersion)]
+	if !ok {
+		err := fmt.Errorf("unable to upgrade: header %s does not exist in request with %d headers", HeaderProtocolVersion, len(req.Header))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return "", err
+	}
+	if len(values) == 0 {
+		err := fmt.Errorf("unable to upgrade: header %s is empty", HeaderProtocolVersion)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return "", err
+	}
+	clientProtocols := commaSeparatedHeaderValues(values)
+	if len(clientProtocols) == 0 {
+		err := fmt.Errorf("unable to upgrade: header %s contains %s, but no valid protocols", HeaderProtocolVersion, values)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return "", err
 	}
 
 	negotiatedProtocol := negotiateProtocol(clientProtocols, serverProtocols)
 	if len(negotiatedProtocol) == 0 {
-		w.WriteHeader(http.StatusForbidden)
 		for i := range serverProtocols {
 			w.Header().Add(HeaderAcceptedProtocolVersions, serverProtocols[i])
 		}
-		fmt.Fprintf(w, "unable to upgrade: unable to negotiate protocol: client supports %v, server accepts %v", clientProtocols, serverProtocols)
-		return "", fmt.Errorf("unable to upgrade: unable to negotiate protocol: client supports %v, server supports %v", clientProtocols, serverProtocols)
+		err := fmt.Errorf("unable to upgrade: unable to negotiate protocol: client supports %v, server accepts %v", clientProtocols, serverProtocols)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return "", err
 	}
 
 	w.Header().Add(HeaderProtocolVersion, negotiatedProtocol)

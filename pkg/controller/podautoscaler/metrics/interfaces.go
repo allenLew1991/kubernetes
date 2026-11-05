@@ -17,29 +17,42 @@ limitations under the License.
 package metrics
 
 import (
+	"context"
 	"time"
 
-	autoscaling "k8s.io/api/autoscaling/v2beta1"
-	"k8s.io/api/core/v1"
+	autoscaling "k8s.io/api/autoscaling/v2"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
-// PodMetricsInfo contains pod metric values as a map from pod names to
-// metric values (the metric values are expected to be the metric as a milli-value)
-type PodMetricsInfo map[string]int64
+// PodMetric contains pod metric value (the metric values are expected to be the metric as a milli-value)
+type PodMetric struct {
+	Timestamp time.Time
+	Window    time.Duration
+	Value     int64
+}
+
+// PodMetricsInfo contains pod metrics as a map from pod names to PodMetricsInfo
+type PodMetricsInfo map[string]PodMetric
 
 // MetricsClient knows how to query a remote interface to retrieve container-level
 // resource metrics as well as pod-level arbitrary metrics
 type MetricsClient interface {
 	// GetResourceMetric gets the given resource metric (and an associated oldest timestamp)
-	// for all pods matching the specified selector in the given namespace
-	GetResourceMetric(resource v1.ResourceName, namespace string, selector labels.Selector) (PodMetricsInfo, time.Time, error)
+	// for the specified named container in all pods matching the specified selector in the given namespace and when
+	// the container is an empty string it returns the sum of all the container metrics.
+	// Missing metrics will not error and callers should rely on Pod status to filter metrics info returned from this interface.
+	GetResourceMetric(ctx context.Context, resource v1.ResourceName, namespace string, selector labels.Selector, container string) (PodMetricsInfo, time.Time, error)
 
 	// GetRawMetric gets the given metric (and an associated oldest timestamp)
 	// for all pods matching the specified selector in the given namespace
-	GetRawMetric(metricName string, namespace string, selector labels.Selector) (PodMetricsInfo, time.Time, error)
+	GetRawMetric(metricName string, namespace string, selector labels.Selector, metricSelector labels.Selector) (PodMetricsInfo, time.Time, error)
 
 	// GetObjectMetric gets the given metric (and an associated timestamp) for the given
 	// object in the given namespace
-	GetObjectMetric(metricName string, namespace string, objectRef *autoscaling.CrossVersionObjectReference) (int64, time.Time, error)
+	GetObjectMetric(metricName string, namespace string, objectRef *autoscaling.CrossVersionObjectReference, metricSelector labels.Selector) (int64, time.Time, error)
+
+	// GetExternalMetric gets all the values of a given external metric
+	// that match the specified selector.
+	GetExternalMetric(metricName string, namespace string, selector labels.Selector) ([]int64, time.Time, error)
 }

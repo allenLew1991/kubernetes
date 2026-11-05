@@ -17,16 +17,28 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
 	"os"
 
-	"k8s.io/kubernetes/cmd/kubectl/app"
+	"k8s.io/component-base/cli"
+	"k8s.io/component-base/logs"
+	"k8s.io/kubectl/pkg/cmd"
+	"k8s.io/kubectl/pkg/cmd/util"
+
+	// Import to initialize client auth plugins.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
 func main() {
-	if err := app.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	// We need to manually parse the arguments looking for verbosity flag and
+	// set appropriate level here, because in the normal flow the flag parsing,
+	// including the logging verbosity, happens inside cli.RunNoErrOutput.
+	// Doing it here ensures we can continue using klog during kubectl command
+	// construction, which includes handling plugins and parsing .kuberc file,
+	// for example.
+	logs.GlogSetter(cmd.GetLogVerbosity(os.Args)) // nolint:errcheck
+	command := cmd.NewDefaultKubectlCommand()
+	if err := cli.RunNoErrOutput(command); err != nil {
+		// Pretty-print the error and exit with an error.
+		util.CheckErr(err)
 	}
-	os.Exit(0)
 }

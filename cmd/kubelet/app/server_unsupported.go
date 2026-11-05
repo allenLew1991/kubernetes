@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -18,8 +18,15 @@ limitations under the License.
 
 package app
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
-func watchForLockfileContention(path string, done chan struct{}) error {
+func watchForLockfileContention(ctx context.Context, path string, done chan struct{}) error {
 	return errors.New("kubelet unsupported in this build")
+}
+
+func isCgroup2UnifiedMode() bool {
+	return false
 }

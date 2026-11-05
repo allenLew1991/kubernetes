@@ -23,25 +23,30 @@ package portallocator
 // On rollback we best-effort release any allocations we did.
 //
 // Pattern for use:
-//   op := StartPortAllocationOperation(...)
-//   defer op.Finish
-//   ...
-//   write(updatedOwner)
-///  op.Commit()
+//
+//	op := StartPortAllocationOperation(...)
+//	defer op.Finish
+//	...
+//	write(updatedOwner)
+//
+// /  op.Commit()
 type PortAllocationOperation struct {
 	pa              Interface
 	allocated       []int
 	releaseDeferred []int
 	shouldRollback  bool
+	dryRun          bool
 }
 
 // Creates a portAllocationOperation, tracking a set of allocations & releases
-func StartOperation(pa Interface) *PortAllocationOperation {
+// If dryRun is specified, never actually allocate or release anything
+func StartOperation(pa Interface, dryRun bool) *PortAllocationOperation {
 	op := &PortAllocationOperation{}
 	op.pa = pa
 	op.allocated = []int{}
 	op.releaseDeferred = []int{}
 	op.shouldRollback = true
+	op.dryRun = dryRun
 	return op
 }
 
@@ -54,6 +59,10 @@ func (op *PortAllocationOperation) Finish() {
 
 // (Try to) undo any operations we did
 func (op *PortAllocationOperation) Rollback() []error {
+	if op.dryRun {
+		return nil
+	}
+
 	errors := []error{}
 
 	for _, allocated := range op.allocated {
@@ -73,6 +82,10 @@ func (op *PortAllocationOperation) Rollback() []error {
 // Note that even if this fails, we don't rollback; we always want to err on the side of over-allocation,
 // and Commit should be called _after_ the owner is written
 func (op *PortAllocationOperation) Commit() []error {
+	if op.dryRun {
+		return nil
+	}
+
 	errors := []error{}
 
 	for _, release := range op.releaseDeferred {
@@ -95,6 +108,19 @@ func (op *PortAllocationOperation) Commit() []error {
 
 // Allocates a port, and record it for future rollback
 func (op *PortAllocationOperation) Allocate(port int) error {
+	if op.dryRun {
+		if op.pa.Has(port) {
+			return ErrAllocated
+		}
+		for _, a := range op.allocated {
+			if port == a {
+				return ErrAllocated
+			}
+		}
+		op.allocated = append(op.allocated, port)
+		return nil
+	}
+
 	err := op.pa.Allocate(port)
 	if err == nil {
 		op.allocated = append(op.allocated, port)
@@ -104,6 +130,33 @@ func (op *PortAllocationOperation) Allocate(port int) error {
 
 // Allocates a port, and record it for future rollback
 func (op *PortAllocationOperation) AllocateNext() (int, error) {
+	if op.dryRun {
+		// Find the max element of the allocated ports array.
+		// If no ports are already being allocated by this operation,
+		// then choose a sensible guess for a dummy port number
+		var lastPort int
+		for _, allocatedPort := range op.allocated {
+			if allocatedPort > lastPort {
+				lastPort = allocatedPort
+			}
+		}
+		if len(op.allocated) == 0 {
+			lastPort = 32768
+		}
+
+		// Try to find the next non allocated port.
+		// If too many ports are full, just reuse one,
+		// since this is just a dummy value.
+		for port := lastPort + 1; port < 100; port++ {
+			err := op.Allocate(port)
+			if err == nil {
+				return port, nil
+			}
+		}
+		op.allocated = append(op.allocated, lastPort+1)
+		return lastPort + 1, nil
+	}
+
 	port, err := op.pa.AllocateNext()
 	if err == nil {
 		op.allocated = append(op.allocated, port)

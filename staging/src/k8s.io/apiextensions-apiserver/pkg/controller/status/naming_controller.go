@@ -17,14 +17,17 @@ limitations under the License.
 package status
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -33,10 +36,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	client "k8s.io/apiextensions-apiserver/pkg/client/clientset/internalclientset/typed/apiextensions/internalversion"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	client "k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
+	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
 )
 
 // This controller is reserving names. To avoid conflicts, be sure to run only one instance of the worker at a time.
@@ -52,12 +56,13 @@ type NamingConditionController struct {
 	crdMutationCache cache.MutationCache
 
 	// To allow injection for testing.
-	syncFn func(key string) error
+	syncFn func(ctx context.Context, key string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 func NewNamingConditionController(
+	logger klog.Logger,
 	crdInformer informers.CustomResourceDefinitionInformer,
 	crdClient client.CustomResourceDefinitionsGetter,
 ) *NamingConditionController {
@@ -65,17 +70,24 @@ func NewNamingConditionController(
 		crdClient: crdClient,
 		crdLister: crdInformer.Lister(),
 		crdSynced: crdInformer.Informer().HasSynced,
-		queue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "CustomResourceDefinition-NamingConditionController"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "crd_naming_condition_controller"},
+		),
 	}
 
 	informerIndexer := crdInformer.Informer().GetIndexer()
-	c.crdMutationCache = cache.NewIntegerResourceVersionMutationCache(informerIndexer, informerIndexer, 60*time.Second, false)
+	c.crdMutationCache = cache.NewIntegerResourceVersionMutationCache(logger, informerIndexer, informerIndexer, 60*time.Second, false)
 
-	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	crdInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addCustomResourceDefinition,
 		UpdateFunc: c.updateCustomResourceDefinition,
 		DeleteFunc: c.deleteCustomResourceDefinition,
-	})
+	},
+		cache.HandlerOptions{
+			Logger: &logger,
+		},
+	)
 
 	c.syncFn = c.sync
 
@@ -102,7 +114,7 @@ func (c *NamingConditionController) getAcceptedNamesForGroup(group string) (allR
 		item := curr
 		obj, exists, err := c.crdMutationCache.GetByKey(curr.Name)
 		if exists && err == nil {
-			item = obj.(*apiextensions.CustomResourceDefinition)
+			item = obj.(*apiextensionsv1.CustomResourceDefinition)
 		}
 
 		allResources.Insert(item.Status.AcceptedNames.Plural)
@@ -116,13 +128,13 @@ func (c *NamingConditionController) getAcceptedNamesForGroup(group string) (allR
 	return allResources, allKinds
 }
 
-func (c *NamingConditionController) calculateNamesAndConditions(in *apiextensions.CustomResourceDefinition) (apiextensions.CustomResourceDefinitionNames, apiextensions.CustomResourceDefinitionCondition, apiextensions.CustomResourceDefinitionCondition) {
+func (c *NamingConditionController) calculateNamesAndConditions(in *apiextensionsv1.CustomResourceDefinition) (apiextensionsv1.CustomResourceDefinitionNames, apiextensionsv1.CustomResourceDefinitionCondition, apiextensionsv1.CustomResourceDefinitionCondition) {
 	// Get the names that have already been claimed
 	allResources, allKinds := c.getAcceptedNamesForGroup(in.Spec.Group)
 
-	namesAcceptedCondition := apiextensions.CustomResourceDefinitionCondition{
-		Type:   apiextensions.NamesAccepted,
-		Status: apiextensions.ConditionUnknown,
+	namesAcceptedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:   apiextensionsv1.NamesAccepted,
+		Status: apiextensionsv1.ConditionUnknown,
 	}
 
 	requestedNames := in.Spec.Names
@@ -132,14 +144,14 @@ func (c *NamingConditionController) calculateNamesAndConditions(in *apiextension
 	// Check each name for mismatches.  If there's a mismatch between spec and status, then try to deconflict.
 	// Continue on errors so that the status is the best match possible
 	if err := equalToAcceptedOrFresh(requestedNames.Plural, acceptedNames.Plural, allResources); err != nil {
-		namesAcceptedCondition.Status = apiextensions.ConditionFalse
+		namesAcceptedCondition.Status = apiextensionsv1.ConditionFalse
 		namesAcceptedCondition.Reason = "PluralConflict"
 		namesAcceptedCondition.Message = err.Error()
 	} else {
 		newNames.Plural = requestedNames.Plural
 	}
 	if err := equalToAcceptedOrFresh(requestedNames.Singular, acceptedNames.Singular, allResources); err != nil {
-		namesAcceptedCondition.Status = apiextensions.ConditionFalse
+		namesAcceptedCondition.Status = apiextensionsv1.ConditionFalse
 		namesAcceptedCondition.Reason = "SingularConflict"
 		namesAcceptedCondition.Message = err.Error()
 	} else {
@@ -159,7 +171,7 @@ func (c *NamingConditionController) calculateNamesAndConditions(in *apiextension
 
 		}
 		if err := utilerrors.NewAggregate(errs); err != nil {
-			namesAcceptedCondition.Status = apiextensions.ConditionFalse
+			namesAcceptedCondition.Status = apiextensionsv1.ConditionFalse
 			namesAcceptedCondition.Reason = "ShortNamesConflict"
 			namesAcceptedCondition.Message = err.Error()
 		} else {
@@ -168,42 +180,47 @@ func (c *NamingConditionController) calculateNamesAndConditions(in *apiextension
 	}
 
 	if err := equalToAcceptedOrFresh(requestedNames.Kind, acceptedNames.Kind, allKinds); err != nil {
-		namesAcceptedCondition.Status = apiextensions.ConditionFalse
+		namesAcceptedCondition.Status = apiextensionsv1.ConditionFalse
 		namesAcceptedCondition.Reason = "KindConflict"
 		namesAcceptedCondition.Message = err.Error()
 	} else {
 		newNames.Kind = requestedNames.Kind
 	}
 	if err := equalToAcceptedOrFresh(requestedNames.ListKind, acceptedNames.ListKind, allKinds); err != nil {
-		namesAcceptedCondition.Status = apiextensions.ConditionFalse
+		namesAcceptedCondition.Status = apiextensionsv1.ConditionFalse
 		namesAcceptedCondition.Reason = "ListKindConflict"
 		namesAcceptedCondition.Message = err.Error()
 	} else {
 		newNames.ListKind = requestedNames.ListKind
 	}
 
+	newNames.Categories = requestedNames.Categories
+
 	// if we haven't changed the condition, then our names must be good.
-	if namesAcceptedCondition.Status == apiextensions.ConditionUnknown {
-		namesAcceptedCondition.Status = apiextensions.ConditionTrue
+	if namesAcceptedCondition.Status == apiextensionsv1.ConditionUnknown {
+		namesAcceptedCondition.Status = apiextensionsv1.ConditionTrue
 		namesAcceptedCondition.Reason = "NoConflicts"
 		namesAcceptedCondition.Message = "no conflicts found"
 	}
 
-	// set EstablishedCondition to true if all names are accepted. Never set it back to false.
-	establishedCondition := apiextensions.CustomResourceDefinitionCondition{
-		Type:    apiextensions.Established,
-		Status:  apiextensions.ConditionFalse,
+	// set EstablishedCondition initially to false, then set it to true in establishing controller.
+	// The Establishing Controller will see the NamesAccepted condition when it arrives through the shared informer.
+	// At that time the API endpoint handler will serve the endpoint, avoiding a race
+	// which we had if we set Established to true here.
+	establishedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:    apiextensionsv1.Established,
+		Status:  apiextensionsv1.ConditionFalse,
 		Reason:  "NotAccepted",
 		Message: "not all names are accepted",
 	}
-	if old := apiextensions.FindCRDCondition(in, apiextensions.Established); old != nil {
+	if old := apiextensionshelpers.FindCRDCondition(in, apiextensionsv1.Established); old != nil {
 		establishedCondition = *old
 	}
-	if establishedCondition.Status != apiextensions.ConditionTrue && namesAcceptedCondition.Status == apiextensions.ConditionTrue {
-		establishedCondition = apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.Established,
-			Status:  apiextensions.ConditionTrue,
-			Reason:  "InitialNamesAccepted",
+	if establishedCondition.Status != apiextensionsv1.ConditionTrue && namesAcceptedCondition.Status == apiextensionsv1.ConditionTrue {
+		establishedCondition = apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.Established,
+			Status:  apiextensionsv1.ConditionFalse,
+			Reason:  "Installing",
 			Message: "the initial names have been accepted",
 		}
 	}
@@ -222,7 +239,7 @@ func equalToAcceptedOrFresh(requestedName, acceptedName string, usedNames sets.S
 	return fmt.Errorf("%q is already in use", requestedName)
 }
 
-func (c *NamingConditionController) sync(key string) error {
+func (c *NamingConditionController) sync(ctx context.Context, key string) error {
 	inCustomResourceDefinition, err := c.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		// CRD was deleted and has freed its names.
@@ -236,21 +253,29 @@ func (c *NamingConditionController) sync(key string) error {
 		return err
 	}
 
+	// Skip checking names if Spec and Status names are same.
+	if equality.Semantic.DeepEqual(inCustomResourceDefinition.Spec.Names, inCustomResourceDefinition.Status.AcceptedNames) {
+		return nil
+	}
+
 	acceptedNames, namingCondition, establishedCondition := c.calculateNamesAndConditions(inCustomResourceDefinition)
 
 	// nothing to do if accepted names and NamesAccepted condition didn't change
 	if reflect.DeepEqual(inCustomResourceDefinition.Status.AcceptedNames, acceptedNames) &&
-		apiextensions.IsCRDConditionEquivalent(&namingCondition, apiextensions.FindCRDCondition(inCustomResourceDefinition, apiextensions.NamesAccepted)) &&
-		apiextensions.IsCRDConditionEquivalent(&establishedCondition, apiextensions.FindCRDCondition(inCustomResourceDefinition, apiextensions.Established)) {
+		apiextensionshelpers.IsCRDConditionEquivalent(&namingCondition, apiextensionshelpers.FindCRDCondition(inCustomResourceDefinition, apiextensionsv1.NamesAccepted)) {
 		return nil
 	}
 
 	crd := inCustomResourceDefinition.DeepCopy()
 	crd.Status.AcceptedNames = acceptedNames
-	apiextensions.SetCRDCondition(crd, namingCondition)
-	apiextensions.SetCRDCondition(crd, establishedCondition)
+	apiextensionshelpers.SetCRDCondition(crd, namingCondition)
+	apiextensionshelpers.SetCRDCondition(crd, establishedCondition)
 
-	updatedObj, err := c.crdClient.CustomResourceDefinitions().UpdateStatus(crd)
+	updatedObj, err := c.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// deleted or changed in the meantime, we'll get called again
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -267,37 +292,43 @@ func (c *NamingConditionController) sync(key string) error {
 	return nil
 }
 
+//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
 func (c *NamingConditionController) Run(stopCh <-chan struct{}) {
+	c.RunWithContext(wait.ContextForChannel(stopCh))
+}
+
+// RunWithContext is a context-aware version of Run.
+func (c *NamingConditionController) RunWithContext(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	glog.Infof("Starting NamingConditionController")
-	defer glog.Infof("Shutting down NamingConditionController")
+	klog.Info("Starting NamingConditionController")
+	defer klog.Info("Shutting down NamingConditionController")
 
-	if !cache.WaitForCacheSync(stopCh, c.crdSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.crdSynced) {
 		return
 	}
 
 	// only start one worker thread since its a slow moving API and the naming conflict resolution bits aren't thread-safe
-	go wait.Until(c.runWorker, time.Second, stopCh)
+	go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (c *NamingConditionController) runWorker() {
-	for c.processNextWorkItem() {
+func (c *NamingConditionController) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
-func (c *NamingConditionController) processNextWorkItem() bool {
+func (c *NamingConditionController) processNextWorkItem(ctx context.Context) bool {
 	key, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(key)
 
-	err := c.syncFn(key.(string))
+	err := c.syncFn(ctx, key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true
@@ -309,10 +340,10 @@ func (c *NamingConditionController) processNextWorkItem() bool {
 	return true
 }
 
-func (c *NamingConditionController) enqueue(obj *apiextensions.CustomResourceDefinition) {
+func (c *NamingConditionController) enqueue(obj *apiextensionsv1.CustomResourceDefinition) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", obj, err))
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", obj, err))
 		return
 	}
 
@@ -320,32 +351,32 @@ func (c *NamingConditionController) enqueue(obj *apiextensions.CustomResourceDef
 }
 
 func (c *NamingConditionController) addCustomResourceDefinition(obj interface{}) {
-	castObj := obj.(*apiextensions.CustomResourceDefinition)
-	glog.V(4).Infof("Adding %s", castObj.Name)
+	castObj := obj.(*apiextensionsv1.CustomResourceDefinition)
+	klog.V(4).Infof("Adding %s", castObj.Name)
 	c.enqueue(castObj)
 }
 
 func (c *NamingConditionController) updateCustomResourceDefinition(obj, _ interface{}) {
-	castObj := obj.(*apiextensions.CustomResourceDefinition)
-	glog.V(4).Infof("Updating %s", castObj.Name)
+	castObj := obj.(*apiextensionsv1.CustomResourceDefinition)
+	klog.V(4).Infof("Updating %s", castObj.Name)
 	c.enqueue(castObj)
 }
 
 func (c *NamingConditionController) deleteCustomResourceDefinition(obj interface{}) {
-	castObj, ok := obj.(*apiextensions.CustomResourceDefinition)
+	castObj, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			glog.Errorf("Couldn't get object from tombstone %#v", obj)
+			klog.Errorf("Couldn't get object from tombstone %#v", obj)
 			return
 		}
-		castObj, ok = tombstone.Obj.(*apiextensions.CustomResourceDefinition)
+		castObj, ok = tombstone.Obj.(*apiextensionsv1.CustomResourceDefinition)
 		if !ok {
-			glog.Errorf("Tombstone contained object that is not expected %#v", obj)
+			klog.Errorf("Tombstone contained object that is not expected %#v", obj)
 			return
 		}
 	}
-	glog.V(4).Infof("Deleting %q", castObj.Name)
+	klog.V(4).Infof("Deleting %q", castObj.Name)
 	c.enqueue(castObj)
 }
 

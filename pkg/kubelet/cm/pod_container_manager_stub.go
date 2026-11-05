@@ -17,8 +17,9 @@ limitations under the License.
 package cm
 
 import (
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
 type podContainerManagerStub struct {
@@ -30,22 +31,46 @@ func (m *podContainerManagerStub) Exists(_ *v1.Pod) bool {
 	return true
 }
 
-func (m *podContainerManagerStub) EnsureExists(_ *v1.Pod) error {
+func (m *podContainerManagerStub) EnsureExists(_ klog.Logger, _ *v1.Pod) error {
 	return nil
 }
 
 func (m *podContainerManagerStub) GetPodContainerName(_ *v1.Pod) (CgroupName, string) {
-	return "", ""
+	return nil, ""
 }
 
-func (m *podContainerManagerStub) Destroy(_ CgroupName) error {
+func (m *podContainerManagerStub) Destroy(_ klog.Logger, _ CgroupName) error {
 	return nil
 }
 
-func (m *podContainerManagerStub) ReduceCPULimits(_ CgroupName) error {
+func (m *podContainerManagerStub) ReduceCPULimits(_ klog.Logger, _ CgroupName) error {
 	return nil
 }
 
-func (m *podContainerManagerStub) GetAllPodsFromCgroups() (map[types.UID]CgroupName, error) {
+func (m *podContainerManagerStub) GetAllPodsFromCgroups(_ klog.Logger) (map[types.UID]CgroupName, error) {
 	return nil, nil
+}
+
+func (m *podContainerManagerStub) IsPodCgroup(_ string) (bool, types.UID) {
+	return false, types.UID("")
+}
+
+func (m *podContainerManagerStub) GetPodCgroupMemoryUsage(_ *v1.Pod) (uint64, error) {
+	return 0, nil
+}
+
+func (m *podContainerManagerStub) GetPodCgroupMemoryLimit(_ *v1.Pod) (uint64, error) {
+	return 0, nil
+}
+
+func (m *podContainerManagerStub) GetPodCgroupCpuLimit(_ *v1.Pod) (int64, uint64, uint64, error) {
+	return 0, 0, 0, nil
+}
+
+func (m *podContainerManagerStub) SetPodCgroupMemoryLimit(_ *v1.Pod, _ int64) error {
+	return nil
+}
+
+func (m *podContainerManagerStub) SetPodCgroupCPULimit(_ klog.Logger, _ *v1.Pod, _ *int64, _, _ *uint64) error {
+	return nil
 }

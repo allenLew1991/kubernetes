@@ -17,12 +17,117 @@ limitations under the License.
 package v1
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/randfill"
 )
+
+func TestParseToLabelSelector(t *testing.T) {
+	tc := []struct {
+		selector  string
+		out       *LabelSelector
+		expectErr bool
+	}{
+		{
+			selector: "",
+			out:      &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{}},
+		},
+		{
+			selector: "foo=bar",
+			out:      &LabelSelector{MatchLabels: map[string]string{"foo": "bar"}, MatchExpressions: []LabelSelectorRequirement{}},
+		},
+		{
+			selector: "foo==bar",
+			out:      &LabelSelector{MatchLabels: map[string]string{"foo": "bar"}, MatchExpressions: []LabelSelectorRequirement{}},
+		},
+		{
+			selector: "foo!=bar",
+			out: &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{
+				{Key: "foo", Operator: LabelSelectorOpNotIn, Values: []string{"bar"}},
+			}},
+		},
+		{
+			selector: "foo in (bar,baz)",
+			out: &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{
+				{Key: "foo", Operator: LabelSelectorOpIn, Values: []string{"bar", "baz"}},
+			}},
+		},
+		{
+			selector: "foo notin (bar)",
+			out: &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{
+				{Key: "foo", Operator: LabelSelectorOpNotIn, Values: []string{"bar"}},
+			}},
+		},
+		{
+			selector: "foo",
+			out: &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{
+				{Key: "foo", Operator: LabelSelectorOpExists, Values: []string{}},
+			}},
+		},
+		{
+			selector: "!foo",
+			out: &LabelSelector{MatchLabels: map[string]string{}, MatchExpressions: []LabelSelectorRequirement{
+				{Key: "foo", Operator: LabelSelectorOpDoesNotExist, Values: []string{}},
+			}},
+		},
+		{
+			selector:  "foo>1",
+			expectErr: true,
+		},
+		{
+			selector:  "foo<1",
+			expectErr: true,
+		},
+		{
+			selector:  "foo=",
+			expectErr: false,
+			out:       &LabelSelector{MatchLabels: map[string]string{"foo": ""}, MatchExpressions: []LabelSelectorRequirement{}},
+		},
+		{
+			selector:  "=bar",
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.selector, func(t *testing.T) {
+			out, err := ParseToLabelSelector(tt.selector)
+			if tt.expectErr {
+				if err == nil {
+					t.Fatalf("expected error parsing %q, got %v", tt.selector, out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error parsing %q: %v", tt.selector, err)
+			}
+			if diff := cmp.Diff(tt.out, out); diff != "" {
+				t.Errorf("unexpected LabelSelector for %q (-want +got):\n%s", tt.selector, diff)
+			}
+			// The parsed LabelSelector must select the same objects as the
+			// selector string it was parsed from.
+			selector, err := LabelSelectorAsSelector(out)
+			if err != nil {
+				t.Fatalf("unexpected error converting %v back to a selector: %v", out, err)
+			}
+			original, err := labels.Parse(tt.selector)
+			if err != nil {
+				t.Fatalf("unexpected error parsing %q with labels.Parse: %v", tt.selector, err)
+			}
+			for _, ls := range []labels.Set{{}, {"foo": "bar"}, {"foo": "baz"}, {"foo": ""}, {"other": "bar"}} {
+				if got, want := selector.Matches(ls), original.Matches(ls); got != want {
+					t.Errorf("selector %q parsed to %v matches %v: got %t, want %t", tt.selector, out, ls, got, want)
+				}
+			}
+		})
+	}
+}
 
 func TestLabelSelectorAsSelector(t *testing.T) {
 	matchLabels := map[string]string{"foo": "bar"}
@@ -70,15 +175,41 @@ func TestLabelSelectorAsSelector(t *testing.T) {
 	}
 
 	for i, tc := range tc {
+		inCopy := tc.in.DeepCopy()
 		out, err := LabelSelectorAsSelector(tc.in)
+		// after calling LabelSelectorAsSelector, tc.in shouldn't be modified
+		if !reflect.DeepEqual(inCopy, tc.in) {
+			t.Errorf("[%v]expected:\n\t%#v\nbut got:\n\t%#v", i, inCopy, tc.in)
+		}
 		if err == nil && tc.expectErr {
 			t.Errorf("[%v]expected error but got none.", i)
 		}
 		if err != nil && !tc.expectErr {
 			t.Errorf("[%v]did not expect error but got: %v", i, err)
 		}
-		if !reflect.DeepEqual(out, tc.out) {
-			t.Errorf("[%v]expected:\n\t%+v\nbut got:\n\t%+v", i, tc.out, out)
+		// fmt.Sprint() over String() as nil.String() will panic
+		if fmt.Sprint(out) != fmt.Sprint(tc.out) {
+			t.Errorf("[%v]expected:\n\t%s\nbut got:\n\t%s", i, fmt.Sprint(tc.out), fmt.Sprint(out))
+		}
+	}
+}
+
+func BenchmarkLabelSelectorAsSelector(b *testing.B) {
+	selector := &LabelSelector{
+		MatchLabels: map[string]string{
+			"foo": "foo",
+			"bar": "bar",
+		},
+		MatchExpressions: []LabelSelectorRequirement{{
+			Key:      "baz",
+			Operator: LabelSelectorOpExists,
+		}},
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := LabelSelectorAsSelector(selector)
+		if err != nil {
+			b.Fatal(err)
 		}
 	}
 }
@@ -150,5 +281,304 @@ func TestLabelSelectorAsMap(t *testing.T) {
 		if !reflect.DeepEqual(out, tc.out) {
 			t.Errorf("[%v]expected:\n\t%+v\nbut got:\n\t%+v", i, tc.out, out)
 		}
+	}
+}
+
+func TestResetObjectMetaForStatus(t *testing.T) {
+	meta := &ObjectMeta{}
+	existingMeta := &ObjectMeta{}
+
+	// fuzz the existingMeta to set every field, no nils
+	f := randfill.New().NilChance(0).NumElements(1, 1).MaxDepth(10)
+	f.Fill(existingMeta)
+	ResetObjectMetaForStatus(meta, existingMeta)
+
+	// not all fields are stomped during the reset.  These fields should not have been set. False
+	// set them all to their zero values.  Before you add anything to this list, consider whether or not
+	// you're enforcing immutability (those are fine) and whether /status should be able to update
+	// these values (these are usually not fine).
+
+	// generateName doesn't do anything after create
+	existingMeta.SetGenerateName("")
+	// resourceVersion is enforced in validation and used during the storage update
+	existingMeta.SetResourceVersion("")
+	// fields made immutable in validation
+	existingMeta.SetUID(types.UID(""))
+	existingMeta.SetName("")
+	existingMeta.SetNamespace("")
+	existingMeta.SetCreationTimestamp(Time{})
+	existingMeta.SetDeletionTimestamp(nil)
+	existingMeta.SetDeletionGracePeriodSeconds(nil)
+	existingMeta.SetManagedFields(nil)
+
+	if !reflect.DeepEqual(meta, existingMeta) {
+		t.Error(cmp.Diff(meta, existingMeta))
+	}
+}
+
+func TestSetMetaDataLabel(t *testing.T) {
+	tests := []struct {
+		obj   *ObjectMeta
+		label string
+		value string
+		want  map[string]string
+	}{
+		{
+			obj:   &ObjectMeta{},
+			label: "foo",
+			value: "bar",
+			want:  map[string]string{"foo": "bar"},
+		},
+		{
+			obj:   &ObjectMeta{Labels: map[string]string{"foo": "bar"}},
+			label: "foo",
+			value: "baz",
+			want:  map[string]string{"foo": "baz"},
+		},
+		{
+			obj:   &ObjectMeta{Labels: map[string]string{"foo": "bar"}},
+			label: "version",
+			value: "1.0.0",
+			want:  map[string]string{"foo": "bar", "version": "1.0.0"},
+		},
+	}
+
+	for _, tc := range tests {
+		SetMetaDataLabel(tc.obj, tc.label, tc.value)
+		if !reflect.DeepEqual(tc.obj.Labels, tc.want) {
+			t.Errorf("got %v, want %v", tc.obj.Labels, tc.want)
+		}
+	}
+}
+
+func TestFieldsV1MarshalJSON(t *testing.T) {
+	for _, tc := range []struct {
+		Name     string
+		FieldsV1 FieldsV1
+		Want     []byte
+		Error    string
+	}{
+		{
+			Name:     "zero-value encodes as json null",
+			FieldsV1: FieldsV1{},
+			Want:     []byte(`null`),
+		},
+		{
+			Name:     "cbor null is transcoded to json null",
+			FieldsV1: *NewFieldsV1(string([]byte{0xf6})), // null
+			Want:     []byte(`null`),
+		},
+		{
+			Name:     "valid non-map cbor and valid non-object json is returned as-is",
+			FieldsV1: *NewFieldsV1(string([]byte{0x30})),
+			Want:     []byte{0x30}, // Valid CBOR encoding of -17 and JSON encoding of 0!
+		},
+		{
+			Name:     "self-described cbor map is transcoded to json map",
+			FieldsV1: *NewFieldsV1(string([]byte{0xd9, 0xd9, 0xf7, 0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'})), // 55799({"foo":"bar"})
+			Want:     []byte(`{"foo":"bar"}`),
+		},
+		{
+			Name:     "json object is returned as-is",
+			FieldsV1: *NewFieldsV1(" \t\r\n{\"foo\":\"bar\"}"),
+			Want:     []byte(" \t\r\n{\"foo\":\"bar\"}"),
+		},
+		{
+			Name:     "invalid json is returned as-is",
+			FieldsV1: *NewFieldsV1(`{{`),
+			Want:     []byte(`{{`),
+		},
+		{
+			Name:     "invalid cbor fails to transcode to json",
+			FieldsV1: *NewFieldsV1(string([]byte{0xa1})),
+			Error:    "metav1.FieldsV1 cbor invalid: unexpected EOF",
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			got, err := tc.FieldsV1.MarshalJSON()
+			if err != nil {
+				if tc.Error == "" {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if msg := err.Error(); msg != tc.Error {
+					t.Fatalf("expected error %q, got %q", tc.Error, msg)
+				}
+			} else if tc.Error != "" {
+				t.Fatalf("expected error %q, got nil", tc.Error)
+			}
+			if diff := cmp.Diff(tc.Want, got); diff != "" {
+				t.Errorf("unexpected diff:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFieldsV1MarshalCBOR(t *testing.T) {
+	for _, tc := range []struct {
+		Name     string
+		FieldsV1 FieldsV1
+		Want     []byte
+		Error    string
+	}{
+		{
+			Name:     "nil encodes as cbor null",
+			FieldsV1: FieldsV1{},
+			Want:     []byte{0xf6}, // null
+		},
+		{
+			Name:     "json null is transcoded to cbor null",
+			FieldsV1: *NewFieldsV1(string(`null`)),
+			Want:     []byte{0xf6}, // null
+		},
+		{
+			Name:     "valid non-map cbor and valid non-object json is returned as-is",
+			FieldsV1: *NewFieldsV1(string([]byte{0x30})),
+			Want:     []byte{0x30}, // Valid CBOR encoding of -17 and JSON encoding of 0!
+		},
+		{
+			Name:     "json object is transcoded to cbor map",
+			FieldsV1: *NewFieldsV1(" \t\r\n{\"foo\":\"bar\"}"),
+			Want:     []byte{0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'},
+		},
+		{
+			Name:     "self-described cbor map is returned as-is",
+			FieldsV1: *NewFieldsV1(string([]byte{0xd9, 0xd9, 0xf7, 0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'})), // 55799({"foo":"bar"})
+			Want:     []byte{0xd9, 0xd9, 0xf7, 0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'},                       // 55799({"foo":"bar"})
+		},
+		{
+			Name:     "invalid json fails to transcode to cbor",
+			FieldsV1: *NewFieldsV1(`{{`),
+			Error:    "metav1.FieldsV1 json invalid: invalid character '{' looking for beginning of object key string",
+		},
+		{
+			Name:     "invalid cbor is returned as-is",
+			FieldsV1: *NewFieldsV1(string([]byte{0xa1})),
+			Want:     []byte{0xa1},
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			got, err := tc.FieldsV1.MarshalCBOR()
+			if err != nil {
+				if tc.Error == "" {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if msg := err.Error(); msg != tc.Error {
+					t.Fatalf("expected error %q, got %q", tc.Error, msg)
+				}
+			} else if tc.Error != "" {
+				t.Fatalf("expected error %q, got nil", tc.Error)
+			}
+
+			if diff := cmp.Diff(tc.Want, got); diff != "" {
+				t.Errorf("unexpected diff:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFieldsV1UnmarshalJSON(t *testing.T) {
+	for _, tc := range []struct {
+		Name  string
+		JSON  []byte
+		Into  *FieldsV1
+		Want  *FieldsV1
+		Error string
+	}{
+		{
+			Name:  "nil receiver returns error",
+			Into:  nil,
+			Error: "metav1.FieldsV1: UnmarshalJSON on nil pointer",
+		},
+		{
+			Name: "json null does not modify receiver", // conventional for json.Unmarshaler
+			JSON: []byte(`null`),
+			Into: NewFieldsV1(`unmodified`),
+			Want: NewFieldsV1(`unmodified`),
+		},
+		{
+			Name: "valid input is copied verbatim",
+			JSON: []byte("{\"foo\":\"bar\"} \t\r\n"),
+			Into: &FieldsV1{},
+			Want: NewFieldsV1("{\"foo\":\"bar\"} \t\r\n"),
+		},
+		{
+			Name: "invalid input is copied verbatim",
+			JSON: []byte("{{"),
+			Into: &FieldsV1{},
+			Want: NewFieldsV1("{{"),
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			got := tc.Into.DeepCopy()
+			err := got.UnmarshalJSON(tc.JSON)
+			if err != nil {
+				if tc.Error == "" {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if msg := err.Error(); msg != tc.Error {
+					t.Fatalf("expected error %q, got %q", tc.Error, msg)
+				}
+			} else if tc.Error != "" {
+				t.Fatalf("expected error %q, got nil", tc.Error)
+			}
+
+			if diff := cmp.Diff(tc.Want, got); diff != "" {
+				t.Errorf("unexpected diff:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFieldsV1UnmarshalCBOR(t *testing.T) {
+	for _, tc := range []struct {
+		Name  string
+		CBOR  []byte
+		Into  *FieldsV1
+		Want  *FieldsV1
+		Error string
+	}{
+		{
+			Name:  "nil receiver returns error",
+			Into:  nil,
+			Want:  nil,
+			Error: "metav1.FieldsV1: UnmarshalCBOR on nil pointer",
+		},
+		{
+			Name: "cbor null does not modify receiver",
+			CBOR: []byte{0xf6},
+			Into: NewFieldsV1(`unmodified`),
+			Want: NewFieldsV1(`unmodified`),
+		},
+		{
+			Name: "valid input is copied verbatim",
+			CBOR: []byte{0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'},
+			Into: &FieldsV1{},
+			Want: NewFieldsV1(string([]byte{0xa1, 0x43, 'f', 'o', 'o', 0x43, 'b', 'a', 'r'})),
+		},
+		{
+			Name: "invalid input is copied verbatim",
+			CBOR: []byte{0xff}, // UnmarshalCBOR should never be called with malformed input, testing anyway.
+			Into: &FieldsV1{},
+			Want: NewFieldsV1(string([]byte{0xff})),
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			got := tc.Into.DeepCopy()
+			err := got.UnmarshalCBOR(tc.CBOR)
+			if err != nil {
+				if tc.Error == "" {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if msg := err.Error(); msg != tc.Error {
+					t.Fatalf("expected error %q, got %q", tc.Error, msg)
+				}
+			} else if tc.Error != "" {
+				t.Fatalf("expected error %q, got nil", tc.Error)
+			}
+
+			if diff := cmp.Diff(tc.Want, got); diff != "" {
+				t.Errorf("unexpected diff:\n%s", diff)
+			}
+		})
 	}
 }

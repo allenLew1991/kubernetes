@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,16 +19,16 @@ limitations under the License.
 package preflight
 
 import (
-	"fmt"
 	"os"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // Check validates if an user has elevated (root) privileges.
-func (ipuc IsPrivilegedUserCheck) Check() (warnings, errors []error) {
-	errors = []error{}
+func (ipuc IsPrivilegedUserCheck) Check() (warnings, errorList []error) {
 	if os.Getuid() != 0 {
-		errors = append(errors, fmt.Errorf("user is not running as root"))
+		return nil, []error{errors.New("user is not running as root")}
 	}
 
-	return nil, errors
+	return nil, nil
 }

@@ -17,9 +17,11 @@ limitations under the License.
 package clusterrole
 
 import (
+	"context"
+
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -29,13 +31,13 @@ import (
 
 // strategy implements behavior for ClusterRoles
 type strategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
-// strategy is the default logic that applies when creating and updating
+// Strategy is the default logic that applies when creating and updating
 // ClusterRole objects.
-var Strategy = strategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = strategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // Strategy should implement rest.RESTCreateStrategy
 var _ rest.RESTCreateStrategy = Strategy
@@ -43,24 +45,24 @@ var _ rest.RESTCreateStrategy = Strategy
 // Strategy should implement rest.RESTUpdateStrategy
 var _ rest.RESTUpdateStrategy = Strategy
 
-// NamespaceScoped is true for ClusterRoles.
+// NamespaceScoped is false for ClusterRoles.
 func (strategy) NamespaceScoped() bool {
 	return false
 }
 
 // AllowCreateOnUpdate is true for ClusterRoles.
-func (strategy) AllowCreateOnUpdate() bool {
+func (strategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return true
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users
 // on creation.
-func (strategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	_ = obj.(*rbac.ClusterRole)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (strategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (strategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newClusterRole := obj.(*rbac.ClusterRole)
 	oldClusterRole := old.(*rbac.ClusterRole)
 
@@ -68,10 +70,16 @@ func (strategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime
 }
 
 // Validate validates a new ClusterRole. Validation must check for a correct signature.
-func (strategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	clusterRole := obj.(*rbac.ClusterRole)
-	return validation.ValidateClusterRole(clusterRole)
+	opts := validation.ClusterRoleValidationOptions{
+		AllowInvalidLabelValueInSelector: false,
+	}
+	return validation.ValidateClusterRole(clusterRole, opts)
 }
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (strategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
 
 // Canonicalize normalizes the object after validation.
 func (strategy) Canonicalize(obj runtime.Object) {
@@ -79,10 +87,18 @@ func (strategy) Canonicalize(obj runtime.Object) {
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (strategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (strategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newObj := obj.(*rbac.ClusterRole)
-	errorList := validation.ValidateClusterRole(newObj)
-	return append(errorList, validation.ValidateClusterRoleUpdate(newObj, old.(*rbac.ClusterRole))...)
+	oldObj := old.(*rbac.ClusterRole)
+	opts := validation.ClusterRoleValidationOptions{
+		AllowInvalidLabelValueInSelector: hasInvalidLabelValueInLabelSelector(oldObj),
+	}
+	return validation.ValidateClusterRoleUpdate(newObj, oldObj, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (strategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 // If AllowUnconditionalUpdate() is true and the object specified by
@@ -90,6 +106,18 @@ func (strategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.O
 // populates it with the latest version. Else, it checks that the
 // version specified by the user matches the version of latest etcd
 // object.
-func (strategy) AllowUnconditionalUpdate() bool {
+func (strategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
+}
+
+func hasInvalidLabelValueInLabelSelector(role *rbac.ClusterRole) bool {
+	if role.AggregationRule != nil {
+		labelSelectorValidationOptions := metav1validation.LabelSelectorValidationOptions{AllowInvalidLabelValueInSelector: false}
+		for _, selector := range role.AggregationRule.ClusterRoleSelectors {
+			if len(metav1validation.ValidateLabelSelector(&selector, labelSelectorValidationOptions, nil)) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }

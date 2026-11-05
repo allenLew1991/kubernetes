@@ -14,36 +14,56 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Reads the pod configuration from the Kubernetes apiserver.
 package config
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/klog/v2"
 )
 
+// WaitForAPIServerSyncPeriod is the period between checks for the node list/watch initial sync
+const WaitForAPIServerSyncPeriod = 1 * time.Second
+
 // NewSourceApiserver creates a config source that watches and pulls from the apiserver.
-func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}) {
-	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector(api.PodHostField, string(nodeName)))
-	newSourceApiserverFromLW(lw, updates)
+func NewSourceApiserver(logger klog.Logger, c clientset.Interface, nodeName types.NodeName, nodeHasSynced func() bool, updates chan<- sourceUpdate) {
+	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector("spec.nodeName", string(nodeName)))
+
+	// The Reflector responsible for watching pods at the apiserver should be run only after
+	// the node sync with the apiserver has completed.
+	logger.Info("Waiting for node sync before watching apiserver pods")
+	go func() {
+		for {
+			if nodeHasSynced() {
+				logger.V(4).Info("node sync completed")
+				break
+			}
+			time.Sleep(WaitForAPIServerSyncPeriod)
+			logger.V(4).Info("node sync has not completed yet")
+		}
+		logger.Info("Watching apiserver")
+		newSourceApiserverFromLW(logger, lw, updates)
+	}()
 }
 
 // newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
-func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}) {
+func newSourceApiserverFromLW(logger klog.Logger, lw cache.ListerWatcher, updates chan<- sourceUpdate) {
 	send := func(objs []interface{}) {
 		var pods []*v1.Pod
 		for _, o := range objs {
 			pods = append(pods, o.(*v1.Pod))
 		}
-		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+		updates <- sourceUpdate{Pods: pods}
 	}
-	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
-	go r.Run(wait.NeverStop)
+	r := cache.NewReflectorWithOptions(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), cache.ReflectorOptions{
+		Logger: &logger,
+	})
+	go r.RunWithContext(klog.NewContext(context.Background(), logger))
 }

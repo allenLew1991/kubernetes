@@ -17,17 +17,22 @@ limitations under the License.
 package replicationcontroller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/utils/ptr"
 
-	// install all api groups for testing
-	_ "k8s.io/kubernetes/pkg/api/testapi"
+	// ensure types are installed
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
 
 func TestControllerStrategy(t *testing.T) {
@@ -35,7 +40,7 @@ func TestControllerStrategy(t *testing.T) {
 	if !Strategy.NamespaceScoped() {
 		t.Errorf("ReplicationController must be namespace scoped")
 	}
-	if Strategy.AllowCreateOnUpdate() {
+	if Strategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("ReplicationController should not allow create on update")
 	}
 
@@ -45,11 +50,7 @@ func TestControllerStrategy(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: validSelector,
 			},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyAlways,
-				DNSPolicy:     api.DNSClusterFirst,
-				Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-			},
+			Spec: podtest.MakePodSpec(),
 		},
 	}
 	rc := &api.ReplicationController{
@@ -57,6 +58,7 @@ func TestControllerStrategy(t *testing.T) {
 		Spec: api.ReplicationControllerSpec{
 			Selector: validSelector,
 			Template: &validPodTemplate.Template,
+			Replicas: ptr.To[int32](1),
 		},
 		Status: api.ReplicationControllerStatus{
 			Replicas:           1,
@@ -71,6 +73,7 @@ func TestControllerStrategy(t *testing.T) {
 	if rc.Status.ObservedGeneration != int64(0) {
 		t.Error("ReplicationController should not allow setting status.observedGeneration on create")
 	}
+
 	errs := Strategy.Validate(ctx, rc)
 	if len(errs) != 0 {
 		t.Errorf("Unexpected error validating %v", errs)
@@ -94,7 +97,7 @@ func TestControllerStatusStrategy(t *testing.T) {
 	if !StatusStrategy.NamespaceScoped() {
 		t.Errorf("ReplicationController must be namespace scoped")
 	}
-	if StatusStrategy.AllowCreateOnUpdate() {
+	if StatusStrategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("ReplicationController should not allow create on update")
 	}
 	validSelector := map[string]string{"a": "b"}
@@ -113,7 +116,7 @@ func TestControllerStatusStrategy(t *testing.T) {
 	oldController := &api.ReplicationController{
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault, ResourceVersion: "10"},
 		Spec: api.ReplicationControllerSpec{
-			Replicas: 3,
+			Replicas: ptr.To[int32](3),
 			Selector: validSelector,
 			Template: &validPodTemplate.Template,
 		},
@@ -125,7 +128,7 @@ func TestControllerStatusStrategy(t *testing.T) {
 	newController := &api.ReplicationController{
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault, ResourceVersion: "9"},
 		Spec: api.ReplicationControllerSpec{
-			Replicas: 1,
+			Replicas: ptr.To[int32](1),
 			Selector: validSelector,
 			Template: &validPodTemplate.Template,
 		},
@@ -138,7 +141,7 @@ func TestControllerStatusStrategy(t *testing.T) {
 	if newController.Status.Replicas != 3 {
 		t.Errorf("Replication controller status updates should allow change of replicas: %v", newController.Status.Replicas)
 	}
-	if newController.Spec.Replicas != 3 {
+	if *newController.Spec.Replicas != 3 {
 		t.Errorf("PrepareForUpdate should have preferred spec")
 	}
 	errs := StatusStrategy.ValidateUpdate(ctx, newController, oldController)
@@ -149,7 +152,7 @@ func TestControllerStatusStrategy(t *testing.T) {
 
 func TestSelectableFieldLabelConversions(t *testing.T) {
 	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		legacyscheme.Registry.GroupOrDie(api.GroupName).GroupVersion.String(),
+		"v1",
 		"ReplicationController",
 		ControllerToSelectableFields(&api.ReplicationController{}),
 		nil,
@@ -164,17 +167,13 @@ func TestValidateUpdate(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: validSelector,
 			},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyAlways,
-				DNSPolicy:     api.DNSClusterFirst,
-				Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: "File"}},
-			},
+			Spec: podtest.MakePodSpec(),
 		},
 	}
 	oldController := &api.ReplicationController{
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault, ResourceVersion: "10", Annotations: make(map[string]string)},
 		Spec: api.ReplicationControllerSpec{
-			Replicas: 3,
+			Replicas: ptr.To[int32](3),
 			Selector: validSelector,
 			Template: &validPodTemplate.Template,
 		},
@@ -190,7 +189,7 @@ func TestValidateUpdate(t *testing.T) {
 	newController := oldController.DeepCopy()
 
 	// Irrelevant (to the selector) update for the replication controller.
-	newController.Spec.Replicas = 5
+	newController.Spec.Replicas = ptr.To[int32](5)
 
 	// If they didn't try to update the selector then we should not return any error.
 	errs := Strategy.ValidateUpdate(ctx, newController, oldController)
@@ -211,5 +210,37 @@ func TestValidateUpdate(t *testing.T) {
 	}
 	if !strings.Contains(errs[0].Error(), "selector") {
 		t.Fatalf("expected error related to the selector")
+	}
+}
+
+func TestWarningsOnUpdate(t *testing.T) {
+	rcWithGrace := func(generation, grace int64) *api.ReplicationController {
+		return &api.ReplicationController{
+			ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault, Generation: generation},
+			Spec: api.ReplicationControllerSpec{
+				Selector: map[string]string{"a": "b"},
+				Template: &api.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"a": "b"}},
+					Spec:       podtest.MakePodSpec(podtest.SetTerminationGracePeriodSeconds(grace)),
+				},
+			},
+		}
+	}
+	negative := "spec.template.spec.terminationGracePeriodSeconds: must be >= 0; negative values are invalid and will be treated as 1"
+	testCases := []struct {
+		name     string
+		old, new *api.ReplicationController
+		expected []string
+	}{
+		{name: "new template warns", old: rcWithGrace(1, 30), new: rcWithGrace(2, -1), expected: []string{negative}},
+		{name: "old template does not warn", old: rcWithGrace(1, -1), new: rcWithGrace(2, 30)},
+		{name: "generation unchanged", old: rcWithGrace(1, 30), new: rcWithGrace(1, -1)},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if diff := cmp.Diff(tc.expected, Strategy.WarningsOnUpdate(t.Context(), tc.new, tc.old), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("unexpected warnings (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

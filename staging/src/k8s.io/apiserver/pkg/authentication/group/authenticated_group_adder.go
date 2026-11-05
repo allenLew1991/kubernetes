@@ -36,25 +36,31 @@ func NewAuthenticatedGroupAdder(auth authenticator.Request) authenticator.Reques
 	return &AuthenticatedGroupAdder{auth}
 }
 
-func (g *AuthenticatedGroupAdder) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
-	u, ok, err := g.Authenticator.AuthenticateRequest(req)
+func (g *AuthenticatedGroupAdder) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
+	r, ok, err := g.Authenticator.AuthenticateRequest(req)
 	if err != nil || !ok {
 		return nil, ok, err
 	}
 
-	if u.GetName() == user.Anonymous {
-		return u, true, nil
+	if r.User.GetName() == user.Anonymous {
+		return r, true, nil
 	}
-	for _, group := range u.GetGroups() {
+	for _, group := range r.User.GetGroups() {
 		if group == user.AllAuthenticated || group == user.AllUnauthenticated {
-			return u, true, nil
+			return r, true, nil
 		}
 	}
 
-	return &user.DefaultInfo{
-		Name:   u.GetName(),
-		UID:    u.GetUID(),
-		Groups: append(u.GetGroups(), user.AllAuthenticated),
-		Extra:  u.GetExtra(),
-	}, true, nil
+	newGroups := make([]string, 0, len(r.User.GetGroups())+1)
+	newGroups = append(newGroups, r.User.GetGroups()...)
+	newGroups = append(newGroups, user.AllAuthenticated)
+
+	ret := *r // shallow copy
+	ret.User = &user.DefaultInfo{
+		Name:   r.User.GetName(),
+		UID:    r.User.GetUID(),
+		Groups: newGroups,
+		Extra:  r.User.GetExtra(),
+	}
+	return &ret, true, nil
 }

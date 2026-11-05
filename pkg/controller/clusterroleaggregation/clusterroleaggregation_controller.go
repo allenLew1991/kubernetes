@@ -17,11 +17,14 @@ limitations under the License.
 package clusterroleaggregation
 
 import (
+	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
+	"k8s.io/klog/v2"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -35,6 +38,7 @@ import (
 	rbaclisters "k8s.io/client-go/listers/rbac/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
 	"k8s.io/kubernetes/pkg/controller"
 )
 
@@ -44,22 +48,29 @@ type ClusterRoleAggregationController struct {
 	clusterRoleLister  rbaclisters.ClusterRoleLister
 	clusterRolesSynced cache.InformerSynced
 
-	syncHandler func(key string) error
-	queue       workqueue.RateLimitingInterface
+	syncHandler func(ctx context.Context, key string) error
+	queue       workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewClusterRoleAggregation creates a new controller
-func NewClusterRoleAggregation(clusterRoleInformer rbacinformers.ClusterRoleInformer, clusterRoleClient rbacclient.ClusterRolesGetter) *ClusterRoleAggregationController {
+func NewClusterRoleAggregation(ctx context.Context, clusterRoleInformer rbacinformers.ClusterRoleInformer, clusterRoleClient rbacclient.ClusterRolesGetter) *ClusterRoleAggregationController {
+	logger := klog.FromContext(ctx)
 	c := &ClusterRoleAggregationController{
 		clusterRoleClient:  clusterRoleClient,
 		clusterRoleLister:  clusterRoleInformer.Lister(),
 		clusterRolesSynced: clusterRoleInformer.Informer().HasSynced,
 
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ClusterRoleAggregator"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "ClusterRoleAggregator",
+			},
+		),
 	}
 	c.syncHandler = c.syncClusterRole
 
-	clusterRoleInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = clusterRoleInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			c.enqueue()
 		},
@@ -69,11 +80,11 @@ func NewClusterRoleAggregation(clusterRoleInformer rbacinformers.ClusterRoleInfo
 		DeleteFunc: func(uncast interface{}) {
 			c.enqueue()
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	return c
 }
 
-func (c *ClusterRoleAggregationController) syncClusterRole(key string) error {
+func (c *ClusterRoleAggregationController) syncClusterRole(ctx context.Context, key string) error {
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -120,15 +131,34 @@ func (c *ClusterRoleAggregationController) syncClusterRole(key string) error {
 		return nil
 	}
 
-	// we need to update
-	clusterRole := sharedClusterRole.DeepCopy()
-	clusterRole.Rules = nil
-	for _, rule := range newPolicyRules {
-		clusterRole.Rules = append(clusterRole.Rules, *rule.DeepCopy())
-	}
-	_, err = c.clusterRoleClient.ClusterRoles().Update(clusterRole)
+	return c.applyClusterRoles(ctx, sharedClusterRole.Name, newPolicyRules)
+}
 
+func (c *ClusterRoleAggregationController) applyClusterRoles(ctx context.Context, name string, newPolicyRules []rbacv1.PolicyRule) error {
+	clusterRoleApply := rbacv1ac.ClusterRole(name).
+		WithRules(toApplyPolicyRules(newPolicyRules)...)
+
+	opts := metav1.ApplyOptions{FieldManager: "clusterrole-aggregation-controller", Force: true}
+	_, err := c.clusterRoleClient.ClusterRoles().Apply(ctx, clusterRoleApply, opts)
 	return err
+}
+
+func toApplyPolicyRules(rules []rbacv1.PolicyRule) []*rbacv1ac.PolicyRuleApplyConfiguration {
+	var result []*rbacv1ac.PolicyRuleApplyConfiguration
+	for _, rule := range rules {
+		result = append(result, toApplyPolicyRule(rule))
+	}
+	return result
+}
+
+func toApplyPolicyRule(rule rbacv1.PolicyRule) *rbacv1ac.PolicyRuleApplyConfiguration {
+	result := rbacv1ac.PolicyRule()
+	result.Resources = rule.Resources
+	result.ResourceNames = rule.ResourceNames
+	result.APIGroups = rule.APIGroups
+	result.NonResourceURLs = rule.NonResourceURLs
+	result.Verbs = rule.Verbs
+	return result
 }
 
 func ruleExists(haystack []rbacv1.PolicyRule, needle rbacv1.PolicyRule) bool {
@@ -141,37 +171,44 @@ func ruleExists(haystack []rbacv1.PolicyRule, needle rbacv1.PolicyRule) bool {
 }
 
 // Run starts the controller and blocks until stopCh is closed.
-func (c *ClusterRoleAggregationController) Run(workers int, stopCh <-chan struct{}) {
-	defer utilruntime.HandleCrash()
-	defer c.queue.ShutDown()
+func (c *ClusterRoleAggregationController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrashWithContext(ctx)
 
-	glog.Infof("Starting ClusterRoleAggregator")
-	defer glog.Infof("Shutting down ClusterRoleAggregator")
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting ClusterRoleAggregator controller")
 
-	if !controller.WaitForCacheSync("ClusterRoleAggregator", stopCh, c.clusterRolesSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down ClusterRoleAggregator controller")
+		c.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.clusterRolesSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		})
 	}
-
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (c *ClusterRoleAggregationController) runWorker() {
-	for c.processNextWorkItem() {
+func (c *ClusterRoleAggregationController) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
-func (c *ClusterRoleAggregationController) processNextWorkItem() bool {
+func (c *ClusterRoleAggregationController) processNextWorkItem(ctx context.Context) bool {
 	dsKey, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(dsKey)
 
-	err := c.syncHandler(dsKey.(string))
+	err := c.syncHandler(ctx, dsKey)
 	if err == nil {
 		c.queue.Forget(dsKey)
 		return true

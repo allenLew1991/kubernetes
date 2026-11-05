@@ -18,17 +18,21 @@ package container
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
+
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 func TestPodSyncResult(t *testing.T) {
 	okResults := []*SyncResult{
 		NewSyncResult(StartContainer, "container_0"),
-		NewSyncResult(SetupNetwork, "pod"),
+		NewSyncResult(CreatePodSandbox, "pod"),
 	}
 	errResults := []*SyncResult{
 		NewSyncResult(KillContainer, "container_1"),
-		NewSyncResult(TeardownNetwork, "pod"),
+		NewSyncResult(KillPodSandbox, "pod"),
 	}
 	errResults[0].Fail(errors.New("error_0"), "message_0")
 	errResults[1].Fail(errors.New("error_1"), "message_1")
@@ -45,7 +49,7 @@ func TestPodSyncResult(t *testing.T) {
 	result.AddSyncResult(okResults...)
 	result.AddSyncResult(errResults...)
 	if result.Error() == nil {
-		t.Errorf("PodSyncResult should be error: %q", result)
+		t.Errorf("PodSyncResult should be error: %v", result)
 	}
 
 	// If the PodSyncResult is failed, it should be error
@@ -53,7 +57,7 @@ func TestPodSyncResult(t *testing.T) {
 	result.AddSyncResult(okResults...)
 	result.Fail(errors.New("error"))
 	if result.Error() == nil {
-		t.Errorf("PodSyncResult should be error: %q", result)
+		t.Errorf("PodSyncResult should be error: %v", result)
 	}
 
 	// If the PodSyncResult is added an error PodSyncResult, it should be error
@@ -63,6 +67,207 @@ func TestPodSyncResult(t *testing.T) {
 	result.AddSyncResult(okResults...)
 	result.AddPodSyncResult(errResult)
 	if result.Error() == nil {
-		t.Errorf("PodSyncResult should be error: %q", result)
+		t.Errorf("PodSyncResult should be error: %v", result)
+	}
+}
+
+// myCustomError is a custom error type for testing.
+type myCustomError struct {
+	msg string
+}
+
+func (e *myCustomError) Error() string {
+	return e.msg
+}
+
+func TestPodSyncResultPreservesOriginalErrorType(t *testing.T) {
+	t.Run("with custom error in SyncResult", func(t *testing.T) {
+		customErr := &myCustomError{msg: "a special error"}
+		syncResult := NewSyncResult(KillContainer, "container_1")
+		syncResult.Fail(customErr, "a special message")
+		result := &PodSyncResult{
+			SyncResults: []*SyncResult{syncResult},
+		}
+
+		aggErr := result.Error()
+		if aggErr == nil {
+			t.Fatal("expected an aggregate error, but got nil")
+		}
+
+		var ae utilerrors.Aggregate
+		if !errors.As(aggErr, &ae) {
+			t.Fatalf("expected an aggregate error, but got %q", aggErr)
+		}
+		errs := ae.Errors()
+		foundCustomErr := false
+		for _, err := range errs {
+			var ce *myCustomError
+			if errors.As(err, &ce) && ce == customErr {
+				foundCustomErr = true
+			}
+		}
+		if !foundCustomErr {
+			t.Errorf("expected custom error not found in aggregate error. got %q, want %q", aggErr, customErr)
+		}
+	})
+
+	t.Run("with custom error in SyncError", func(t *testing.T) {
+		customErr := &myCustomError{msg: "a special sync error"}
+		result := &PodSyncResult{}
+		result.Fail(customErr)
+
+		aggErr := result.Error()
+		if aggErr == nil {
+			t.Fatal("expected an aggregate error for SyncError, but got nil")
+		}
+
+		var ae utilerrors.Aggregate
+		if !errors.As(aggErr, &ae) {
+			t.Fatalf("expected an aggregate error, but got %q", aggErr)
+		}
+		errs := ae.Errors()
+		foundCustomErr := false
+		for _, err := range errs {
+			var ce *myCustomError
+			if errors.As(err, &ce) && ce == customErr {
+				foundCustomErr = true
+			}
+		}
+		if !foundCustomErr {
+			t.Errorf("expected custom error not found in aggregate error. got %q, want %q", aggErr, customErr)
+		}
+	})
+}
+
+func TestMinBackoffExpiration(t *testing.T) {
+	now := time.Now()
+	testCases := []struct {
+		name            string
+		err             error
+		expectedBackoff time.Time
+		expectedFound   bool
+	}{
+		{
+			name:            "nil error",
+			err:             nil,
+			expectedBackoff: time.Time{},
+			expectedFound:   false,
+		},
+		{
+			name:            "simple error",
+			err:             errors.New("generic error"),
+			expectedBackoff: time.Time{},
+			expectedFound:   false,
+		},
+		{
+			name:            "BackoffError",
+			err:             NewBackoffError(errors.New("backoff"), now.Add(5*time.Second)),
+			expectedBackoff: now.Add(5 * time.Second),
+			expectedFound:   true,
+		},
+		{
+			name:            "wrapped BackoffError",
+			err:             fmt.Errorf("wrapped: %w", NewBackoffError(errors.New("backoff"), now.Add(3*time.Second))),
+			expectedBackoff: now.Add(3 * time.Second),
+			expectedFound:   true,
+		},
+		{
+			name:            "aggregate with no BackoffError",
+			err:             utilerrors.NewAggregate([]error{errors.New("err1"), errors.New("err2")}),
+			expectedBackoff: time.Time{},
+			expectedFound:   false,
+		},
+		{
+			name: "aggregate with one BackoffError",
+			err: utilerrors.NewAggregate([]error{
+				errors.New("err1"),
+				NewBackoffError(errors.New("backoff"), now.Add(7*time.Second)),
+			}),
+			expectedBackoff: now.Add(7 * time.Second),
+			expectedFound:   true,
+		},
+		{
+			name: "aggregate with multiple BackoffErrors, returns minimum",
+			err: utilerrors.NewAggregate([]error{
+				NewBackoffError(errors.New("backoff1"), now.Add(10*time.Second)),
+				NewBackoffError(errors.New("backoff2"), now.Add(3*time.Second)),
+				errors.New("err1"),
+				NewBackoffError(errors.New("backoff3"), now.Add(5*time.Second)),
+			}),
+			expectedBackoff: now.Add(3 * time.Second),
+			expectedFound:   true,
+		},
+		{
+			name: "wrapped aggregate with BackoffError",
+			err: fmt.Errorf("wrapped: %w", utilerrors.NewAggregate([]error{
+				NewBackoffError(errors.New("backoff1"), now.Add(10*time.Second)),
+				NewBackoffError(errors.New("backoff2"), now.Add(3*time.Second)),
+			})),
+			expectedBackoff: now.Add(3 * time.Second),
+			expectedFound:   true,
+		},
+		{
+			name: "nested aggregate with BackoffError",
+			err: utilerrors.NewAggregate([]error{
+				errors.New("err1"),
+				utilerrors.NewAggregate([]error{
+					NewBackoffError(errors.New("backoff nested"), now.Add(2*time.Second)),
+				}),
+				NewBackoffError(errors.New("backoff outer"), now.Add(4*time.Second)),
+			}),
+			expectedBackoff: now.Add(2 * time.Second),
+			expectedFound:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			backoff, found := MinBackoffExpiration(tc.err)
+			if found != tc.expectedFound {
+				t.Errorf("expected found=%t, got %t", tc.expectedFound, found)
+			}
+			if !backoff.Equal(tc.expectedBackoff) {
+				t.Errorf("expected backoff=%v, got %v", tc.expectedBackoff, backoff)
+			}
+		})
+	}
+}
+
+func TestIsBackoffError(t *testing.T) {
+	backoffErr := NewBackoffError(errors.New("backoff"), time.Now())
+	testCases := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{name: "nil error", err: nil},
+		{name: "generic error", err: errors.New("generic error")},
+		{name: "BackoffError", err: backoffErr, expected: true},
+		{name: "crash loop backoff", err: ErrCrashLoopBackOff, expected: true},
+		{name: "image pull backoff", err: ErrImagePullBackOff, expected: true},
+		{name: "wrapped image pull backoff", err: fmt.Errorf("wrapped: %w", ErrImagePullBackOff), expected: true},
+		{name: "empty aggregate", err: utilerrors.NewAggregate([]error{nil})},
+		{
+			name:     "aggregate of backoff errors",
+			err:      utilerrors.NewAggregate([]error{backoffErr, fmt.Errorf("wrapped: %w", ErrImagePullBackOff)}),
+			expected: true,
+		},
+		{
+			name: "aggregate with non-backoff error",
+			err:  utilerrors.NewAggregate([]error{backoffErr, errors.New("generic error")}),
+		},
+		{
+			name:     "wrapped nested aggregate of backoff errors",
+			err:      fmt.Errorf("wrapped: %w", utilerrors.NewAggregate([]error{utilerrors.NewAggregate([]error{backoffErr}), ErrCrashLoopBackOff})),
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsBackoffError(tc.err); got != tc.expected {
+				t.Errorf("expected %t, got %t", tc.expected, got)
+			}
+		})
 	}
 }

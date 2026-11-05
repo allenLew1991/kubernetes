@@ -19,16 +19,16 @@ package generators
 import (
 	"io"
 
-	"k8s.io/gengo/generator"
-	"k8s.io/gengo/namer"
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2/generator"
+	"k8s.io/gengo/v2/namer"
+	"k8s.io/gengo/v2/types"
 
 	"k8s.io/code-generator/cmd/client-gen/generators/util"
 )
 
 // versionInterfaceGenerator generates the per-version interface file.
 type versionInterfaceGenerator struct {
-	generator.DefaultGen
+	generator.GoGenerator
 	outputPackage             string
 	imports                   namer.ImportTracker
 	types                     []*types.Type
@@ -63,12 +63,12 @@ func (g *versionInterfaceGenerator) GenerateType(c *generator.Context, t *types.
 	m := map[string]interface{}{
 		"interfacesTweakListOptionsFunc":  c.Universe.Type(types.Name{Package: g.internalInterfacesPackage, Name: "TweakListOptionsFunc"}),
 		"interfacesSharedInformerFactory": c.Universe.Type(types.Name{Package: g.internalInterfacesPackage, Name: "SharedInformerFactory"}),
-		"types": g.types,
+		"types":                           g.types,
 	}
 
 	sw.Do(versionTemplate, m)
 	for _, typeDef := range g.types {
-		tags, err := util.ParseClientGenTags(typeDef.SecondClosestCommentLines)
+		tags, err := util.ParseClientGenTags(append(typeDef.SecondClosestCommentLines, typeDef.CommentLines...))
 		if err != nil {
 			return err
 		}
@@ -84,8 +84,8 @@ var versionTemplate = `
 // Interface provides access to all the informers in this group version.
 type Interface interface {
 	$range .types -$
-		// $.|publicPlural$ returns a $.|public$Informer.
-		$.|publicPlural$() $.|public$Informer
+		// $.|publicPlural$ returns a Typed$.|public$Informer.
+		$.|publicPlural$() Typed$.|public$Informer
 	$end$
 }
 
@@ -102,8 +102,8 @@ func New(f $.interfacesSharedInformerFactory|raw$, namespace string, tweakListOp
 `
 
 var versionFuncTemplate = `
-// $.type|publicPlural$ returns a $.type|public$Informer.
-func (v *version) $.type|publicPlural$() $.type|public$Informer {
+// $.type|publicPlural$ returns a Typed$.type|public$Informer.
+func (v *version) $.type|publicPlural$() Typed$.type|public$Informer {
 	return &$.type|private$Informer{factory: v.factory$if .namespaced$, namespace: v.namespace$end$, tweakListOptions: v.tweakListOptions}
 }
 `

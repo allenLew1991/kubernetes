@@ -18,82 +18,35 @@ package securitycontext
 
 import (
 	"fmt"
-	"strings"
+	"os"
+	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
-// HasPrivilegedRequest returns the value of SecurityContext.Privileged, taking into account
-// the possibility of nils
-func HasPrivilegedRequest(container *v1.Container) bool {
-	if container.SecurityContext == nil {
+// HasWindowsHostProcessRequest returns true if container should run as HostProcess container,
+// taking into account nils
+func HasWindowsHostProcessRequest(pod *v1.Pod, container *v1.Container) bool {
+	effectiveSc := DetermineEffectiveSecurityContext(pod, container)
+
+	if effectiveSc.WindowsOptions == nil {
 		return false
 	}
-	if container.SecurityContext.Privileged == nil {
+	if effectiveSc.WindowsOptions.HostProcess == nil {
 		return false
 	}
-	return *container.SecurityContext.Privileged
+	return *effectiveSc.WindowsOptions.HostProcess
 }
 
-// HasCapabilitiesRequest returns true if Adds or Drops are defined in the security context
-// capabilities, taking into account nils
-func HasCapabilitiesRequest(container *v1.Container) bool {
-	if container.SecurityContext == nil {
-		return false
-	}
-	if container.SecurityContext.Capabilities == nil {
-		return false
-	}
-	return len(container.SecurityContext.Capabilities.Add) > 0 || len(container.SecurityContext.Capabilities.Drop) > 0
-}
-
-const expectedSELinuxFields = 4
-
-// ParseSELinuxOptions parses a string containing a full SELinux context
-// (user, role, type, and level) into an SELinuxOptions object.  If the
-// context is malformed, an error is returned.
-func ParseSELinuxOptions(context string) (*v1.SELinuxOptions, error) {
-	fields := strings.SplitN(context, ":", expectedSELinuxFields)
-
-	if len(fields) != expectedSELinuxFields {
-		return nil, fmt.Errorf("expected %v fields in selinux; got %v (context: %v)", expectedSELinuxFields, len(fields), context)
-	}
-
-	return &v1.SELinuxOptions{
-		User:  fields[0],
-		Role:  fields[1],
-		Type:  fields[2],
-		Level: fields[3],
-	}, nil
-}
-
-// HasNonRootUID returns true if the runAsUser is set and is greater than 0.
-func HasRootUID(container *v1.Container) bool {
-	if container.SecurityContext == nil {
-		return false
-	}
-	if container.SecurityContext.RunAsUser == nil {
-		return false
-	}
-	return *container.SecurityContext.RunAsUser == 0
-}
-
-// HasRunAsUser determines if the sc's runAsUser field is set.
-func HasRunAsUser(container *v1.Container) bool {
-	return container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil
-}
-
-// HasRootRunAsUser returns true if the run as user is set and it is set to 0.
-func HasRootRunAsUser(container *v1.Container) bool {
-	return HasRunAsUser(container) && HasRootUID(container)
-}
-
+// DetermineEffectiveSecurityContext returns a synthesized SecurityContext for reading effective configurations
+// from the provided pod's and container's security context. Container's fields take precedence in cases where both
+// are set
 func DetermineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container) *v1.SecurityContext {
 	effectiveSc := securityContextFromPodSecurityContext(pod)
 	containerSc := container.SecurityContext
 
 	if effectiveSc == nil && containerSc == nil {
-		return nil
+		return &v1.SecurityContext{}
 	}
 	if effectiveSc != nil && containerSc == nil {
 		return effectiveSc
@@ -105,6 +58,24 @@ func DetermineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container) *v1
 	if containerSc.SELinuxOptions != nil {
 		effectiveSc.SELinuxOptions = new(v1.SELinuxOptions)
 		*effectiveSc.SELinuxOptions = *containerSc.SELinuxOptions
+	}
+
+	if containerSc.WindowsOptions != nil {
+		// only override fields that are set at the container level, not the whole thing
+		if effectiveSc.WindowsOptions == nil {
+			effectiveSc.WindowsOptions = &v1.WindowsSecurityContextOptions{}
+		}
+		if containerSc.WindowsOptions.GMSACredentialSpecName != nil || containerSc.WindowsOptions.GMSACredentialSpec != nil {
+			// both GMSA fields go hand in hand
+			effectiveSc.WindowsOptions.GMSACredentialSpecName = containerSc.WindowsOptions.GMSACredentialSpecName
+			effectiveSc.WindowsOptions.GMSACredentialSpec = containerSc.WindowsOptions.GMSACredentialSpec
+		}
+		if containerSc.WindowsOptions.RunAsUserName != nil {
+			effectiveSc.WindowsOptions.RunAsUserName = containerSc.WindowsOptions.RunAsUserName
+		}
+		if containerSc.WindowsOptions.HostProcess != nil {
+			effectiveSc.WindowsOptions.HostProcess = containerSc.WindowsOptions.HostProcess
+		}
 	}
 
 	if containerSc.Capabilities != nil {
@@ -122,6 +93,11 @@ func DetermineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container) *v1
 		*effectiveSc.RunAsUser = *containerSc.RunAsUser
 	}
 
+	if containerSc.RunAsGroup != nil {
+		effectiveSc.RunAsGroup = new(int64)
+		*effectiveSc.RunAsGroup = *containerSc.RunAsGroup
+	}
+
 	if containerSc.RunAsNonRoot != nil {
 		effectiveSc.RunAsNonRoot = new(bool)
 		*effectiveSc.RunAsNonRoot = *containerSc.RunAsNonRoot
@@ -137,7 +113,31 @@ func DetermineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container) *v1
 		*effectiveSc.AllowPrivilegeEscalation = *containerSc.AllowPrivilegeEscalation
 	}
 
+	if containerSc.ProcMount != nil {
+		effectiveSc.ProcMount = new(v1.ProcMountType)
+		*effectiveSc.ProcMount = *containerSc.ProcMount
+	}
+
 	return effectiveSc
+}
+
+// DetermineEffectiveRunAsUser returns a pointer of UID from the provided pod's
+// and container's security context and a bool value to indicate if it is absent.
+// Container's runAsUser take precedence in cases where both are set.
+func DetermineEffectiveRunAsUser(pod *v1.Pod, container *v1.Container) (*int64, bool) {
+	var runAsUser *int64
+	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsUser != nil {
+		runAsUser = new(int64)
+		*runAsUser = *pod.Spec.SecurityContext.RunAsUser
+	}
+	if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
+		runAsUser = new(int64)
+		*runAsUser = *container.SecurityContext.RunAsUser
+	}
+	if runAsUser == nil {
+		return nil, false
+	}
+	return runAsUser, true
 }
 
 func securityContextFromPodSecurityContext(pod *v1.Pod) *v1.SecurityContext {
@@ -151,9 +151,20 @@ func securityContextFromPodSecurityContext(pod *v1.Pod) *v1.SecurityContext {
 		synthesized.SELinuxOptions = &v1.SELinuxOptions{}
 		*synthesized.SELinuxOptions = *pod.Spec.SecurityContext.SELinuxOptions
 	}
+
+	if pod.Spec.SecurityContext.WindowsOptions != nil {
+		synthesized.WindowsOptions = &v1.WindowsSecurityContextOptions{}
+		*synthesized.WindowsOptions = *pod.Spec.SecurityContext.WindowsOptions
+	}
+
 	if pod.Spec.SecurityContext.RunAsUser != nil {
 		synthesized.RunAsUser = new(int64)
 		*synthesized.RunAsUser = *pod.Spec.SecurityContext.RunAsUser
+	}
+
+	if pod.Spec.SecurityContext.RunAsGroup != nil {
+		synthesized.RunAsGroup = new(int64)
+		*synthesized.RunAsGroup = *pod.Spec.SecurityContext.RunAsGroup
 	}
 
 	if pod.Spec.SecurityContext.RunAsNonRoot != nil {
@@ -177,4 +188,65 @@ func AddNoNewPrivileges(sc *v1.SecurityContext) bool {
 
 	// handle the case where defaultAllowPrivilegeEscalation is false or the user explicitly set allowPrivilegeEscalation to true/false
 	return !*sc.AllowPrivilegeEscalation
+}
+
+var (
+	// These *must* be kept in sync with moby/moby.
+	// https://github.com/moby/moby/blob/ecb03c4cdae6f323150fc11b303dcc5dc4d82416/oci/defaults.go#L190-L218
+	defaultMaskedPaths = sync.OnceValue(func() []string {
+		maskedPaths := []string{
+			"/proc/asound",
+			"/proc/acpi",
+			"/proc/interrupts",
+			"/proc/kcore",
+			"/proc/keys",
+			"/proc/latency_stats",
+			"/proc/timer_list",
+			"/proc/timer_stats",
+			"/proc/sched_debug",
+			"/proc/scsi",
+			"/sys/firmware",
+			"/sys/devices/virtual/powercap",
+		}
+
+		for _, cpu := range possibleCPUs() {
+			path := fmt.Sprintf("/sys/devices/system/cpu/cpu%d/thermal_throttle", cpu)
+			if _, err := os.Stat(path); err == nil {
+				maskedPaths = append(maskedPaths, path)
+			}
+		}
+
+		return maskedPaths
+	})
+	defaultReadonlyPaths = []string{
+		"/proc/bus",
+		"/proc/fs",
+		"/proc/irq",
+		"/proc/sys",
+		"/proc/sysrq-trigger",
+	}
+)
+
+// ConvertToRuntimeMaskedPaths converts the ProcMountType to the specified or default
+// masked paths.
+func ConvertToRuntimeMaskedPaths(opt *v1.ProcMountType) []string {
+	if opt != nil && *opt == v1.UnmaskedProcMount {
+		// Unmasked proc mount should have no paths set as masked.
+		return []string{}
+	}
+
+	// Otherwise, add the default masked paths to the runtime security context.
+	return defaultMaskedPaths()
+}
+
+// ConvertToRuntimeReadonlyPaths converts the ProcMountType to the specified or default
+// readonly paths.
+func ConvertToRuntimeReadonlyPaths(opt *v1.ProcMountType) []string {
+	if opt != nil && *opt == v1.UnmaskedProcMount {
+		// Unmasked proc mount should have no paths set as readonly.
+		return []string{}
+	}
+
+	// Otherwise, add the default readonly paths to the runtime security context.
+	return defaultReadonlyPaths
 }

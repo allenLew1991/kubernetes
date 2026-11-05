@@ -17,135 +17,65 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/lithammer/dedent"
+
+	apps "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
+	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
 	core "k8s.io/client-go/testing"
-	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
-	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	kubeproxyconfigv1alpha1 "k8s.io/kubernetes/pkg/proxy/apis/kubeproxyconfig/v1alpha1"
-	"k8s.io/kubernetes/pkg/util/pointer"
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 )
-
-func TestCreateServiceAccount(t *testing.T) {
-	tests := []struct {
-		name      string
-		createErr error
-		expectErr bool
-	}{
-		{
-			"error-free case",
-			nil,
-			false,
-		},
-		{
-			"duplication errors should be ignored",
-			apierrors.NewAlreadyExists(api.Resource(""), ""),
-			false,
-		},
-		{
-			"unexpected errors should be returned",
-			apierrors.NewUnauthorized(""),
-			true,
-		},
-	}
-
-	for _, tc := range tests {
-		client := clientsetfake.NewSimpleClientset()
-		if tc.createErr != nil {
-			client.PrependReactor("create", "serviceaccounts", func(action core.Action) (bool, runtime.Object, error) {
-				return true, nil, tc.createErr
-			})
-		}
-
-		err := CreateServiceAccount(client)
-		if tc.expectErr {
-			if err == nil {
-				t.Errorf("CreateServiceAccounts(%s) wanted err, got nil", tc.name)
-			}
-			continue
-		} else if !tc.expectErr && err != nil {
-			t.Errorf("CreateServiceAccounts(%s) returned unexpected err: %v", tc.name, err)
-		}
-
-		wantResourcesCreated := 1
-		if len(client.Actions()) != wantResourcesCreated {
-			t.Errorf("CreateServiceAccounts(%s) should have made %d actions, but made %d", tc.name, wantResourcesCreated, len(client.Actions()))
-		}
-
-		for _, action := range client.Actions() {
-			if action.GetVerb() != "create" || action.GetResource().Resource != "serviceaccounts" {
-				t.Errorf("CreateServiceAccounts(%s) called [%v %v], but wanted [create serviceaccounts]",
-					tc.name, action.GetVerb(), action.GetResource().Resource)
-			}
-		}
-
-	}
-}
-
-func TestGetClusterCIDR(t *testing.T) {
-	emptyClusterCIDR := getClusterCIDR("")
-	if emptyClusterCIDR != "" {
-		t.Errorf("Invalid format: %s", emptyClusterCIDR)
-	}
-
-	clusterCIDR := getClusterCIDR("10.244.0.0/16")
-	if clusterCIDR != "- --cluster-cidr=10.244.0.0/16" {
-		t.Errorf("Invalid format: %s", clusterCIDR)
-	}
-
-	clusterIPv6CIDR := getClusterCIDR("2001:db8::/64")
-	if clusterIPv6CIDR != "- --cluster-cidr=2001:db8::/64" {
-		t.Errorf("Invalid format: %s", clusterIPv6CIDR)
-	}
-}
 
 func TestCompileManifests(t *testing.T) {
 	var tests = []struct {
+		name     string
 		manifest string
 		data     interface{}
-		expected bool
 	}{
 		{
+			name:     "KubeProxyConfigMap19",
 			manifest: KubeProxyConfigMap19,
 			data: struct {
-				MasterEndpoint, ProxyConfig string
+				ControlPlaneEndpoint, ProxyConfig, ProxyConfigMap, ProxyConfigMapKey string
 			}{
-				MasterEndpoint: "foo",
-				ProxyConfig:    "  bindAddress: 0.0.0.0\n  clusterCIDR: 192.168.1.1\n  enableProfiling: false",
+				ControlPlaneEndpoint: "foo",
+				ProxyConfig:          "  bindAddress: 0.0.0.0\n  clusterCIDR: 192.168.1.1\n  enableProfiling: false",
+				ProxyConfigMap:       "bar",
+				ProxyConfigMapKey:    "baz",
 			},
-			expected: true,
 		},
 		{
+			name:     "KubeProxyDaemonSet19",
 			manifest: KubeProxyDaemonSet19,
-			data: struct{ ImageRepository, Arch, Version, ImageOverride, MasterTaintKey, CloudTaintKey string }{
-				ImageRepository: "foo",
-				Arch:            "foo",
-				Version:         "foo",
-				ImageOverride:   "foo",
-				MasterTaintKey:  "foo",
-				CloudTaintKey:   "foo",
+			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
+				Image:             "foo",
+				ProxyConfigMap:    "bar",
+				ProxyConfigMapKey: "baz",
 			},
-			expected: true,
 		},
 	}
 	for _, rt := range tests {
-		_, actual := kubeadmutil.ParseTemplate(rt.manifest, rt.data)
-		if (actual == nil) != rt.expected {
-			t.Errorf(
-				"failed to compile %s manifest:\n\texpected: %t\n\t  actual: %t",
-				rt.manifest,
-				rt.expected,
-				(actual == nil),
-			)
-		}
+		t.Run(rt.name, func(t *testing.T) {
+			_, err := kubeadmutil.ParseTemplate(rt.manifest, rt.data)
+			if err != nil {
+				t.Errorf("unexpected ParseTemplate failure: %+v", err)
+			}
+		})
 	}
 }
 
@@ -154,7 +84,7 @@ func TestEnsureProxyAddon(t *testing.T) {
 	const (
 		NoError SimulatedError = iota
 		ServiceAccountError
-		InvalidMasterEndpoint
+		InvalidControlPlaneEndpoint
 		IPv6SetBindAddress
 	)
 
@@ -186,86 +116,243 @@ func TestEnsureProxyAddon(t *testing.T) {
 		},
 	}
 
+	// Override the default timeouts to be shorter
+	defaultTimeouts := kubeadmapi.GetActiveTimeouts()
+	defaultAPICallTimeout := defaultTimeouts.KubernetesAPICall
+	defaultTimeouts.KubernetesAPICall = &metav1.Duration{Duration: time.Microsecond * 500}
+	defer func() {
+		defaultTimeouts.KubernetesAPICall = defaultAPICallTimeout
+	}()
+
 	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a fake client and set up default test configuration
+			client := clientsetfake.NewSimpleClientset()
 
-		// Create a fake client and set up default test configuration
-		client := clientsetfake.NewSimpleClientset()
+			// TODO: Consider using a YAML file instead for this that makes it possible to specify YAML documents for the ComponentConfigs
+			initConfiguration, err := configutil.DefaultedStaticInitConfiguration()
+			if err != nil {
+				t.Errorf("test failed to convert external to internal version: %v", err)
+				return
+			}
 
-		masterConfig := &kubeadmapiext.MasterConfiguration{
-			API: kubeadmapiext.API{
+			initConfiguration.LocalAPIEndpoint = kubeadmapi.APIEndpoint{
 				AdvertiseAddress: "1.2.3.4",
 				BindPort:         1234,
-			},
-			KubeProxy: kubeadmapiext.KubeProxy{
-				Config: &kubeproxyconfigv1alpha1.KubeProxyConfiguration{
-					BindAddress:        "",
-					HealthzBindAddress: "0.0.0.0:10256",
-					MetricsBindAddress: "127.0.0.1:10249",
-					Conntrack: kubeproxyconfigv1alpha1.KubeProxyConntrackConfiguration{
-						Max:        pointer.Int32Ptr(2),
-						MaxPerCore: pointer.Int32Ptr(1),
-						Min:        pointer.Int32Ptr(1),
-						TCPEstablishedTimeout: &metav1.Duration{Duration: 5 * time.Second},
-						TCPCloseWaitTimeout:   &metav1.Duration{Duration: 5 * time.Second},
-					},
-				},
-			},
-			Networking: kubeadmapiext.Networking{
-				PodSubnet: "5.6.7.8/24",
-			},
-			ImageRepository:          "someRepo",
-			KubernetesVersion:        "v1.9.0",
-			UnifiedControlPlaneImage: "someImage",
-		}
+			}
 
-		// Simulate an error if neccessary
-		switch tc.simError {
-		case ServiceAccountError:
-			client.PrependReactor("create", "serviceaccounts", func(action core.Action) (bool, runtime.Object, error) {
-				return true, nil, apierrors.NewUnauthorized("")
-			})
-		case InvalidMasterEndpoint:
-			masterConfig.API.AdvertiseAddress = "1.2.3"
-		case IPv6SetBindAddress:
-			masterConfig.API.AdvertiseAddress = "1:2::3:4"
-			masterConfig.Networking.PodSubnet = "2001:101::/96"
-		}
+			initConfiguration.ClusterConfiguration.Networking.PodSubnet = "5.6.7.8/24"
+			initConfiguration.ClusterConfiguration.ImageRepository = "someRepo"
 
-		kubeadmapiext.SetDefaults_MasterConfiguration(masterConfig)
-		intMaster, err := cmdutil.ConfigFileAndDefaultsToInternalConfig("", masterConfig)
-		if err != nil {
-			t.Errorf(" test failed to convert v1alpha1 to internal version")
-			break
-		}
-		err = EnsureProxyAddon(intMaster, client)
+			// Simulate an error if necessary
+			switch tc.simError {
+			case ServiceAccountError:
+				client.PrependReactor("create", "serviceaccounts", func(action core.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewUnauthorized("")
+				})
+			case InvalidControlPlaneEndpoint:
+				initConfiguration.LocalAPIEndpoint.AdvertiseAddress = "1.2.3"
+			case IPv6SetBindAddress:
+				initConfiguration.LocalAPIEndpoint.AdvertiseAddress = "1:2::3:4"
+				initConfiguration.ClusterConfiguration.Networking.PodSubnet = "2001:101::/48"
+			}
 
-		// Compare actual to expected errors
-		actErr := "No error"
-		if err != nil {
-			actErr = err.Error()
-		}
-		expErr := "No error"
-		if tc.expErrString != "" {
-			expErr = tc.expErrString
-		}
-		if !strings.Contains(actErr, expErr) {
-			t.Errorf(
-				"%s test failed, expected: %s, got: %s",
-				tc.name,
-				expErr,
-				actErr)
-		}
-		if intMaster.KubeProxy.Config.BindAddress != tc.expBindAddr {
-			t.Errorf("%s test failed, expected: %s, got: %s",
-				tc.name,
-				tc.expBindAddr,
-				intMaster.KubeProxy.Config.BindAddress)
-		}
-		if intMaster.KubeProxy.Config.ClusterCIDR != tc.expClusterCIDR {
-			t.Errorf("%s test failed, expected: %s, got: %s",
-				tc.name,
-				tc.expClusterCIDR,
-				intMaster.KubeProxy.Config.ClusterCIDR)
-		}
+			err = EnsureProxyAddon(&initConfiguration.ClusterConfiguration, &initConfiguration.LocalAPIEndpoint, client, "", os.Stdout, false)
+
+			// Compare actual to expected errors
+			actErr := "No error"
+			if err != nil {
+				actErr = err.Error()
+			}
+			expErr := "No error"
+			if tc.expErrString != "" {
+				expErr = tc.expErrString
+			}
+			if !strings.Contains(actErr, expErr) {
+				t.Errorf(
+					"%s test failed, expected: %s, got: %s",
+					tc.name,
+					expErr,
+					actErr)
+			}
+		})
 	}
+}
+
+func TestApplyKubeProxyDaemonSetPatches(t *testing.T) {
+	daemonSetBytes, err := kubeadmutil.ParseTemplate(KubeProxyDaemonSet19, struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
+		Image:             "foo",
+		ProxyConfigMap:    "bar",
+		ProxyConfigMapKey: "baz",
+	})
+	if err != nil {
+		t.Fatalf("unexpected ParseTemplate failure: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	patchFile := filepath.Join(tmpDir, "kubeproxydaemonset+strategic.yaml")
+	patch := `spec:
+  template:
+    spec:
+      hostNetwork: false
+`
+	if err := os.WriteFile(patchFile, []byte(patch), 0600); err != nil {
+		t.Fatalf("failed writing patch file: %v", err)
+	}
+
+	patchedDaemonSetBytes, err := applyKubeProxyDaemonSetPatches(daemonSetBytes, tmpDir, os.Stdout)
+	if err != nil {
+		t.Fatalf("applyKubeProxyDaemonSetPatches returned error: %v", err)
+	}
+
+	kubeproxyDaemonSet := &apps.DaemonSet{}
+	if err := runtime.DecodeInto(clientsetscheme.Codecs.UniversalDecoder(), patchedDaemonSetBytes, kubeproxyDaemonSet); err != nil {
+		t.Fatalf("unable to decode kube-proxy daemonset: %v", err)
+	}
+
+	if kubeproxyDaemonSet.Spec.Template.Spec.HostNetwork {
+		t.Fatal("expected patched kube-proxy daemonset hostNetwork to be false")
+	}
+}
+
+func TestDaemonSetsHaveSystemNodeCriticalPriorityClassName(t *testing.T) {
+	testCases := []struct {
+		name     string
+		manifest string
+		data     interface{}
+	}{
+		{
+			name:     "KubeProxyDaemonSet19",
+			manifest: KubeProxyDaemonSet19,
+			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
+				Image:             "foo",
+				ProxyConfigMap:    "foo",
+				ProxyConfigMapKey: "foo",
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			daemonSetBytes, _ := kubeadmutil.ParseTemplate(testCase.manifest, testCase.data)
+			daemonSet := &apps.DaemonSet{}
+			if err := runtime.DecodeInto(clientsetscheme.Codecs.UniversalDecoder(), daemonSetBytes, daemonSet); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if daemonSet.Spec.Template.Spec.PriorityClassName != "system-node-critical" {
+				t.Errorf("expected to see system-node-critical priority class name. Got %q instead", daemonSet.Spec.Template.Spec.PriorityClassName)
+			}
+		})
+	}
+}
+
+func TestPrintOrCreateKubeProxyObjects(t *testing.T) {
+	tests := []struct {
+		name          string
+		printManifest bool
+		wantOut       string
+		wantErr       bool
+	}{
+		{
+			name:          "do not print manifest",
+			printManifest: false,
+			wantOut:       "[addons] Applied essential addon: kube-proxy\n",
+			wantErr:       false,
+		},
+		{
+			name:          "print manifest",
+			printManifest: true,
+			wantOut: dedent.Dedent(`---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeadm:node-proxier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+- kind: ServiceAccount
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+rules:
+- apiGroups:
+  - ""
+  resourceNames:
+  - kube-proxy
+  resources:
+  - configmaps
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-proxy
+subjects:
+- kind: Group
+  name: system:bootstrappers:kubeadm:default-node-token
+---
+foo
+---
+bar
+`),
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			client := newMockClientForTest(t)
+			cmByte := []byte{'\n', 'f', 'o', 'o', '\n'}
+			dsByte := []byte{'\n', 'b', 'a', 'r', '\n'}
+			if err := printOrCreateKubeProxyObjects(cmByte, dsByte, client, out, tt.printManifest); (err != nil) != tt.wantErr {
+				t.Fatalf("printOrCreateKubeProxyObjects() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if gotOut := out.String(); gotOut != tt.wantOut {
+				t.Fatalf("printOrCreateKubeProxyObjects() = %v, want %v", gotOut, tt.wantOut)
+			}
+		})
+	}
+}
+
+func newMockClientForTest(t *testing.T) *clientsetfake.Clientset {
+	client := clientsetfake.NewSimpleClientset()
+	_, err := client.AppsV1().DaemonSets(metav1.NamespaceSystem).Create(context.TODO(), &apps.DaemonSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "DaemonSet",
+			APIVersion: "apps/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-proxy",
+			Namespace: metav1.NamespaceSystem,
+			Labels: map[string]string{
+				"k8s-app": "kube-proxy",
+			},
+		},
+		Spec: apps.DaemonSetSpec{
+			Template: v1.PodTemplateSpec{},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("error creating Daemonset: %v", err)
+	}
+
+	return client
 }

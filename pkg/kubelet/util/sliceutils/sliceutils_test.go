@@ -18,45 +18,23 @@ package sliceutils
 
 import (
 	"testing"
+	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"time"
 )
 
-func TestStringInSlice(t *testing.T) {
-	fooTests := []struct {
-		s    string
-		list []string
-		er   bool
-	}{
-		{"first", []string{"first", "second"}, true},
-		{"FIRST", []string{"first", "second"}, false},
-		{"third", []string{"first", "second"}, false},
-		{"first", nil, false},
-
-		{"", []string{"first", "second"}, false},
-		{"", []string{"first", "second", ""}, true},
-		{"", nil, false},
-	}
-
-	for _, fooTest := range fooTests {
-		r := StringInSlice(fooTest.s, fooTest.list)
-		if r != fooTest.er {
-			t.Errorf("returned %t but expected %t for s=%s & list=%s", r, fooTest.er, fooTest.s, fooTest.list)
-		}
-	}
-}
-
 func buildPodsByCreationTime() PodsByCreationTime {
+	baseTime := time.Now()
 	return []*v1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo1",
 				Namespace: v1.NamespaceDefault,
+				UID:       "uid-1",
 				CreationTimestamp: metav1.Time{
-					Time: time.Now(),
+					Time: baseTime,
 				},
 			},
 		},
@@ -64,8 +42,9 @@ func buildPodsByCreationTime() PodsByCreationTime {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo2",
 				Namespace: v1.NamespaceDefault,
+				UID:       "uid-2",
 				CreationTimestamp: metav1.Time{
-					Time: time.Now().Add(time.Hour * 1),
+					Time: baseTime.Add(time.Hour * 1),
 				},
 			},
 		},
@@ -73,8 +52,9 @@ func buildPodsByCreationTime() PodsByCreationTime {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo3",
 				Namespace: v1.NamespaceDefault,
+				UID:       "uid-3",
 				CreationTimestamp: metav1.Time{
-					Time: time.Now().Add(time.Hour * 2),
+					Time: baseTime.Add(time.Hour * 2),
 				},
 			},
 		},
@@ -127,7 +107,7 @@ func TestPodsByCreationTimeLess(t *testing.T) {
 		j    int
 		er   bool
 	}{
-		// ascending order
+		// ascending order by creation time
 		{buildPodsByCreationTime(), 0, 2, true},
 		{buildPodsByCreationTime(), 1, 0, false},
 	}
@@ -136,6 +116,69 @@ func TestPodsByCreationTimeLess(t *testing.T) {
 		r := fooTest.pods.Less(fooTest.i, fooTest.j)
 		if r != fooTest.er {
 			t.Errorf("returned %t but expected %t for the foo=%s", r, fooTest.er, fooTest.pods)
+		}
+	}
+}
+
+func TestPodsByCreationTimeTieBreaker(t *testing.T) {
+	// Test that when CreationTimestamp is equal, UID is used as tie-breaker
+	baseTime := time.Now()
+	podsWithSameTime := PodsByCreationTime{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod-z",
+				Namespace: v1.NamespaceDefault,
+				UID:       "uid-z",
+				CreationTimestamp: metav1.Time{
+					Time: baseTime,
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod-a",
+				Namespace: v1.NamespaceDefault,
+				UID:       "uid-a",
+				CreationTimestamp: metav1.Time{
+					Time: baseTime,
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod-m",
+				Namespace: v1.NamespaceDefault,
+				UID:       "uid-m",
+				CreationTimestamp: metav1.Time{
+					Time: baseTime,
+				},
+			},
+		},
+	}
+
+	fooTests := []struct {
+		pods PodsByCreationTime
+		i    int
+		j    int
+		er   bool
+	}{
+		// When timestamps are equal, UID comparison determines order
+		// uid-a < uid-m < uid-z
+		{podsWithSameTime, 0, 1, false}, // uid-z < uid-a? No
+		{podsWithSameTime, 1, 0, true},  // uid-a < uid-z? Yes
+		{podsWithSameTime, 1, 2, true},  // uid-a < uid-m? Yes
+		{podsWithSameTime, 2, 1, false}, // uid-m < uid-a? No
+		{podsWithSameTime, 0, 2, false}, // uid-z < uid-m? No
+		{podsWithSameTime, 2, 0, true},  // uid-m < uid-z? Yes
+	}
+
+	for _, fooTest := range fooTests {
+		r := fooTest.pods.Less(fooTest.i, fooTest.j)
+		if r != fooTest.er {
+			t.Errorf("returned %t but expected %t for pods: %v vs %v (UID: %s vs %s)",
+				r, fooTest.er,
+				fooTest.pods[fooTest.i].Name, fooTest.pods[fooTest.j].Name,
+				fooTest.pods[fooTest.i].UID, fooTest.pods[fooTest.j].UID)
 		}
 	}
 }
@@ -160,6 +203,12 @@ func buildByImageSize() ByImageSize {
 			RepoDigests: []string{"foo-rd31", "foo-rd32"},
 			Size:        3,
 		},
+		{
+			ID:          "4",
+			RepoTags:    []string{"foo-tag41", "foo-tag42"},
+			RepoDigests: []string{"foo-rd41", "foo-rd42"},
+			Size:        3,
+		},
 	}
 }
 
@@ -169,7 +218,7 @@ func TestByImageSizeLen(t *testing.T) {
 		el     int
 	}{
 		{[]kubecontainer.Image{}, 0},
-		{buildByImageSize(), 3},
+		{buildByImageSize(), 4},
 		{nil, 0},
 	}
 
@@ -211,6 +260,7 @@ func TestByImageSizeLess(t *testing.T) {
 		// descending order
 		{buildByImageSize(), 0, 2, false},
 		{buildByImageSize(), 1, 0, true},
+		{buildByImageSize(), 3, 2, true},
 	}
 
 	for _, fooTest := range fooTests {

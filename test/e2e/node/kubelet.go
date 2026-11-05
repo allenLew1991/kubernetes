@@ -17,23 +17,43 @@ limitations under the License.
 package node
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	"github.com/onsi/gomega"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/test/e2e/framework"
-	testutils "k8s.io/kubernetes/test/utils"
+	"k8s.io/kubernetes/pkg/features"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"k8s.io/kubernetes/test/e2e/feature"
+	"k8s.io/kubernetes/test/e2e/framework"
+	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
+	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
+	"k8s.io/kubernetes/test/e2e/storage/utils"
+	testutils "k8s.io/kubernetes/test/utils"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+
+	"github.com/onsi/ginkgo/v2"
 )
 
 const (
@@ -47,10 +67,10 @@ const (
 
 // getPodMatches returns a set of pod names on the given node that matches the
 // podNamePrefix and namespace.
-func getPodMatches(c clientset.Interface, nodeName string, podNamePrefix string, namespace string) sets.String {
+func getPodMatches(ctx context.Context, c clientset.Interface, nodeName string, podNamePrefix string, namespace string) sets.String {
 	matches := sets.NewString()
 	framework.Logf("Checking pods on node %v via /runningpods endpoint", nodeName)
-	runningPods, err := framework.GetKubeletPods(c, nodeName)
+	runningPods, err := e2ekubelet.GetKubeletRunningPods(ctx, c, nodeName)
 	if err != nil {
 		framework.Logf("Error checking running pods on %v: %v", nodeName, err)
 		return matches
@@ -71,14 +91,13 @@ func getPodMatches(c clientset.Interface, nodeName string, podNamePrefix string,
 // information; they are reconstructed by examining the container runtime. In
 // the scope of this test, we do not expect pod naming conflicts so
 // podNamePrefix should be sufficient to identify the pods.
-func waitTillNPodsRunningOnNodes(c clientset.Interface, nodeNames sets.String, podNamePrefix string, namespace string, targetNumPods int, timeout time.Duration) error {
-	return wait.Poll(pollInterval, timeout, func() (bool, error) {
+func waitTillNPodsRunningOnNodes(ctx context.Context, c clientset.Interface, nodeNames sets.String, podNamePrefix string, namespace string, targetNumPods int, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(ctx, pollInterval, timeout, false, func(ctx context.Context) (bool, error) {
 		matchCh := make(chan sets.String, len(nodeNames))
-		for _, item := range nodeNames.List() {
+		for _, nodeName := range nodeNames.List() {
 			// Launch a goroutine per node to check the pods running on the nodes.
-			nodeName := item
 			go func() {
-				matchCh <- getPodMatches(c, nodeName, podNamePrefix, namespace)
+				matchCh <- getPodMatches(ctx, c, nodeName, podNamePrefix, namespace)
 			}()
 		}
 
@@ -94,72 +113,18 @@ func waitTillNPodsRunningOnNodes(c clientset.Interface, nodeNames sets.String, p
 	})
 }
 
-// updates labels of nodes given by nodeNames.
-// In case a given label already exists, it overwrites it. If label to remove doesn't exist
-// it silently ignores it.
-// TODO: migrate to use framework.AddOrUpdateLabelOnNode/framework.RemoveLabelOffNode
-func updateNodeLabels(c clientset.Interface, nodeNames sets.String, toAdd, toRemove map[string]string) {
-	const maxRetries = 5
-	for nodeName := range nodeNames {
-		var node *v1.Node
-		var err error
-		for i := 0; i < maxRetries; i++ {
-			node, err = c.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
-			if err != nil {
-				framework.Logf("Error getting node %s: %v", nodeName, err)
-				continue
-			}
-			if toAdd != nil {
-				for k, v := range toAdd {
-					node.ObjectMeta.Labels[k] = v
-				}
-			}
-			if toRemove != nil {
-				for k := range toRemove {
-					delete(node.ObjectMeta.Labels, k)
-				}
-			}
-			_, err = c.CoreV1().Nodes().Update(node)
-			if err != nil {
-				framework.Logf("Error updating node %s: %v", nodeName, err)
-			} else {
-				break
-			}
-		}
-		Expect(err).NotTo(HaveOccurred())
-	}
-}
-
-// Restart the passed-in nfs-server by issuing a `/usr/sbin/rpc.nfsd 1` command in the
-// pod's (only) container. This command changes the number of nfs server threads from
-// (presumably) zero back to 1, and therefore allows nfs to open connections again.
-func restartNfsServer(serverPod *v1.Pod) {
-	const startcmd = "/usr/sbin/rpc.nfsd 1"
-	ns := fmt.Sprintf("--namespace=%v", serverPod.Namespace)
-	framework.RunKubectlOrDie("exec", ns, serverPod.Name, "--", "/bin/sh", "-c", startcmd)
-}
-
-// Stop the passed-in nfs-server by issuing a `/usr/sbin/rpc.nfsd 0` command in the
-// pod's (only) container. This command changes the number of nfs server threads to 0,
-// thus closing all open nfs connections.
-func stopNfsServer(serverPod *v1.Pod) {
-	const stopcmd = "/usr/sbin/rpc.nfsd 0"
-	ns := fmt.Sprintf("--namespace=%v", serverPod.Namespace)
-	framework.RunKubectlOrDie("exec", ns, serverPod.Name, "--", "/bin/sh", "-c", stopcmd)
-}
-
 // Creates a pod that mounts an nfs volume that is served by the nfs-server pod. The container
 // will execute the passed in shell cmd. Waits for the pod to start.
 // Note: the nfs plugin is defined inline, no PV or PVC.
-func createPodUsingNfs(f *framework.Framework, c clientset.Interface, ns, nfsIP, cmd string) *v1.Pod {
-	By("create pod using nfs volume")
+func createPodUsingNfs(ctx context.Context, f *framework.Framework, c clientset.Interface, ns, nfsIP, cmd string) *v1.Pod {
+	ginkgo.By("create pod using nfs volume")
 
 	isPrivileged := true
 	cmdLine := []string{"-c", cmd}
 	pod := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
-			APIVersion: testapi.Groups[v1.GroupName].GroupVersion().String(),
+			APIVersion: "v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "pod-nfs-vol-",
@@ -169,7 +134,7 @@ func createPodUsingNfs(f *framework.Framework, c clientset.Interface, ns, nfsIP,
 			Containers: []v1.Container{
 				{
 					Name:    "pod-nfs-vol",
-					Image:   "busybox",
+					Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 					Command: []string{"/bin/sh"},
 					Args:    cmdLine,
 					VolumeMounts: []v1.VolumeMount{
@@ -183,7 +148,7 @@ func createPodUsingNfs(f *framework.Framework, c clientset.Interface, ns, nfsIP,
 					},
 				},
 			},
-			RestartPolicy: v1.RestartPolicyNever, //don't restart pod
+			RestartPolicy: v1.RestartPolicyNever, // don't restart pod
 			Volumes: []v1.Volume{
 				{
 					Name: "nfs-vol",
@@ -198,15 +163,38 @@ func createPodUsingNfs(f *framework.Framework, c clientset.Interface, ns, nfsIP,
 			},
 		},
 	}
-	rtnPod, err := c.CoreV1().Pods(ns).Create(pod)
-	Expect(err).NotTo(HaveOccurred())
+	rtnPod, err := c.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err)
 
-	err = f.WaitForPodReady(rtnPod.Name) // running & ready
-	Expect(err).NotTo(HaveOccurred())
+	err = e2epod.WaitTimeoutForPodReadyInNamespace(ctx, f.ClientSet, rtnPod.Name, f.Namespace.Name, framework.PodStartTimeout) // running & ready
+	framework.ExpectNoError(err)
 
-	rtnPod, err = c.CoreV1().Pods(ns).Get(rtnPod.Name, metav1.GetOptions{}) // return fresh pod
-	Expect(err).NotTo(HaveOccurred())
+	rtnPod, err = c.CoreV1().Pods(ns).Get(ctx, rtnPod.Name, metav1.GetOptions{}) // return fresh pod
+	framework.ExpectNoError(err)
 	return rtnPod
+}
+
+// getHostExternalAddress gets the node for a pod and returns the first External
+// address. Returns an error if the node the pod is on doesn't have an External
+// address.
+func getHostExternalAddress(ctx context.Context, client clientset.Interface, p *v1.Pod) (externalAddress string, err error) {
+	node, err := client.CoreV1().Nodes().Get(ctx, p.Spec.NodeName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	for _, address := range node.Status.Addresses {
+		if address.Type == v1.NodeExternalIP {
+			if address.Address != "" {
+				externalAddress = address.Address
+				break
+			}
+		}
+	}
+	if externalAddress == "" {
+		e2eskipper.Skipf("No NodeExternalIP for pod %v on node %v, test requires SSH-reachable worker nodes",
+			p.Name, p.Spec.NodeName)
+	}
+	return
 }
 
 // Checks for a lingering nfs mount and/or uid directory on the pod's host. The host IP is used
@@ -215,14 +203,14 @@ func createPodUsingNfs(f *framework.Framework, c clientset.Interface, ns, nfsIP,
 // `ls <uid-dir>` should fail (since that dir was removed). If expectClean is false then we expect
 // the node is not cleaned up, and thus cmds like `ls <uid-dir>` should succeed. We wait for the
 // kubelet to be cleaned up, afterwhich an error is reported.
-func checkPodCleanup(c clientset.Interface, pod *v1.Pod, expectClean bool) {
+func checkPodCleanup(ctx context.Context, c clientset.Interface, pod *v1.Pod, expectClean bool) {
 	timeout := 5 * time.Minute
 	poll := 20 * time.Second
 	podDir := filepath.Join("/var/lib/kubelet/pods", string(pod.UID))
 	mountDir := filepath.Join(podDir, "volumes", "kubernetes.io~nfs")
 	// use ip rather than hostname in GCE
-	nodeIP, err := framework.GetHostExternalAddress(c, pod)
-	Expect(err).NotTo(HaveOccurred())
+	nodeIP, err := getHostExternalAddress(ctx, c, pod)
+	framework.ExpectNoError(err)
 
 	condMsg := "deleted"
 	if !expectClean {
@@ -247,11 +235,11 @@ func checkPodCleanup(c clientset.Interface, pod *v1.Pod, expectClean bool) {
 
 	for _, test := range tests {
 		framework.Logf("Wait up to %v for host's (%v) %q to be %v", timeout, nodeIP, test.feature, condMsg)
-		err = wait.Poll(poll, timeout, func() (bool, error) {
-			result, err := framework.NodeExec(nodeIP, test.cmd)
-			Expect(err).NotTo(HaveOccurred())
-			framework.LogSSHResult(result)
-			ok := (result.Code == 0 && len(result.Stdout) > 0 && len(result.Stderr) == 0)
+		err = wait.PollUntilContextTimeout(ctx, poll, timeout, false, func(ctx context.Context) (bool, error) {
+			result, err := e2essh.NodeExec(ctx, nodeIP, test.cmd, framework.TestContext.Provider)
+			framework.ExpectNoError(err)
+			e2essh.LogResult(result)
+			ok := result.Code == 0 && len(result.Stdout) > 0 && len(result.Stderr) == 0
 			if expectClean && ok { // keep trying
 				return false, nil
 			}
@@ -260,7 +248,7 @@ func checkPodCleanup(c clientset.Interface, pod *v1.Pod, expectClean bool) {
 			}
 			return true, nil // done, host is as expected
 		})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Host (%v) cleanup error: %v. Expected %q to be %v", nodeIP, err, test.feature, condMsg))
+		framework.ExpectNoError(err, fmt.Sprintf("Host (%v) cleanup error: %v. Expected %q to be %v", nodeIP, err, test.feature, condMsg))
 	}
 
 	if expectClean {
@@ -276,18 +264,19 @@ var _ = SIGDescribe("kubelet", func() {
 		ns string
 	)
 	f := framework.NewDefaultFramework("kubelet")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
-	BeforeEach(func() {
+	ginkgo.BeforeEach(func() {
 		c = f.ClientSet
 		ns = f.Namespace.Name
 	})
 
-	SIGDescribe("Clean up pods on node", func() {
+	ginkgo.Describe("Clean up pods on node", func() {
 		var (
 			numNodes        int
 			nodeNames       sets.String
 			nodeLabels      map[string]string
-			resourceMonitor *framework.ResourceMonitor
+			resourceMonitor *e2ekubelet.ResourceMonitor
 		)
 		type DeleteTest struct {
 			podsPerNode int
@@ -298,71 +287,70 @@ var _ = SIGDescribe("kubelet", func() {
 			{podsPerNode: 10, timeout: 1 * time.Minute},
 		}
 
-		BeforeEach(func() {
+		// Must be called in each It with the context of the test.
+		start := func(ctx context.Context) {
 			// Use node labels to restrict the pods to be assigned only to the
 			// nodes we observe initially.
 			nodeLabels = make(map[string]string)
 			nodeLabels["kubelet_cleanup"] = "true"
-			nodes := framework.GetReadySchedulableNodesOrDie(c)
+			nodes, err := e2enode.GetBoundedReadySchedulableNodes(ctx, c, maxNodesToCheck)
 			numNodes = len(nodes.Items)
-			Expect(numNodes).NotTo(BeZero())
+			framework.ExpectNoError(err)
 			nodeNames = sets.NewString()
-			// If there are a lot of nodes, we don't want to use all of them
-			// (if there are 1000 nodes in the cluster, starting 10 pods/node
-			// will take ~10 minutes today). And there is also deletion phase.
-			// Instead, we choose at most 10 nodes.
-			if numNodes > maxNodesToCheck {
-				numNodes = maxNodesToCheck
-			}
-			for i := 0; i < numNodes; i++ {
+			for i := 0; i < len(nodes.Items); i++ {
 				nodeNames.Insert(nodes.Items[i].Name)
 			}
-			updateNodeLabels(c, nodeNames, nodeLabels, nil)
+			for nodeName := range nodeNames {
+				for k, v := range nodeLabels {
+					e2enode.AddOrUpdateLabelOnNode(c, nodeName, k, v)
+					ginkgo.DeferCleanup(e2enode.RemoveLabelOffNode, c, nodeName, k)
+				}
+			}
+
+			// While we only use a bounded number of nodes in the test. We need to know
+			// the actual number of nodes in the cluster, to avoid running resourceMonitor
+			// against large clusters.
+			actualNodes, err := e2enode.GetReadySchedulableNodes(ctx, c)
+			framework.ExpectNoError(err)
 
 			// Start resourceMonitor only in small clusters.
-			if len(nodes.Items) <= maxNodesToCheck {
-				resourceMonitor = framework.NewResourceMonitor(f.ClientSet, framework.TargetContainers(), containerStatsPollingInterval)
-				resourceMonitor.Start()
+			if len(actualNodes.Items) <= maxNodesToCheck {
+				resourceMonitor = e2ekubelet.NewResourceMonitor(f.ClientSet, e2ekubelet.TargetContainers(), containerStatsPollingInterval)
+				resourceMonitor.Start(ctx)
+				ginkgo.DeferCleanup(resourceMonitor.Stop)
 			}
-		})
-
-		AfterEach(func() {
-			if resourceMonitor != nil {
-				resourceMonitor.Stop()
-			}
-			// If we added labels to nodes in this test, remove them now.
-			updateNodeLabels(c, nodeNames, nil, nodeLabels)
-		})
+		}
 
 		for _, itArg := range deleteTests {
 			name := fmt.Sprintf(
 				"kubelet should be able to delete %d pods per node in %v.", itArg.podsPerNode, itArg.timeout)
-			It(name, func() {
+			ginkgo.It(name, func(ctx context.Context) {
+				start(ctx)
 				totalPods := itArg.podsPerNode * numNodes
-				By(fmt.Sprintf("Creating a RC of %d pods and wait until all pods of this RC are running", totalPods))
+				ginkgo.By(fmt.Sprintf("Creating a RC of %d pods and wait until all pods of this RC are running", totalPods))
 				rcName := fmt.Sprintf("cleanup%d-%s", totalPods, string(uuid.NewUUID()))
 
-				Expect(framework.RunRC(testutils.RCConfig{
-					Client:         f.ClientSet,
-					InternalClient: f.InternalClientset,
-					Name:           rcName,
-					Namespace:      f.Namespace.Name,
-					Image:          framework.GetPauseImageName(f.ClientSet),
-					Replicas:       totalPods,
-					NodeSelector:   nodeLabels,
-				})).NotTo(HaveOccurred())
+				err := e2erc.RunRC(ctx, testutils.RCConfig{
+					Client:       f.ClientSet,
+					Name:         rcName,
+					Namespace:    f.Namespace.Name,
+					Image:        imageutils.GetPauseImageName(),
+					Replicas:     totalPods,
+					NodeSelector: nodeLabels,
+				})
+				framework.ExpectNoError(err)
 				// Perform a sanity check so that we know all desired pods are
 				// running on the nodes according to kubelet. The timeout is set to
-				// only 30 seconds here because framework.RunRC already waited for all pods to
+				// only 30 seconds here because e2erc.RunRC already waited for all pods to
 				// transition to the running status.
-				Expect(waitTillNPodsRunningOnNodes(f.ClientSet, nodeNames, rcName, ns, totalPods,
-					time.Second*30)).NotTo(HaveOccurred())
+				err = waitTillNPodsRunningOnNodes(ctx, f.ClientSet, nodeNames, rcName, ns, totalPods, time.Second*30)
+				framework.ExpectNoError(err)
 				if resourceMonitor != nil {
 					resourceMonitor.LogLatest()
 				}
 
-				By("Deleting the RC")
-				framework.DeleteRCAndPods(f.ClientSet, f.InternalClientset, f.Namespace.Name, rcName)
+				ginkgo.By("Deleting the RC")
+				e2erc.DeleteRCAndWaitForGC(ctx, f.ClientSet, f.Namespace.Name, rcName)
 				// Check that the pods really are gone by querying /runningpods on the
 				// node. The /runningpods handler checks the container runtime (or its
 				// cache) and  returns a list of running pods. Some possible causes of
@@ -371,8 +359,8 @@ var _ = SIGDescribe("kubelet", func() {
 				//   - a bug in graceful termination (if it is enabled)
 				//   - docker slow to delete pods (or resource problems causing slowness)
 				start := time.Now()
-				Expect(waitTillNPodsRunningOnNodes(f.ClientSet, nodeNames, rcName, ns, 0,
-					itArg.timeout)).NotTo(HaveOccurred())
+				err = waitTillNPodsRunningOnNodes(ctx, f.ClientSet, nodeNames, rcName, ns, 0, itArg.timeout)
+				framework.ExpectNoError(err)
 				framework.Logf("Deleting %d pods on %d nodes completed in %v after the RC was deleted", totalPods, len(nodeNames),
 					time.Since(start))
 				if resourceMonitor != nil {
@@ -383,7 +371,7 @@ var _ = SIGDescribe("kubelet", func() {
 	})
 
 	// Test host cleanup when disrupting the volume environment.
-	SIGDescribe("host cleanup with volume mounts [sig-storage][HostCleanup][Flaky]", func() {
+	f.Describe("host cleanup with volume mounts [HostCleanup]", func() {
 
 		type hostCleanupTest struct {
 			itDescr string
@@ -395,12 +383,11 @@ var _ = SIGDescribe("kubelet", func() {
 		//       If the nfs-server pod is deleted the client pod's mount can not be unmounted.
 		//       If the nfs-server pod is deleted and re-created, due to having a different ip
 		//       addr, the client pod's mount still cannot be unmounted.
-		Context("Host cleanup after disrupting NFS volume [NFS]", func() {
+		f.Context("Host cleanup after disrupting NFS volume [NFS]", f.WithSlow(), f.WithProvider(framework.ProvidersWithSSH...), func() {
 			// issue #31272
 			var (
 				nfsServerPod *v1.Pod
 				nfsIP        string
-				NFSconfig    framework.VolumeTestConfig
 				pod          *v1.Pod // client pod
 			)
 
@@ -416,41 +403,405 @@ var _ = SIGDescribe("kubelet", func() {
 				},
 			}
 
-			BeforeEach(func() {
-				framework.SkipUnlessProviderIs(framework.ProvidersWithSSH...)
-				NFSconfig, nfsServerPod, nfsIP = framework.NewNFSServer(c, ns, []string{"-G", "777", "/exports"})
+			ginkgo.BeforeEach(func(ctx context.Context) {
+				_, nfsServerPod, nfsIP = e2evolume.NewNFSServer(ctx, c, ns, []string{"-G", "777", "/exports"})
 			})
 
-			AfterEach(func() {
-				err := framework.DeletePodWithWait(f, c, pod)
-				Expect(err).NotTo(HaveOccurred(), "AfterEach: Failed to delete client pod ", pod.Name)
-				err = framework.DeletePodWithWait(f, c, nfsServerPod)
-				Expect(err).NotTo(HaveOccurred(), "AfterEach: Failed to delete server pod ", nfsServerPod.Name)
+			ginkgo.AfterEach(func(ctx context.Context) {
+				e2epod.DeletePodsWithWait(ctx, c, []*v1.Pod{pod, nfsServerPod})
 			})
 
 			// execute It blocks from above table of tests
 			for _, t := range testTbl {
-				It(t.itDescr, func() {
-					pod = createPodUsingNfs(f, c, ns, nfsIP, t.podCmd)
+				ginkgo.It(t.itDescr, func(ctx context.Context) {
+					pod = createPodUsingNfs(ctx, f, c, ns, nfsIP, t.podCmd)
 
-					By("Stop the NFS server")
-					stopNfsServer(nfsServerPod)
+					ginkgo.By("Stop the NFS server")
+					e2evolume.StopNFSServer(ctx, f, nfsServerPod)
 
-					By("Delete the pod mounted to the NFS volume -- expect failure")
-					err := framework.DeletePodWithWait(f, c, pod)
-					Expect(err).To(HaveOccurred())
+					ginkgo.By("Delete the pod mounted to the NFS volume -- expect failure")
+					err := e2epod.DeletePodWithWait(ctx, c, pod)
+					gomega.Expect(err).To(gomega.HaveOccurred())
 					// pod object is now stale, but is intentionally not nil
 
-					By("Check if pod's host has been cleaned up -- expect not")
-					checkPodCleanup(c, pod, false)
+					ginkgo.By("Check if pod's host has been cleaned up -- expect not")
+					checkPodCleanup(ctx, c, pod, false)
 
-					By("Restart the nfs server")
-					restartNfsServer(nfsServerPod)
+					ginkgo.By("Restart the nfs server")
+					e2evolume.RestartNFSServer(ctx, f, nfsServerPod)
 
-					By("Verify that the deleted client pod is now cleaned up")
-					checkPodCleanup(c, pod, true)
+					ginkgo.By("Verify that the deleted client pod is now cleaned up")
+					checkPodCleanup(ctx, c, pod, true)
 				})
 			}
 		})
 	})
+
+	// Tests for NodeLogQuery feature
+	f.Describe("kubectl get --raw \"/api/v1/nodes/<insert-node-name-here>/proxy/logs/?query=/<insert-log-file-name-here>", feature.NodeLogQuery, func() {
+		var linuxNodeName string
+		var windowsNodeName string
+
+		ginkgo.BeforeEach(func(ctx context.Context) {
+			allNodes, err := e2enode.GetReadyNodesIncludingTainted(ctx, c)
+			framework.ExpectNoError(err)
+			if len(allNodes.Items) == 0 {
+				framework.Fail("Expected at least one node to be present")
+			}
+			// Make a copy of the node list as getLinuxNodes will filter out the Windows nodes
+			nodes := allNodes.DeepCopy()
+
+			linuxNodes := getLinuxNodes(nodes)
+			if len(linuxNodes.Items) == 0 {
+				framework.Fail("Expected at least one Linux node to be present")
+			}
+			linuxNodeName = linuxNodes.Items[0].Name
+
+			windowsNodes := getWindowsNodes(allNodes)
+			if len(windowsNodes.Items) == 0 {
+				framework.Logf("No Windows node found")
+			} else {
+				windowsNodeName = windowsNodes.Items[0].Name
+			}
+
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-node-name-here>/proxy/logs/?query"
+			returns an error!
+		*/
+
+		ginkgo.It("should return the error with an empty --query option", func() {
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query", linuxNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			_, _, err := framework.StartCmdAndStreamOutput(cmd)
+			if err != nil {
+				framework.Failf("Failed to start kubectl command! Error: %v", err)
+			}
+			err = cmd.Wait()
+			gomega.Expect(err).To(gomega.HaveOccurred(), "Command kubectl get --raw "+queryCommand+" was expected to return an error!")
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-linux-node-name-here>/proxy/logs/?query=kubelet"
+			returns the kubelet logs
+		*/
+
+		ginkgo.It("should return the kubelet logs", func(ctx context.Context) {
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=kubelet", linuxNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			assertContains("kubelet", result)
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-linux-node-name-here>/proxy/logs/?query=kubelet&boot=0"
+			returns kubelet logs from the current boot
+		*/
+
+		ginkgo.It("should return the kubelet logs for the current boot", func(ctx context.Context) {
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=kubelet&boot=0", linuxNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			assertContains("kubelet", result)
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-linux-node-name-here>/proxy/logs/?query=kubelet&tailLines=3"
+			returns the last three lines of the kubelet log
+		*/
+
+		f.It("should return the last three lines of the kubelet logs", f.WithProvider(framework.ProvidersWithSSH...), func(ctx context.Context) {
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=kubelet&tailLines=3", linuxNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			logs := journalctlCommandOnNode(linuxNodeName, "-u kubelet -n 3")
+			if result != logs {
+				framework.Failf("Failed to receive the correct kubelet logs or the correct amount of lines of logs")
+			}
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-linux-node-name-here>/proxy/logs/?query=kubelet&pattern=container"
+			returns kubelet logs for the current boot with the pattern container
+		*/
+
+		f.It("should return the kubelet logs for the current boot with the pattern container", f.WithProvider(framework.ProvidersWithSSH...), func(ctx context.Context) {
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=kubelet&boot=0&pattern=container", linuxNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			logs := journalctlCommandOnNode(linuxNodeName, "-u kubelet --grep container --boot 0")
+			if result != logs {
+				framework.Failf("Failed to receive the correct kubelet logs")
+			}
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-linux-node-name-here>/proxy/logs/?query=kubelet&sinceTime=<now>"
+			returns the kubelet logs since the current date and time. This can be "-- No entries --" which is correct.
+		*/
+
+		ginkgo.It("should return the kubelet logs since the current date and time", func() {
+			ginkgo.By("Starting the command")
+			start := time.Now().UTC()
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			currentTime := start.Format(time.RFC3339)
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=kubelet&sinceTime=%s", linuxNodeName, currentTime)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			journalctlDateLayout := "2006-1-2 15:4:5"
+			result := runKubectlCommand(cmd)
+			logs := journalctlCommandOnNode(linuxNodeName, fmt.Sprintf("-u kubelet --since \"%s\"", start.Format(journalctlDateLayout)))
+			if result != logs {
+				framework.Failf("Failed to receive the correct kubelet logs or the correct amount of lines of logs")
+			}
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-windows-node-name-here>/proxy/logs/?query="Microsoft-Windows-Security-SPP"
+			returns the Microsoft-Windows-Security-SPP log
+		*/
+
+		ginkgo.It("should return the Microsoft-Windows-Security-SPP logs", func(ctx context.Context) {
+			if len(windowsNodeName) == 0 {
+				ginkgo.Skip("No Windows node found")
+			}
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=Microsoft-Windows-Security-SPP", windowsNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			assertContains("ProviderName: Microsoft-Windows-Security-SPP", result)
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-windows-node-name-here>/proxy/logs/?query=Microsoft-Windows-Security-SPP&tailLines=3"
+			returns the last three lines of the Microsoft-Windows-Security-SPP log
+		*/
+
+		f.It("should return the last three lines of the Microsoft-Windows-Security-SPP logs", f.WithProvider(framework.ProvidersWithSSH...), func(ctx context.Context) {
+			if len(windowsNodeName) == 0 {
+				ginkgo.Skip("No Windows node found")
+			}
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=Microsoft-Windows-Security-SPP&tailLines=3", windowsNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			logs := getWinEventCommandOnNode(windowsNodeName, "Microsoft-Windows-Security-SPP", " -MaxEvents 3")
+			if trimSpaceNewlineInString(result) != trimSpaceNewlineInString(logs) {
+				framework.Failf("Failed to receive the correct Microsoft-Windows-Security-SPP logs or the correct amount of lines of logs")
+			}
+		})
+
+		/*
+			Test if kubectl get --raw "/api/v1/nodes/<insert-windows-node-name-here>/proxy/logs/?query=Microsoft-Windows-Security-SPP&pattern=Health"
+			returns the lines of the Microsoft-Windows-Security-SPP log with the pattern Health
+		*/
+
+		f.It("should return the Microsoft-Windows-Security-SPP logs with the pattern Health", f.WithProvider(framework.ProvidersWithSSH...), func(ctx context.Context) {
+			if len(windowsNodeName) == 0 {
+				ginkgo.Skip("No Windows node found")
+			}
+			ginkgo.By("Starting the command")
+			tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+			queryCommand := fmt.Sprintf("/api/v1/nodes/%s/proxy/logs/?query=Microsoft-Windows-Security-SPP&pattern=Health", windowsNodeName)
+			cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+			result := runKubectlCommand(cmd)
+			logs := getWinEventCommandOnNode(windowsNodeName, "Microsoft-Windows-Security-SPP", "  | Where-Object -Property Message -Match Health")
+			if trimSpaceNewlineInString(result) != trimSpaceNewlineInString(logs) {
+				framework.Failf("Failed to receive the correct Microsoft-Windows-Security-SPP logs or the correct amount of lines of logs")
+			}
+		})
+	})
 })
+
+var _ = SIGDescribe("specific log stream", feature.PodLogsQuerySplitStreams, framework.WithFeatureGate(features.PodLogsQuerySplitStreams), func() {
+	var (
+		c  clientset.Interface
+		ns string
+	)
+	f := framework.NewDefaultFramework("pod-log-stream")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+
+	ginkgo.BeforeEach(func() {
+		c = f.ClientSet
+		ns = f.Namespace.Name
+	})
+
+	ginkgo.It("kubectl get --raw /api/v1/namespaces/default/pods/<pod-name>/log?stream", func(ctx context.Context) {
+		ginkgo.By("create pod")
+
+		pod := &v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Pod",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "log-stream-",
+				Namespace:    ns,
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:    "log-stream",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+						Command: []string{"/bin/sh"},
+						Args:    []string{"-c", "echo out1; echo err1 >&2; tail -f /dev/null"},
+					},
+				},
+				RestartPolicy: v1.RestartPolicyNever, // don't restart pod
+			},
+		}
+		rtnPod, err := c.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+
+		err = e2epod.WaitTimeoutForPodReadyInNamespace(ctx, f.ClientSet, rtnPod.Name, f.Namespace.Name, framework.PodStartTimeout) // running & ready
+		framework.ExpectNoError(err)
+
+		rtnPod, err = c.CoreV1().Pods(ns).Get(ctx, rtnPod.Name, metav1.GetOptions{}) // return fresh pod
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Starting the command")
+		tk := e2ekubectl.NewTestKubeconfig(framework.TestContext.CertDir, framework.TestContext.Host, framework.TestContext.KubeConfig, framework.TestContext.KubeContext, framework.TestContext.KubectlPath, ns)
+
+		queryCommand := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?stream=All", rtnPod.Namespace, rtnPod.Name)
+		cmd := tk.KubectlCmd("get", "--raw", queryCommand)
+		result := runKubectlCommand(cmd)
+		// the order of the logs is indeterminate
+		assertContains("out1", result)
+		assertContains("err1", result)
+
+		queryCommand = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?stream=Stdout", rtnPod.Namespace, rtnPod.Name)
+		cmd = tk.KubectlCmd("get", "--raw", queryCommand)
+		result = runKubectlCommand(cmd)
+		assertContains("out1", result)
+		assertNotContains("err1", result)
+
+		queryCommand = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?stream=Stderr", rtnPod.Namespace, rtnPod.Name)
+		cmd = tk.KubectlCmd("get", "--raw", queryCommand)
+		result = runKubectlCommand(cmd)
+		assertContains("err1", result)
+		assertNotContains("out1", result)
+	})
+})
+
+func getLinuxNodes(nodes *v1.NodeList) *v1.NodeList {
+	filteredNodes := nodes
+	e2enode.Filter(filteredNodes, func(node v1.Node) bool {
+		return isNode(&node, "linux")
+	})
+	return filteredNodes
+}
+
+func getWindowsNodes(nodes *v1.NodeList) *v1.NodeList {
+	filteredNodes := nodes
+	e2enode.Filter(filteredNodes, func(node v1.Node) bool {
+		return isNode(&node, "windows")
+	})
+	return filteredNodes
+}
+
+func isNode(node *v1.Node, os string) bool {
+	if node == nil {
+		return false
+	}
+	if foundOS, found := node.Labels[v1.LabelOSStable]; found {
+		return os == foundOS
+	}
+	return false
+}
+
+func runKubectlCommand(cmd *exec.Cmd) (result string) {
+	stdout, stderr, err := framework.StartCmdAndStreamOutput(cmd)
+	var buf bytes.Buffer
+	if err != nil {
+		framework.Failf("Failed to start kubectl command! Stderr: %v, error: %v", stderr, err)
+	}
+	defer stdout.Close()
+	defer stderr.Close()
+	defer framework.TryKill(cmd)
+
+	b_read, err := io.Copy(&buf, stdout)
+	if err != nil {
+		framework.Failf("Expected output from kubectl alpha node-logs %s: %v\n Stderr: %v", cmd.Args, err, stderr)
+	}
+	out := ""
+	if b_read >= 0 {
+		out = buf.String()
+	}
+
+	framework.Logf("Kubectl output: %s", out)
+	return out
+}
+
+func assertContains(expectedString string, result string) {
+	if strings.Contains(result, expectedString) {
+		return
+	}
+	framework.Failf("Failed to find \"%s\"", expectedString)
+}
+
+func assertNotContains(expectedString string, result string) {
+	if !strings.Contains(result, expectedString) {
+		return
+	}
+	framework.Failf("Found unexpected \"%s\"", expectedString)
+}
+
+func commandOnNode(nodeName string, cmd string) string {
+	result, err := e2essh.NodeExec(context.Background(), nodeName, cmd, framework.TestContext.Provider)
+	framework.ExpectNoError(err)
+	e2essh.LogResult(result)
+	return result.Stdout
+}
+
+func journalctlCommandOnNode(nodeName string, args string) string {
+	return commandOnNode(nodeName, "journalctl --utc --no-pager --output=short-precise "+args)
+}
+
+func getWinEventCommandOnNode(nodeName string, providerName, args string) string {
+	output := commandOnNode(nodeName, "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='"+providerName+"'}"+args+" | Sort-Object TimeCreated | Format-Table -AutoSize -Wrap")
+	return output
+}
+
+func trimSpaceNewlineInString(s string) string {
+	// Remove Windows newlines
+	re := regexp.MustCompile(` +\r?\n +`)
+	s = re.ReplaceAllString(s, "")
+	// Replace spaces to account for cases like "\r\n " that could lead to false negatives
+	return strings.ReplaceAll(s, " ", "")
+}
+
+func pidOfKubelet(ctx context.Context, hostExec utils.HostExec, node *v1.Node) int {
+	cmd := "pidof kubelet"
+	kubeletPid, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
+	framework.ExpectNoError(err, "Checking kubelet pid")
+	framework.Logf("pidof kubelet returns %s", kubeletPid)
+	// In rare cases in the CI, we are seeing two pids for kubelet.
+	// We did some investigating and the last entry of this list is the one that we want
+	// Higher pids are more likely to be created after the first one
+	kubeletPids := strings.Split(strings.TrimSuffix(kubeletPid, "\n"), " ")
+	kubeletPidChosen := kubeletPids[len(kubeletPids)-1]
+	pid, err := strconv.Atoi(kubeletPidChosen)
+	framework.ExpectNoError(err, "Converting kubelet pid to int")
+	return pid
+}

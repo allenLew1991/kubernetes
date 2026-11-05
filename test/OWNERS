@@ -1,53 +1,62 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+options:
+  # make root approval non-recursive
+  no_parent_owners: true
 reviewers:
-  - bowei
-  - deads2k
-  - enisoc
-  - enj # for test/integration/etcd/etcd_storage_path_test.go
-  - erictune
-  - foxish # for test/e2e/network-partition.go
-  - gmarek
-  - janetkuo
-  - kow3ns # for test/e2e/statefulset.go
-  - krousey
+  - aojea
+  - dchen1107
+  - johnSchnake
   - liggitt
-  - madhusudancs
-  - marun
-  - mikedanese
-  - ncdc
-  - pwittrock # for test/e2e/kubectl.go
-  - saad-ali
-  - shyamjvs
-  - smarterclayton
-  - soltysh
-  - sig-testing-reviewers
-  - sttts
-  - timothysc
-  - zmerlynn
-  - vishh
+  - SataQiu
+  - thockin
+  - wojtek-t
 approvers:
+  - andrewsykim
+  - aojea
+  - BenTheElder
   - bowei # for test/e2e/{dns*,network}.go
+  - caseydavenport # for test/e2e/{dns*,network}.go
+  - cblecker
+  - dchen1107
   - deads2k
-  - enisoc
-  - enj # for test/integration/etcd/etcd_storage_path_test.go
-  - eparis
-  - erictune
-  - foxish # for test/e2e/network-partition.go
-  - gmarek
+  - dims
+  - enj
   - janetkuo
-  - kow3ns # for test/e2e/statefulset.go
-  - krousey
   - liggitt
-  - madhusudancs
-  - marun
-  - mikedanese
-  - ncdc
+  - MrHohn
+  - msau42
+  - oomichi
+  - pohly
   - pwittrock # for test/e2e/kubectl.go
   - saad-ali
-  - shyamjvs
-  - sig-testing-approvers
-  - smarterclayton
+  - SataQiu
   - soltysh
   - sttts
-  - timothysc
+  - thockin
+  - wojtek-t
+emeritus_approvers:
+  - eparis
+  - foxish
+  - gmarek
+  - ixdy
+  - krousey
+  - krzyzacy
+  - kow3ns
+  - lavalamp
+  - madhusudancs
+  - marun
   - zmerlynn
-  - vishh 
+  - MaciekPytel
+  - rramkumar1
+  - ncdc
+  - vishh
+  - shyamjvs
+  - spiffxp
+  - enisoc
+  - alejandrox1
+  - timothysc
+  - neolit123
+labels:
+  - area/test
+  - sig/testing

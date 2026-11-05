@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Package runes provide transforms for UTF-8 encoded text.
-package runes
+package runes // import "golang.org/x/text/runes"
 
 import (
 	"unicode"
@@ -33,7 +33,7 @@ func In(rt *unicode.RangeTable) Set {
 	return setFunc(func(r rune) bool { return unicode.Is(rt, r) })
 }
 
-// In creates a Set with a Contains method that returns true for all runes not
+// NotIn creates a Set with a Contains method that returns true for all runes not
 // in the given RangeTable.
 func NotIn(rt *unicode.RangeTable) Set {
 	return setFunc(func(r rune) bool { return !unicode.Is(rt, r) })

@@ -19,22 +19,74 @@ package helper
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/kubernetes/pkg/apis/core"
 )
+
+// IsPodLevelResourcesSet check if PodLevelResources pod-level resources are set.
+// It returns true if either the Requests or Limits maps are non-empty.
+// Note: keep this in sync with k8s.io/component-helpers/resource.IsPodLevelResourcesSet
+func IsPodLevelResourcesSet(pod *core.Pod) bool {
+	if pod.Spec.Resources == nil {
+		return false
+	}
+
+	if (len(pod.Spec.Resources.Requests) + len(pod.Spec.Resources.Limits)) == 0 {
+		return false
+	}
+
+	for name := range pod.Spec.Resources.Requests {
+		if resourcehelper.IsSupportedPodLevelResource(v1.ResourceName(name)) {
+			return true
+		}
+	}
+
+	for name := range pod.Spec.Resources.Limits {
+		if resourcehelper.IsSupportedPodLevelResource(v1.ResourceName(name)) {
+			return true
+		}
+	}
+
+	return false
+}
 
 // IsHugePageResourceName returns true if the resource name has the huge page
 // resource prefix.
 func IsHugePageResourceName(name core.ResourceName) bool {
 	return strings.HasPrefix(string(name), core.ResourceHugePagesPrefix)
+}
+
+// IsHugePageResourceValueDivisible returns true if the resource value of storage is
+// integer multiple of page size. A value outside the int64 range is not.
+func IsHugePageResourceValueDivisible(name core.ResourceName, quantity resource.Quantity) bool {
+	pageSize, err := HugePageSizeFromResourceName(name)
+	if err != nil {
+		return false
+	}
+
+	milli, ok := pageSize.AsMilliInt64()
+	if pageSize.Sign() <= 0 || !ok || milli%1000 != 0 {
+		return false
+	}
+	// milli is a positive multiple of 1000, so this is the page size in whole bytes.
+	size := milli / 1000
+
+	value, ok := quantity.AsScaledInt64(0)
+	if !ok {
+		return false
+	}
+	return value%size == 0
 }
 
 // IsQuotaHugePageResourceName returns true if the resource name has the quota
@@ -55,7 +107,7 @@ func HugePageResourceName(pageSize resource.Quantity) core.ResourceName {
 // an error is returned.
 func HugePageSizeFromResourceName(name core.ResourceName) (resource.Quantity, error) {
 	if !IsHugePageResourceName(name) {
-		return resource.Quantity{}, fmt.Errorf("resource name: %s is not valid hugepage name", name)
+		return resource.Quantity{}, fmt.Errorf("resource name: %s is an invalid hugepage name", name)
 	}
 	pageSize := strings.TrimPrefix(string(name), core.ResourceHugePagesPrefix)
 	return resource.ParseQuantity(pageSize)
@@ -89,6 +141,9 @@ var Semantic = conversion.EqualitiesOrDie(
 	func(a, b metav1.Time) bool {
 		return a.UTC() == b.UTC()
 	},
+	func(a, b metav1.FieldsV1) bool {
+		return a.Equal(b)
+	},
 	func(a, b labels.Selector) bool {
 		return a.String() == b.String()
 	},
@@ -97,251 +152,231 @@ var Semantic = conversion.EqualitiesOrDie(
 	},
 )
 
-var standardResourceQuotaScopes = sets.NewString(
-	string(core.ResourceQuotaScopeTerminating),
-	string(core.ResourceQuotaScopeNotTerminating),
-	string(core.ResourceQuotaScopeBestEffort),
-	string(core.ResourceQuotaScopeNotBestEffort),
+var standardResourceQuotaScopes = sets.New(
+	core.ResourceQuotaScopeTerminating,
+	core.ResourceQuotaScopeNotTerminating,
+	core.ResourceQuotaScopeBestEffort,
+	core.ResourceQuotaScopeNotBestEffort,
+	core.ResourceQuotaScopePriorityClass,
+	core.ResourceQuotaScopeVolumeAttributesClass,
 )
 
 // IsStandardResourceQuotaScope returns true if the scope is a standard value
-func IsStandardResourceQuotaScope(str string) bool {
-	return standardResourceQuotaScopes.Has(str)
+func IsStandardResourceQuotaScope(scope core.ResourceQuotaScope) bool {
+	return standardResourceQuotaScopes.Has(scope) || scope == core.ResourceQuotaScopeCrossNamespacePodAffinity
 }
 
-var podObjectCountQuotaResources = sets.NewString(
-	string(core.ResourcePods),
+var podObjectCountQuotaResources = sets.New(
+	core.ResourcePods,
 )
 
-var podComputeQuotaResources = sets.NewString(
-	string(core.ResourceCPU),
-	string(core.ResourceMemory),
-	string(core.ResourceLimitsCPU),
-	string(core.ResourceLimitsMemory),
-	string(core.ResourceRequestsCPU),
-	string(core.ResourceRequestsMemory),
+var podComputeQuotaResources = sets.New(
+	core.ResourceCPU,
+	core.ResourceMemory,
+	core.ResourceLimitsCPU,
+	core.ResourceLimitsMemory,
+	core.ResourceRequestsCPU,
+	core.ResourceRequestsMemory,
+)
+
+var pvcObjectCountQuotaResources = sets.New(
+	core.ResourcePersistentVolumeClaims,
+)
+
+var pvcStorageQuotaResources = sets.New(
+	core.ResourceRequestsStorage,
 )
 
 // IsResourceQuotaScopeValidForResource returns true if the resource applies to the specified scope
-func IsResourceQuotaScopeValidForResource(scope core.ResourceQuotaScope, resource string) bool {
+func IsResourceQuotaScopeValidForResource(scope core.ResourceQuotaScope, resource core.ResourceName) bool {
 	switch scope {
-	case core.ResourceQuotaScopeTerminating, core.ResourceQuotaScopeNotTerminating, core.ResourceQuotaScopeNotBestEffort:
+	case core.ResourceQuotaScopeTerminating, core.ResourceQuotaScopeNotTerminating, core.ResourceQuotaScopeNotBestEffort,
+		core.ResourceQuotaScopePriorityClass, core.ResourceQuotaScopeCrossNamespacePodAffinity:
 		return podObjectCountQuotaResources.Has(resource) || podComputeQuotaResources.Has(resource)
 	case core.ResourceQuotaScopeBestEffort:
 		return podObjectCountQuotaResources.Has(resource)
+	case core.ResourceQuotaScopeVolumeAttributesClass:
+		return pvcObjectCountQuotaResources.Has(resource) || pvcStorageQuotaResources.Has(resource)
 	default:
 		return true
 	}
 }
 
-var standardContainerResources = sets.NewString(
-	string(core.ResourceCPU),
-	string(core.ResourceMemory),
-	string(core.ResourceEphemeralStorage),
+var standardContainerResources = sets.New(
+	core.ResourceCPU,
+	core.ResourceMemory,
+	core.ResourceEphemeralStorage,
 )
 
 // IsStandardContainerResourceName returns true if the container can make a resource request
 // for the specified resource
-func IsStandardContainerResourceName(str string) bool {
-	return standardContainerResources.Has(str) || IsHugePageResourceName(core.ResourceName(str))
+func IsStandardContainerResourceName(name core.ResourceName) bool {
+	return standardContainerResources.Has(name) || IsHugePageResourceName(name)
 }
 
-// IsExtendedResourceName returns true if the resource name is not in the
-// default namespace.
+// IsNodeAllocatableResourceName returns true if the resource name is valid for DRA NodeAllocatableResources.
+// Currently, only cpu, memory, and hugepages are supported (excluding ephemeral-storage for alpha).
+func IsNodeAllocatableResourceName(name core.ResourceName) bool {
+	return name == core.ResourceCPU || name == core.ResourceMemory || IsHugePageResourceName(name)
+}
+
+// IsExtendedResourceName returns true if:
+// 1. the resource name is not in the default namespace;
+// 2. resource name does not have "requests." prefix,
+// to avoid confusion with the convention in quota
+// 3. it satisfies the rules in IsQualifiedName() after converted into quota resource name
 func IsExtendedResourceName(name core.ResourceName) bool {
-	return !IsDefaultNamespaceResource(name)
+	if IsNativeResource(name) || strings.HasPrefix(string(name), core.DefaultResourceRequestsPrefix) {
+		return false
+	}
+	// Ensure it satisfies the rules in IsQualifiedName() after converted into quota resource name
+	nameForQuota := fmt.Sprintf("%s%s", core.DefaultResourceRequestsPrefix, string(name))
+	if errs := validation.IsQualifiedName(nameForQuota); len(errs) != 0 {
+		return false
+	}
+	return true
 }
 
-// IsDefaultNamespaceResource returns true if the resource name is in the
+// IsNativeResource returns true if the resource name is in the
 // *kubernetes.io/ namespace. Partially-qualified (unprefixed) names are
 // implicitly in the kubernetes.io/ namespace.
-func IsDefaultNamespaceResource(name core.ResourceName) bool {
+func IsNativeResource(name core.ResourceName) bool {
 	return !strings.Contains(string(name), "/") ||
 		strings.Contains(string(name), core.ResourceDefaultNamespacePrefix)
 }
 
-var overcommitBlacklist = sets.NewString(string(core.ResourceNvidiaGPU))
-
 // IsOvercommitAllowed returns true if the resource is in the default
-// namespace and not blacklisted.
+// namespace and is not hugepages.
 func IsOvercommitAllowed(name core.ResourceName) bool {
-	return IsDefaultNamespaceResource(name) &&
-		!IsHugePageResourceName(name) &&
-		!overcommitBlacklist.Has(string(name))
+	return IsNativeResource(name) &&
+		!IsHugePageResourceName(name)
 }
 
-var standardLimitRangeTypes = sets.NewString(
-	string(core.LimitTypePod),
-	string(core.LimitTypeContainer),
-	string(core.LimitTypePersistentVolumeClaim),
+var standardLimitRangeTypes = sets.New(
+	core.LimitTypePod,
+	core.LimitTypeContainer,
+	core.LimitTypePersistentVolumeClaim,
 )
 
 // IsStandardLimitRangeType returns true if the type is Pod or Container
-func IsStandardLimitRangeType(str string) bool {
-	return standardLimitRangeTypes.Has(str)
+func IsStandardLimitRangeType(value core.LimitType) bool {
+	return standardLimitRangeTypes.Has(value)
 }
 
-var standardQuotaResources = sets.NewString(
-	string(core.ResourceCPU),
-	string(core.ResourceMemory),
-	string(core.ResourceEphemeralStorage),
-	string(core.ResourceRequestsCPU),
-	string(core.ResourceRequestsMemory),
-	string(core.ResourceRequestsStorage),
-	string(core.ResourceRequestsEphemeralStorage),
-	string(core.ResourceLimitsCPU),
-	string(core.ResourceLimitsMemory),
-	string(core.ResourceLimitsEphemeralStorage),
-	string(core.ResourcePods),
-	string(core.ResourceQuotas),
-	string(core.ResourceServices),
-	string(core.ResourceReplicationControllers),
-	string(core.ResourceSecrets),
-	string(core.ResourcePersistentVolumeClaims),
-	string(core.ResourceConfigMaps),
-	string(core.ResourceServicesNodePorts),
-	string(core.ResourceServicesLoadBalancers),
+var standardQuotaResources = sets.New(
+	core.ResourceCPU,
+	core.ResourceMemory,
+	core.ResourceEphemeralStorage,
+	core.ResourceRequestsCPU,
+	core.ResourceRequestsMemory,
+	core.ResourceRequestsStorage,
+	core.ResourceRequestsEphemeralStorage,
+	core.ResourceLimitsCPU,
+	core.ResourceLimitsMemory,
+	core.ResourceLimitsEphemeralStorage,
+	core.ResourcePods,
+	core.ResourceQuotas,
+	core.ResourceServices,
+	core.ResourceReplicationControllers,
+	core.ResourceSecrets,
+	core.ResourcePersistentVolumeClaims,
+	core.ResourceConfigMaps,
+	core.ResourceServicesNodePorts,
+	core.ResourceServicesLoadBalancers,
 )
 
 // IsStandardQuotaResourceName returns true if the resource is known to
 // the quota tracking system
-func IsStandardQuotaResourceName(str string) bool {
-	return standardQuotaResources.Has(str) || IsQuotaHugePageResourceName(core.ResourceName(str))
+func IsStandardQuotaResourceName(name core.ResourceName) bool {
+	return standardQuotaResources.Has(name) || IsQuotaHugePageResourceName(name)
 }
 
-var standardResources = sets.NewString(
-	string(core.ResourceCPU),
-	string(core.ResourceMemory),
-	string(core.ResourceEphemeralStorage),
-	string(core.ResourceRequestsCPU),
-	string(core.ResourceRequestsMemory),
-	string(core.ResourceRequestsEphemeralStorage),
-	string(core.ResourceLimitsCPU),
-	string(core.ResourceLimitsMemory),
-	string(core.ResourceLimitsEphemeralStorage),
-	string(core.ResourcePods),
-	string(core.ResourceQuotas),
-	string(core.ResourceServices),
-	string(core.ResourceReplicationControllers),
-	string(core.ResourceSecrets),
-	string(core.ResourceConfigMaps),
-	string(core.ResourcePersistentVolumeClaims),
-	string(core.ResourceStorage),
-	string(core.ResourceRequestsStorage),
-	string(core.ResourceServicesNodePorts),
-	string(core.ResourceServicesLoadBalancers),
+var standardResources = sets.New(
+	core.ResourceCPU,
+	core.ResourceMemory,
+	core.ResourceEphemeralStorage,
+	core.ResourceRequestsCPU,
+	core.ResourceRequestsMemory,
+	core.ResourceRequestsEphemeralStorage,
+	core.ResourceLimitsCPU,
+	core.ResourceLimitsMemory,
+	core.ResourceLimitsEphemeralStorage,
+	core.ResourcePods,
+	core.ResourceQuotas,
+	core.ResourceServices,
+	core.ResourceReplicationControllers,
+	core.ResourceSecrets,
+	core.ResourceConfigMaps,
+	core.ResourcePersistentVolumeClaims,
+	core.ResourceStorage,
+	core.ResourceRequestsStorage,
+	core.ResourceServicesNodePorts,
+	core.ResourceServicesLoadBalancers,
 )
 
 // IsStandardResourceName returns true if the resource is known to the system
-func IsStandardResourceName(str string) bool {
-	return standardResources.Has(str) || IsQuotaHugePageResourceName(core.ResourceName(str))
+func IsStandardResourceName(name core.ResourceName) bool {
+	return standardResources.Has(name) || IsQuotaHugePageResourceName(name)
 }
 
-var integerResources = sets.NewString(
-	string(core.ResourcePods),
-	string(core.ResourceQuotas),
-	string(core.ResourceServices),
-	string(core.ResourceReplicationControllers),
-	string(core.ResourceSecrets),
-	string(core.ResourceConfigMaps),
-	string(core.ResourcePersistentVolumeClaims),
-	string(core.ResourceServicesNodePorts),
-	string(core.ResourceServicesLoadBalancers),
+var integerResources = sets.New(
+	core.ResourcePods,
+	core.ResourceQuotas,
+	core.ResourceServices,
+	core.ResourceReplicationControllers,
+	core.ResourceSecrets,
+	core.ResourceConfigMaps,
+	core.ResourcePersistentVolumeClaims,
+	core.ResourceServicesNodePorts,
+	core.ResourceServicesLoadBalancers,
 )
 
 // IsIntegerResourceName returns true if the resource is measured in integer values
-func IsIntegerResourceName(str string) bool {
-	return integerResources.Has(str) || IsExtendedResourceName(core.ResourceName(str))
+func IsIntegerResourceName(name core.ResourceName) bool {
+	return integerResources.Has(name) || IsExtendedResourceName(name)
 }
 
-// this function aims to check if the service's ClusterIP is set or not
+// IsServiceIPSet aims to check if the service's ClusterIP is set or not
 // the objective is not to perform validation here
 func IsServiceIPSet(service *core.Service) bool {
-	return service.Spec.ClusterIP != core.ClusterIPNone && service.Spec.ClusterIP != ""
+	// This function assumes that the service is semantically validated
+	// it does not test if the IP is valid, just makes sure that it is set.
+	return len(service.Spec.ClusterIP) > 0 &&
+		service.Spec.ClusterIP != core.ClusterIPNone
 }
 
-var standardFinalizers = sets.NewString(
+var standardFinalizers = sets.New(
 	string(core.FinalizerKubernetes),
 	metav1.FinalizerOrphanDependents,
 	metav1.FinalizerDeleteDependents,
 )
 
+// IsStandardFinalizerName checks if the input string is a standard finalizer name
 func IsStandardFinalizerName(str string) bool {
 	return standardFinalizers.Has(str)
 }
 
-// AddToNodeAddresses appends the NodeAddresses to the passed-by-pointer slice,
-// only if they do not already exist
-func AddToNodeAddresses(addresses *[]core.NodeAddress, addAddresses ...core.NodeAddress) {
-	for _, add := range addAddresses {
-		exists := false
-		for _, existing := range *addresses {
-			if existing.Address == add.Address && existing.Type == add.Type {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			*addresses = append(*addresses, add)
-		}
-	}
-}
-
-// TODO: make method on LoadBalancerStatus?
-func LoadBalancerStatusEqual(l, r *core.LoadBalancerStatus) bool {
-	return ingressSliceEqual(l.Ingress, r.Ingress)
-}
-
-func ingressSliceEqual(lhs, rhs []core.LoadBalancerIngress) bool {
-	if len(lhs) != len(rhs) {
-		return false
-	}
-	for i := range lhs {
-		if !ingressEqual(&lhs[i], &rhs[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func ingressEqual(lhs, rhs *core.LoadBalancerIngress) bool {
-	if lhs.IP != rhs.IP {
-		return false
-	}
-	if lhs.Hostname != rhs.Hostname {
-		return false
-	}
-	return true
-}
-
-// TODO: make method on LoadBalancerStatus?
-func LoadBalancerStatusDeepCopy(lb *core.LoadBalancerStatus) *core.LoadBalancerStatus {
-	c := &core.LoadBalancerStatus{}
-	c.Ingress = make([]core.LoadBalancerIngress, len(lb.Ingress))
-	for i := range lb.Ingress {
-		c.Ingress[i] = lb.Ingress[i]
-	}
-	return c
-}
-
 // GetAccessModesAsString returns a string representation of an array of access modes.
-// modes, when present, are always in the same order: RWO,ROX,RWX.
+// modes, when present, are always in the same order: RWO,ROX,RWX,RWOP.
 func GetAccessModesAsString(modes []core.PersistentVolumeAccessMode) string {
 	modes = removeDuplicateAccessModes(modes)
 	modesStr := []string{}
-	if containsAccessMode(modes, core.ReadWriteOnce) {
+	if ContainsAccessMode(modes, core.ReadWriteOnce) {
 		modesStr = append(modesStr, "RWO")
 	}
-	if containsAccessMode(modes, core.ReadOnlyMany) {
+	if ContainsAccessMode(modes, core.ReadOnlyMany) {
 		modesStr = append(modesStr, "ROX")
 	}
-	if containsAccessMode(modes, core.ReadWriteMany) {
+	if ContainsAccessMode(modes, core.ReadWriteMany) {
 		modesStr = append(modesStr, "RWX")
+	}
+	if ContainsAccessMode(modes, core.ReadWriteOncePod) {
+		modesStr = append(modesStr, "RWOP")
 	}
 	return strings.Join(modesStr, ",")
 }
 
-// GetAccessModesAsString returns an array of AccessModes from a string created by GetAccessModesAsString
+// GetAccessModesFromString returns an array of AccessModes from a string created by GetAccessModesAsString
 func GetAccessModesFromString(modes string) []core.PersistentVolumeAccessMode {
 	strmodes := strings.Split(modes, ",")
 	accessModes := []core.PersistentVolumeAccessMode{}
@@ -354,6 +389,8 @@ func GetAccessModesFromString(modes string) []core.PersistentVolumeAccessMode {
 			accessModes = append(accessModes, core.ReadOnlyMany)
 		case s == "RWX":
 			accessModes = append(accessModes, core.ReadWriteMany)
+		case s == "RWOP":
+			accessModes = append(accessModes, core.ReadWriteOncePod)
 		}
 	}
 	return accessModes
@@ -363,14 +400,14 @@ func GetAccessModesFromString(modes string) []core.PersistentVolumeAccessMode {
 func removeDuplicateAccessModes(modes []core.PersistentVolumeAccessMode) []core.PersistentVolumeAccessMode {
 	accessModes := []core.PersistentVolumeAccessMode{}
 	for _, m := range modes {
-		if !containsAccessMode(accessModes, m) {
+		if !ContainsAccessMode(accessModes, m) {
 			accessModes = append(accessModes, m)
 		}
 	}
 	return accessModes
 }
 
-func containsAccessMode(modes []core.PersistentVolumeAccessMode, mode core.PersistentVolumeAccessMode) bool {
+func ContainsAccessMode(modes []core.PersistentVolumeAccessMode, mode core.PersistentVolumeAccessMode) bool {
 	for _, m := range modes {
 		if m == mode {
 			return true
@@ -379,38 +416,26 @@ func containsAccessMode(modes []core.PersistentVolumeAccessMode, mode core.Persi
 	return false
 }
 
-// NodeSelectorRequirementsAsSelector converts the []NodeSelectorRequirement core type into a struct that implements
-// labels.Selector.
-func NodeSelectorRequirementsAsSelector(nsm []core.NodeSelectorRequirement) (labels.Selector, error) {
-	if len(nsm) == 0 {
-		return labels.Nothing(), nil
+func ClaimContainsAllocatedResources(pvc *core.PersistentVolumeClaim) bool {
+	if pvc == nil {
+		return false
 	}
-	selector := labels.NewSelector()
-	for _, expr := range nsm {
-		var op selection.Operator
-		switch expr.Operator {
-		case core.NodeSelectorOpIn:
-			op = selection.In
-		case core.NodeSelectorOpNotIn:
-			op = selection.NotIn
-		case core.NodeSelectorOpExists:
-			op = selection.Exists
-		case core.NodeSelectorOpDoesNotExist:
-			op = selection.DoesNotExist
-		case core.NodeSelectorOpGt:
-			op = selection.GreaterThan
-		case core.NodeSelectorOpLt:
-			op = selection.LessThan
-		default:
-			return nil, fmt.Errorf("%q is not a valid node selector operator", expr.Operator)
-		}
-		r, err := labels.NewRequirement(expr.Key, op, expr.Values)
-		if err != nil {
-			return nil, err
-		}
-		selector = selector.Add(*r)
+
+	if pvc.Status.AllocatedResources != nil {
+		return true
 	}
-	return selector, nil
+	return false
+}
+
+func ClaimContainsAllocatedResourceStatus(pvc *core.PersistentVolumeClaim) bool {
+	if pvc == nil {
+		return false
+	}
+
+	if pvc.Status.AllocatedResourceStatuses != nil {
+		return true
+	}
+	return false
 }
 
 // GetTolerationsFromPodAnnotations gets the json serialized tolerations data from Pod.Annotations
@@ -467,54 +492,6 @@ func GetTaintsFromNodeAnnotations(annotations map[string]string) ([]core.Taint, 
 	return taints, nil
 }
 
-// SysctlsFromPodAnnotations parses the sysctl annotations into a slice of safe Sysctls
-// and a slice of unsafe Sysctls. This is only a convenience wrapper around
-// SysctlsFromPodAnnotation.
-func SysctlsFromPodAnnotations(a map[string]string) ([]core.Sysctl, []core.Sysctl, error) {
-	safe, err := SysctlsFromPodAnnotation(a[core.SysctlsPodAnnotationKey])
-	if err != nil {
-		return nil, nil, err
-	}
-	unsafe, err := SysctlsFromPodAnnotation(a[core.UnsafeSysctlsPodAnnotationKey])
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return safe, unsafe, nil
-}
-
-// SysctlsFromPodAnnotation parses an annotation value into a slice of Sysctls.
-func SysctlsFromPodAnnotation(annotation string) ([]core.Sysctl, error) {
-	if len(annotation) == 0 {
-		return nil, nil
-	}
-
-	kvs := strings.Split(annotation, ",")
-	sysctls := make([]core.Sysctl, len(kvs))
-	for i, kv := range kvs {
-		cs := strings.Split(kv, "=")
-		if len(cs) != 2 || len(cs[0]) == 0 {
-			return nil, fmt.Errorf("sysctl %q not of the format sysctl_name=value", kv)
-		}
-		sysctls[i].Name = cs[0]
-		sysctls[i].Value = cs[1]
-	}
-	return sysctls, nil
-}
-
-// PodAnnotationsFromSysctls creates an annotation value for a slice of Sysctls.
-func PodAnnotationsFromSysctls(sysctls []core.Sysctl) string {
-	if len(sysctls) == 0 {
-		return ""
-	}
-
-	kvs := make([]string, len(sysctls))
-	for i := range sysctls {
-		kvs[i] = fmt.Sprintf("%s=%s", sysctls[i].Name, sysctls[i].Value)
-	}
-	return strings.Join(kvs, ",")
-}
-
 // GetPersistentVolumeClass returns StorageClassName.
 func GetPersistentVolumeClass(volume *core.PersistentVolume) string {
 	// Use beta annotation first
@@ -554,32 +531,43 @@ func PersistentVolumeClaimHasClass(claim *core.PersistentVolumeClaim) bool {
 	return false
 }
 
-// GetStorageNodeAffinityFromAnnotation gets the json serialized data from PersistentVolume.Annotations
-// and converts it to the NodeAffinity type in core.
-// TODO: update when storage node affinity graduates to beta
-func GetStorageNodeAffinityFromAnnotation(annotations map[string]string) (*core.NodeAffinity, error) {
-	if len(annotations) > 0 && annotations[core.AlphaStorageNodeAffinityAnnotation] != "" {
-		var affinity core.NodeAffinity
-		err := json.Unmarshal([]byte(annotations[core.AlphaStorageNodeAffinityAnnotation]), &affinity)
-		if err != nil {
-			return nil, err
+// GetDeletionCostFromPodAnnotations returns the integer value of pod-deletion-cost. Returns 0
+// if not set or the value is invalid.
+func GetDeletionCostFromPodAnnotations(annotations map[string]string) (int32, error) {
+	if value, exist := annotations[core.PodDeletionCost]; exist {
+		// values that start with plus sign (e.g, "+10") or leading zeros (e.g., "008") are not valid.
+		if !validFirstDigit(value) {
+			return 0, fmt.Errorf("invalid value %q", value)
 		}
-		return &affinity, nil
+
+		i, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			// make sure we default to 0 on error.
+			return 0, err
+		}
+		return int32(i), nil
 	}
-	return nil, nil
+	return 0, nil
 }
 
-// Converts NodeAffinity type to Alpha annotation for use in PersistentVolumes
-// TODO: update when storage node affinity graduates to beta
-func StorageNodeAffinityToAlphaAnnotation(annotations map[string]string, affinity *core.NodeAffinity) error {
-	if affinity == nil {
-		return nil
+func validFirstDigit(str string) bool {
+	if len(str) == 0 {
+		return false
 	}
+	return str[0] == '-' || (str[0] == '0' && str == "0") || (str[0] >= '1' && str[0] <= '9')
+}
 
-	json, err := json.Marshal(*affinity)
-	if err != nil {
-		return err
+// HasInvalidLabelValueInNodeSelectorTerms checks if there's an invalid label value
+// in one NodeSelectorTerm's MatchExpression values
+func HasInvalidLabelValueInNodeSelectorTerms(terms []core.NodeSelectorTerm) bool {
+	for _, term := range terms {
+		for _, expression := range term.MatchExpressions {
+			for _, value := range expression.Values {
+				if len(validation.IsValidLabelValue(value)) > 0 {
+					return true
+				}
+			}
+		}
 	}
-	annotations[core.AlphaStorageNodeAffinityAnnotation] = string(json)
-	return nil
+	return false
 }

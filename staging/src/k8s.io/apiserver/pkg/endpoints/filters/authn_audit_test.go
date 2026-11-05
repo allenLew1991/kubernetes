@@ -26,18 +26,21 @@ import (
 
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/audit/policy"
+	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 func TestFailedAuthnAudit(t *testing.T) {
+	ctx := t.Context()
 	sink := &fakeAuditSink{}
-	policyChecker := policy.FakeChecker(auditinternal.LevelRequestResponse, nil)
+	fakeRuleEvaluator := policy.NewFakePolicyRuleEvaluator(auditinternal.LevelRequestResponse, nil)
 	handler := WithFailedAuthenticationAudit(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "", http.StatusUnauthorized)
 		}),
-		&fakeRequestContextMapper{}, sink, policyChecker)
-	req, _ := http.NewRequest("GET", "/api/v1/namespaces/default/pods", nil)
+		sink, fakeRuleEvaluator)
+	req, _ := http.NewRequestWithContext(ctx, request.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	req.RemoteAddr = "127.0.0.1"
+	req = withTestContext(req, nil, nil)
 	req.SetBasicAuth("username", "password")
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -60,15 +63,17 @@ func TestFailedAuthnAudit(t *testing.T) {
 }
 
 func TestFailedMultipleAuthnAudit(t *testing.T) {
+	ctx := t.Context()
 	sink := &fakeAuditSink{}
-	policyChecker := policy.FakeChecker(auditinternal.LevelRequestResponse, nil)
+	fakeRuleEvaluator := policy.NewFakePolicyRuleEvaluator(auditinternal.LevelRequestResponse, nil)
 	handler := WithFailedAuthenticationAudit(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "", http.StatusUnauthorized)
 		}),
-		&fakeRequestContextMapper{}, sink, policyChecker)
-	req, _ := http.NewRequest("GET", "/api/v1/namespaces/default/pods", nil)
+		sink, fakeRuleEvaluator)
+	req, _ := http.NewRequestWithContext(ctx, request.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	req.RemoteAddr = "127.0.0.1"
+	req = withTestContext(req, nil, nil)
 	req.SetBasicAuth("username", "password")
 	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}}
 	handler.ServeHTTP(httptest.NewRecorder(), req)
@@ -92,15 +97,17 @@ func TestFailedMultipleAuthnAudit(t *testing.T) {
 }
 
 func TestFailedAuthnAuditWithoutAuthorization(t *testing.T) {
+	ctx := t.Context()
 	sink := &fakeAuditSink{}
-	policyChecker := policy.FakeChecker(auditinternal.LevelRequestResponse, nil)
+	fakeRuleEvaluator := policy.NewFakePolicyRuleEvaluator(auditinternal.LevelRequestResponse, nil)
 	handler := WithFailedAuthenticationAudit(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "", http.StatusUnauthorized)
 		}),
-		&fakeRequestContextMapper{}, sink, policyChecker)
-	req, _ := http.NewRequest("GET", "/api/v1/namespaces/default/pods", nil)
+		sink, fakeRuleEvaluator)
+	req, _ := http.NewRequestWithContext(ctx, request.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	req.RemoteAddr = "127.0.0.1"
+	req = withTestContext(req, nil, nil)
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
 	if len(sink.events) != 1 {
@@ -122,15 +129,17 @@ func TestFailedAuthnAuditWithoutAuthorization(t *testing.T) {
 }
 
 func TestFailedAuthnAuditOmitted(t *testing.T) {
+	ctx := t.Context()
 	sink := &fakeAuditSink{}
-	policyChecker := policy.FakeChecker(auditinternal.LevelRequestResponse, []auditinternal.Stage{auditinternal.StageResponseStarted})
+	fakeRuleEvaluator := policy.NewFakePolicyRuleEvaluator(auditinternal.LevelRequestResponse, []auditinternal.Stage{auditinternal.StageResponseStarted})
 	handler := WithFailedAuthenticationAudit(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "", http.StatusUnauthorized)
 		}),
-		&fakeRequestContextMapper{}, sink, policyChecker)
-	req, _ := http.NewRequest("GET", "/api/v1/namespaces/default/pods", nil)
+		sink, fakeRuleEvaluator)
+	req, _ := http.NewRequestWithContext(ctx, request.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	req.RemoteAddr = "127.0.0.1"
+	req = withTestContext(req, nil, nil)
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
 	if len(sink.events) != 0 {

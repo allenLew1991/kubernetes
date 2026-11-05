@@ -19,9 +19,12 @@ package fc
 import (
 	"os"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/util/mount"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 // Abstract interface to disk operations.
@@ -37,19 +40,19 @@ type diskManager interface {
 }
 
 // utility to mount a disk based filesystem
-func diskSetUp(manager diskManager, b fcDiskMounter, volPath string, mounter mount.Interface, fsGroup *int64) error {
+func diskSetUp(manager diskManager, b fcDiskMounter, volPath string, mounter mount.Interface, fsGroup *int64, fsGroupChangePolicy *v1.PodFSGroupChangePolicy) error {
 	globalPDPath := manager.MakeGlobalPDName(*b.fcDisk)
 	noMnt, err := mounter.IsLikelyNotMountPoint(volPath)
 
 	if err != nil && !os.IsNotExist(err) {
-		glog.Errorf("cannot validate mountpoint: %s", volPath)
+		klog.Errorf("cannot validate mountpoint: %s", volPath)
 		return err
 	}
 	if !noMnt {
 		return nil
 	}
 	if err := os.MkdirAll(volPath, 0750); err != nil {
-		glog.Errorf("failed to mkdir:%s", volPath)
+		klog.Errorf("failed to mkdir:%s", volPath)
 		return err
 	}
 	// Perform a bind mount to the full path to allow duplicate mounts of the same disk.
@@ -57,27 +60,28 @@ func diskSetUp(manager diskManager, b fcDiskMounter, volPath string, mounter mou
 	if b.readOnly {
 		options = append(options, "ro")
 	}
-	err = mounter.Mount(globalPDPath, volPath, "", options)
+	mountOptions := util.JoinMountOptions(options, b.mountOptions)
+	err = mounter.MountSensitiveWithoutSystemd(globalPDPath, volPath, "", mountOptions, nil)
 	if err != nil {
-		glog.Errorf("Failed to bind mount: source:%s, target:%s, err:%v", globalPDPath, volPath, err)
+		klog.Errorf("Failed to bind mount: source:%s, target:%s, err:%v", globalPDPath, volPath, err)
 		noMnt, mntErr := b.mounter.IsLikelyNotMountPoint(volPath)
 		if mntErr != nil {
-			glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
+			klog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
 			return err
 		}
 		if !noMnt {
 			if mntErr = b.mounter.Unmount(volPath); mntErr != nil {
-				glog.Errorf("Failed to unmount: %v", mntErr)
+				klog.Errorf("Failed to unmount: %v", mntErr)
 				return err
 			}
 			noMnt, mntErr = b.mounter.IsLikelyNotMountPoint(volPath)
 			if mntErr != nil {
-				glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
+				klog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
 				return err
 			}
 			if !noMnt {
 				//  will most likely retry on next sync loop.
-				glog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", volPath)
+				klog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", volPath)
 				return err
 			}
 		}
@@ -87,7 +91,9 @@ func diskSetUp(manager diskManager, b fcDiskMounter, volPath string, mounter mou
 	}
 
 	if !b.readOnly {
-		volume.SetVolumeOwnership(&b, fsGroup)
+		ownershipChanger := volume.NewVolumeOwnership(&b, volPath, fsGroup, fsGroupChangePolicy, util.FSGroupCompleteHook(b.plugin, nil))
+		// TODO: Handle error returned here properly.
+		_ = ownershipChanger.ChangePermissions()
 	}
 
 	return nil

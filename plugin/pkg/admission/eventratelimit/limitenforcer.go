@@ -20,13 +20,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/golang-lru"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/client-go/util/flowcontrol"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	eventratelimitapi "k8s.io/kubernetes/plugin/pkg/admission/eventratelimit/apis/eventratelimit"
+	"k8s.io/utils/lru"
 )
 
 const (
@@ -63,10 +61,7 @@ func newLimitEnforcer(config eventratelimitapi.Limit, clock flowcontrol.Clock) (
 	if cacheSize == 0 {
 		cacheSize = defaultCacheSize
 	}
-	underlyingCache, err := lru.New(cacheSize)
-	if err != nil {
-		return nil, fmt.Errorf("could not create lru cache: %v", err)
-	}
+	underlyingCache := lru.New(cacheSize)
 	cache := &lruCache{
 		rateLimiterFactory: rateLimiterFactory,
 		cache:              underlyingCache,
@@ -99,7 +94,7 @@ func (enforcer *limitEnforcer) accept(attr admission.Attributes) error {
 	allow := rateLimiter.TryAccept()
 
 	if !allow {
-		return apierrors.NewTooManyRequestsError(fmt.Sprintf("limit reached on type %v for key %v", enforcer.limitType, key))
+		return fmt.Errorf("limit reached on type %v for key %v", enforcer.limitType, key)
 	}
 
 	return nil

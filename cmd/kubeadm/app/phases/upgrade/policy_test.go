@@ -17,176 +17,274 @@ limitations under the License.
 package upgrade
 
 import (
+	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/version"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestEnforceVersionPolicies(t *testing.T) {
+	minimumKubeletVersion := version.MustParseSemantic("v1.3.0")
+	minimumControlPlaneVersion := version.MustParseSemantic("v1.3.0")
+	currentKubernetesVersion := version.MustParseSemantic("v1.4.0")
 	tests := []struct {
+		name                        string
 		vg                          *fakeVersionGetter
 		expectedMandatoryErrs       int
 		expectedSkippableErrs       int
 		allowExperimental, allowRCs bool
 		newK8sVersion               string
 	}{
-		{ // everything ok
+		{
+			name: "minor upgrade",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.5",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithPatch(5).String(),
 			},
-			newK8sVersion: "v1.9.5",
+			newK8sVersion: minimumControlPlaneVersion.WithPatch(5).String(),
 		},
-		{ // everything ok
+		{
+			name: "major upgrade",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.2",
-				kubeadmVersion: "v1.10.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumControlPlaneVersion.WithPatch(2).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPatch(1).String(),
 			},
-			newK8sVersion: "v1.10.0",
+			newK8sVersion: currentKubernetesVersion.String(),
 		},
-		{ // downgrades ok
+		{
+			name: "downgrade",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.3",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithPatch(3).String(),
 			},
-			newK8sVersion: "v1.9.2",
+			newK8sVersion: minimumControlPlaneVersion.WithPatch(2).String(),
 		},
-		{ // upgrades without bumping the version number ok
+		{
+			name: "same version upgrade",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.3",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithPatch(3).String(),
 			},
-			newK8sVersion: "v1.9.3",
+			newK8sVersion: minimumControlPlaneVersion.WithPatch(3).String(),
 		},
-		{ // new version must be higher than v1.9.0
+		{
+			name: "new version must be higher than v1.12.0",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.3",
+				clusterVersion: "v1.12.3",
+				kubeletVersion: "v1.12.3",
+				kubeadmVersion: "v1.12.3",
 			},
-			newK8sVersion:         "v1.8.10",
-			expectedMandatoryErrs: 1, // version must be higher than v1.9.0
+			newK8sVersion:         "v1.10.10",
+			expectedMandatoryErrs: 1, // version must be higher than v1.12.0
+			expectedSkippableErrs: 1, // can't upgrade old k8s with newer kubeadm
 		},
-		{ // upgrading two minor versions in one go is not supported
-			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.11.0",
-			},
-			newK8sVersion:         "v1.11.0",
-			expectedMandatoryErrs: 1, // can't upgrade two minor versions
-			expectedSkippableErrs: 1, // kubelet <-> apiserver skew too large
-		},
-		{ // downgrading two minor versions in one go is not supported
+		{
+			name: "upgrading two minor versions in one go is not supported",
 			vg: &fakeVersionGetter{
 				clusterVersion: "v1.11.3",
 				kubeletVersion: "v1.11.3",
-				kubeadmVersion: "v1.11.0",
+				kubeadmVersion: "v1.13.0",
 			},
-			newK8sVersion:         "v1.9.3",
+			newK8sVersion:         "v1.13.0",
+			expectedMandatoryErrs: 1, // can't upgrade two minor versions
+		},
+		{
+			name: "upgrading with n-3 kubelet is supported",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.3",
+				kubeletVersion: "v1.12.3",
+				kubeadmVersion: "v1.15.0",
+			},
+			newK8sVersion: "v1.15.0",
+		},
+		{
+			name: "upgrading with n-4 kubelet is not supported",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.3",
+				kubeletVersion: "v1.11.3",
+				kubeadmVersion: "v1.15.0",
+			},
+			newK8sVersion:         "v1.15.0",
+			expectedSkippableErrs: 1, // kubelet <-> apiserver skew too large
+		},
+		{
+			name: "downgrading two minor versions in one go is not supported",
+			vg: &fakeVersionGetter{
+				clusterVersion: currentKubernetesVersion.WithMinor(currentKubernetesVersion.Minor() + 2).String(),
+				kubeletVersion: currentKubernetesVersion.WithMinor(currentKubernetesVersion.Minor() + 2).String(),
+				kubeadmVersion: currentKubernetesVersion.String(),
+			},
+			newK8sVersion:         currentKubernetesVersion.String(),
 			expectedMandatoryErrs: 1, // can't downgrade two minor versions
 		},
-		{ // kubeadm version must be higher than the new kube version. However, patch version skews may be forced
+		{
+			name: "kubeadm version must be higher than the new kube version. However, patch version skews may be forced",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.3",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithPatch(3).String(),
 			},
-			newK8sVersion:         "v1.9.5",
+			newK8sVersion:         minimumControlPlaneVersion.WithPatch(5).String(),
 			expectedSkippableErrs: 1,
 		},
-		{ // kubeadm version must be higher than the new kube version. Trying to upgrade k8s to a higher minor version than kubeadm itself should never be supported
+		{
+			name: "kubeadm version must be higher than the new kube version. Trying to upgrade k8s to a higher minor version than kubeadm itself should never be supported",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.9.3",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithPatch(3).String(),
 			},
-			newK8sVersion:         "v1.10.0",
+			newK8sVersion:         currentKubernetesVersion.String(),
 			expectedMandatoryErrs: 1,
 		},
-		{ // the maximum skew between the cluster version and the kubelet versions should be one minor version. This may be forced through though.
+		{
+			name: "the maximum skew between the cluster version and the kubelet versions should be three minor version.",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.8.8",
-				kubeadmVersion: "v1.10.0",
+				clusterVersion: "v1.13.0",
+				kubeletVersion: "v1.10.8",
+				kubeadmVersion: "v1.13.0",
 			},
-			newK8sVersion:         "v1.10.0",
+			newK8sVersion: "v1.13.0",
+		},
+		{
+			name: "the maximum skew between the cluster version and the kubelet versions should be three minor version. This may be forced through though.",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.0",
+				kubeletVersion: "v1.10.8",
+				kubeadmVersion: "v1.14.0",
+			},
+			newK8sVersion:         "v1.14.0",
 			expectedSkippableErrs: 1,
 		},
-		{ // experimental upgrades supported if the flag is set
+		{
+			name: "experimental upgrades supported if the flag is set",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.10.0-beta.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPreRelease("beta.1").String(),
 			},
-			newK8sVersion:     "v1.10.0-beta.1",
+			newK8sVersion:     currentKubernetesVersion.WithPreRelease("beta.1").String(),
 			allowExperimental: true,
 		},
-		{ // release candidate upgrades supported if the flag is set
+		{
+			name: "release candidate upgrades supported if the flag is set",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.10.0-rc.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			},
-			newK8sVersion: "v1.10.0-rc.1",
+			newK8sVersion: currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			allowRCs:      true,
 		},
-		{ // release candidate upgrades supported if the flag is set
+		{
+			name: "release candidate upgrades supported if the flag is set",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.10.0-rc.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			},
-			newK8sVersion:     "v1.10.0-rc.1",
+			newK8sVersion:     currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			allowExperimental: true,
 		},
-		{ // the user should not be able to upgrade to an experimental version if they haven't opted into that
+		{
+			name: "the user should not be able to upgrade to an experimental version if they haven't opted into that",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.10.0-beta.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPreRelease("beta.1").String(),
 			},
-			newK8sVersion:         "v1.10.0-beta.1",
+			newK8sVersion:         currentKubernetesVersion.WithPreRelease("beta.1").String(),
 			allowRCs:              true,
 			expectedSkippableErrs: 1,
 		},
-		{ // the user should not be able to upgrade to an release candidate version if they haven't opted into that
+		{
+			name: "the user should not be able to upgrade to an release candidate version if they haven't opted into that",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.9.3",
-				kubeletVersion: "v1.9.3",
-				kubeadmVersion: "v1.10.0-rc.1",
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			},
-			newK8sVersion:         "v1.10.0-rc.1",
+			newK8sVersion:         currentKubernetesVersion.WithPreRelease("rc.1").String(),
 			expectedSkippableErrs: 1,
+		},
+		{
+			name: "the user can't use a newer minor version of kubeadm to upgrade an older version of kubeadm",
+			vg: &fakeVersionGetter{
+				clusterVersion: minimumControlPlaneVersion.WithPatch(3).String(),
+				kubeletVersion: minimumKubeletVersion.WithPatch(3).String(),
+				kubeadmVersion: currentKubernetesVersion.String(),
+			},
+			newK8sVersion:         minimumControlPlaneVersion.WithPatch(6).String(),
+			expectedSkippableErrs: 1, // can't upgrade old k8s with newer kubeadm
+		},
+		{
+			name: "build release supported at MinimumControlPlaneVersion",
+			vg: &fakeVersionGetter{
+				clusterVersion: minimumControlPlaneVersion.String(),
+				kubeletVersion: minimumControlPlaneVersion.String(),
+				kubeadmVersion: minimumControlPlaneVersion.WithBuildMetadata("build").String(),
+			},
+			newK8sVersion: minimumControlPlaneVersion.WithBuildMetadata("build").String(),
 		},
 	}
 
 	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
 
-		newK8sVer, err := version.ParseSemantic(rt.newK8sVersion)
-		if err != nil {
-			t.Fatalf("couldn't parse version %s: %v", rt.newK8sVersion, err)
-		}
-
-		actualSkewErrs := EnforceVersionPolicies(rt.vg, rt.newK8sVersion, newK8sVer, rt.allowExperimental, rt.allowRCs)
-		if actualSkewErrs == nil {
-			// No errors were seen. Report unit test failure if we expected to see errors
-			if rt.expectedMandatoryErrs+rt.expectedSkippableErrs > 0 {
-				t.Errorf("failed TestEnforceVersionPolicies\n\texpected errors but got none")
+			newK8sVer, err := version.ParseSemantic(rt.newK8sVersion)
+			if err != nil {
+				t.Fatalf("couldn't parse version %s: %v", rt.newK8sVersion, err)
 			}
-			// Otherwise, just move on with the next test
-			continue
-		}
 
-		if len(actualSkewErrs.Skippable) != rt.expectedSkippableErrs {
-			t.Errorf("failed TestEnforceVersionPolicies\n\texpected skippable errors: %d\n\tgot skippable errors: %d %v", rt.expectedSkippableErrs, len(actualSkewErrs.Skippable), *rt.vg)
-		}
-		if len(actualSkewErrs.Mandatory) != rt.expectedMandatoryErrs {
-			t.Errorf("failed TestEnforceVersionPolicies\n\texpected mandatory errors: %d\n\tgot mandatory errors: %d %v", rt.expectedMandatoryErrs, len(actualSkewErrs.Mandatory), *rt.vg)
+			actualSkewErrs := EnforceVersionPolicies(rt.vg, rt.newK8sVersion, newK8sVer, rt.allowExperimental, rt.allowRCs)
+			if actualSkewErrs == nil {
+				// No errors were seen. Report unit test failure if we expected to see errors
+				if rt.expectedMandatoryErrs+rt.expectedSkippableErrs > 0 {
+					t.Errorf("failed TestEnforceVersionPolicies\n\texpected errors but got none")
+				}
+				// Otherwise, just move on with the next test
+				return
+			}
+
+			if len(actualSkewErrs.Skippable) != rt.expectedSkippableErrs {
+				t.Errorf("failed TestEnforceVersionPolicies\n\texpected skippable errors: %d\n\tgot skippable errors: %d\n%#v\n%#v", rt.expectedSkippableErrs, len(actualSkewErrs.Skippable), *rt.vg, actualSkewErrs)
+			}
+			if len(actualSkewErrs.Mandatory) != rt.expectedMandatoryErrs {
+				t.Errorf("failed TestEnforceVersionPolicies\n\texpected mandatory errors: %d\n\tgot mandatory errors: %d\n%#v\n%#v", rt.expectedMandatoryErrs, len(actualSkewErrs.Mandatory), *rt.vg, actualSkewErrs)
+			}
+		})
+	}
+}
+
+func TestEnforceVersionPoliciesMinimumVersionError(t *testing.T) {
+	// The cluster runs a patch release above the minimum supported control plane version
+	// and the version to upgrade to is below that minimum.
+	minimumControlPlaneVersion := constants.MinimumControlPlaneVersion
+	clusterVersion := minimumControlPlaneVersion.WithPatch(3)
+	newK8sVersion := minimumControlPlaneVersion.WithPreRelease("alpha.0")
+	vg := &fakeVersionGetter{
+		clusterVersion: clusterVersion.String(),
+		kubeletVersion: clusterVersion.String(),
+		kubeadmVersion: clusterVersion.String(),
+	}
+
+	skewErrs := EnforceVersionPolicies(vg, newK8sVersion.String(), newK8sVersion, true, true)
+	if skewErrs == nil {
+		t.Fatal("expected errors but got none")
+	}
+	for _, err := range skewErrs.Mandatory {
+		if strings.Contains(err.Error(), "minimum supported version") {
+			if !strings.Contains(err.Error(), minimumControlPlaneVersion.String()) {
+				t.Errorf("expected the error to name the minimum supported version %q, got: %v", minimumControlPlaneVersion, err)
+			}
+			return
 		}
 	}
+	t.Errorf("expected a minimum supported version error, got: %v", skewErrs.Mandatory)
 }

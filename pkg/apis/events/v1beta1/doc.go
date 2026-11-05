@@ -17,7 +17,13 @@ limitations under the License.
 // +k8s:conversion-gen=k8s.io/kubernetes/pkg/apis/events
 // +k8s:conversion-gen-external-types=k8s.io/api/events/v1beta1
 // +k8s:defaulter-gen=TypeMeta
-// +k8s:defaulter-gen-input=../../../../vendor/k8s.io/api/events/v1beta1
+// +k8s:defaulter-gen-input=k8s.io/api/events/v1beta1
+
+// v1beta1 is no longer served. Its legacy validation diverges significantly
+// from v1, violating the declarative validation framework's requirement
+// for validation equivalence across all versions of a resource.
+// +k8s:validation-gen=false
 
 // +groupName=events.k8s.io
-package v1beta1 // import "k8s.io/kubernetes/pkg/apis/events/v1beta1"
+
+package v1beta1

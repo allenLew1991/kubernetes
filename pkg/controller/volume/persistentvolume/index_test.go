@@ -20,20 +20,48 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/golang/glog"
-
-	"k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	ref "k8s.io/client-go/tools/reference"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
-	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/component-helpers/storage/volume"
+	"k8s.io/component-helpers/storage/volume/assumecache"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/volume/util"
 )
 
+// fakePVInformer is a minimal assumecache.Informer for unit tests that only
+// need a standalone persistentVolumeOrderedIndex over an in-memory indexer.
+type fakePVInformer struct {
+	indexer cache.Indexer
+}
+
+func (f *fakePVInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return nil, nil
+}
+
+func (f *fakePVInformer) GetIndexer() cache.Indexer {
+	return f.indexer
+}
+
+// newPersistentVolumeOrderedIndex builds a persistentVolumeOrderedIndex backed
+// by a standalone assume cache, for tests that exercise the matching logic
+// without a running informer.
+func newPersistentVolumeOrderedIndex() persistentVolumeOrderedIndex {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{accessModesIndex: accessModesIndexFunc})
+	c, err := assumecache.NewAssumeCache[*v1.PersistentVolume](klog.Background(), &fakePVInformer{indexer: indexer}, schema.GroupResource{Resource: "persistentvolumes"})
+	if err != nil {
+		panic(err)
+	}
+	return persistentVolumeOrderedIndex{c}
+}
+
 func makePVC(size string, modfn func(*v1.PersistentVolumeClaim)) *v1.PersistentVolumeClaim {
+	fs := v1.PersistentVolumeFilesystem
 	pvc := v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "claim01",
@@ -41,11 +69,12 @@ func makePVC(size string, modfn func(*v1.PersistentVolumeClaim)) *v1.PersistentV
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany, v1.ReadWriteOnce},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse(size),
 				},
 			},
+			VolumeMode: &fs,
 		},
 	}
 	if modfn != nil {
@@ -63,7 +92,7 @@ func makeVolumeModePVC(size string, mode *v1.PersistentVolumeMode, modfn func(*v
 		Spec: v1.PersistentVolumeClaimSpec{
 			VolumeMode:  mode,
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse(size),
 				},
@@ -79,7 +108,7 @@ func makeVolumeModePVC(size string, mode *v1.PersistentVolumeMode, modfn func(*v
 func TestMatchVolume(t *testing.T) {
 	volList := newPersistentVolumeOrderedIndex()
 	for _, pv := range createTestVolumes() {
-		volList.store.Add(pv)
+		require.NoError(t, volList.Indexer().Add(pv))
 	}
 
 	scenarios := map[string]struct {
@@ -134,6 +163,24 @@ func TestMatchVolume(t *testing.T) {
 					},
 				}
 				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
+			}),
+		},
+		"successful-match-with-empty-vac": {
+			expectedMatch: "gce-pd-10",
+			claim: makePVC("8G", func(pvc *v1.PersistentVolumeClaim) {
+				pvc.Spec.VolumeAttributesClassName = &classEmpty
+			}),
+		},
+		"successful-match-with-vac": {
+			expectedMatch: "gce-pd-vac-silver1",
+			claim: makePVC("1G", func(pvc *v1.PersistentVolumeClaim) {
+				pvc.Spec.VolumeAttributesClassName = &classSilver
+			}),
+		},
+		"successful-no-match-vac-nonexisting": {
+			expectedMatch: "",
+			claim: makePVC("1G", func(pvc *v1.PersistentVolumeClaim) {
+				pvc.Spec.VolumeAttributesClassName = &classNonExisting
 			}),
 		},
 		"successful-match-with-class": {
@@ -198,6 +245,7 @@ func TestMatchVolume(t *testing.T) {
 }
 
 func TestMatchingWithBoundVolumes(t *testing.T) {
+	fs := v1.PersistentVolumeFilesystem
 	volumeIndex := newPersistentVolumeOrderedIndex()
 	// two similar volumes, one is bound
 	pv1 := &v1.PersistentVolume{
@@ -214,7 +262,11 @@ func TestMatchingWithBoundVolumes(t *testing.T) {
 			},
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany},
 			// this one we're pretending is already bound
-			ClaimRef: &v1.ObjectReference{UID: "abc123"},
+			ClaimRef:   &v1.ObjectReference{UID: "abc123"},
+			VolumeMode: &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeBound,
 		},
 	}
 
@@ -231,11 +283,15 @@ func TestMatchingWithBoundVolumes(t *testing.T) {
 				GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{},
 			},
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany},
+			VolumeMode:  &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
 
-	volumeIndex.store.Add(pv1)
-	volumeIndex.store.Add(pv2)
+	require.NoError(t, volumeIndex.Indexer().Add(pv1))
+	require.NoError(t, volumeIndex.Indexer().Add(pv2))
 
 	claim := &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -244,11 +300,12 @@ func TestMatchingWithBoundVolumes(t *testing.T) {
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany, v1.ReadWriteOnce},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G"),
 				},
 			},
+			VolumeMode: &fs,
 		},
 	}
 
@@ -267,7 +324,7 @@ func TestMatchingWithBoundVolumes(t *testing.T) {
 func TestListByAccessModes(t *testing.T) {
 	volList := newPersistentVolumeOrderedIndex()
 	for _, pv := range createTestVolumes() {
-		volList.store.Add(pv)
+		require.NoError(t, volList.Indexer().Add(pv))
 	}
 
 	volumes, err := volList.listByAccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany})
@@ -298,7 +355,7 @@ func TestListByAccessModes(t *testing.T) {
 func TestAllPossibleAccessModes(t *testing.T) {
 	index := newPersistentVolumeOrderedIndex()
 	for _, pv := range createTestVolumes() {
-		index.store.Add(pv)
+		require.NoError(t, index.Indexer().Add(pv))
 	}
 
 	// the mock PVs creates contain 2 types of accessmodes:   RWO+ROX and RWO+ROW+RWX
@@ -307,7 +364,7 @@ func TestAllPossibleAccessModes(t *testing.T) {
 		t.Errorf("Expected 3 arrays of modes that match RWO, but got %v", len(possibleModes))
 	}
 	for _, m := range possibleModes {
-		if !volume.AccessModesContains(m, v1.ReadWriteOnce) {
+		if !util.ContainsAccessMode(m, v1.ReadWriteOnce) {
 			t.Errorf("AccessModes does not contain %s", v1.ReadWriteOnce)
 		}
 	}
@@ -316,13 +373,14 @@ func TestAllPossibleAccessModes(t *testing.T) {
 	if len(possibleModes) != 1 {
 		t.Errorf("Expected 1 array of modes that match RWX, but got %v", len(possibleModes))
 	}
-	if !volume.AccessModesContains(possibleModes[0], v1.ReadWriteMany) {
+	if !util.ContainsAccessMode(possibleModes[0], v1.ReadWriteMany) {
 		t.Errorf("AccessModes does not contain %s", v1.ReadWriteOnce)
 	}
 
 }
 
 func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
+	fs := v1.PersistentVolumeFilesystem
 	gce := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{UID: "001", Name: "gce"},
 		Spec: v1.PersistentVolumeSpec{
@@ -332,6 +390,10 @@ func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
 				v1.ReadWriteOnce,
 				v1.ReadOnlyMany,
 			},
+			VolumeMode: &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
 
@@ -343,6 +405,10 @@ func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
 			AccessModes: []v1.PersistentVolumeAccessMode{
 				v1.ReadWriteOnce,
 			},
+			VolumeMode: &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
 
@@ -356,6 +422,10 @@ func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
 				v1.ReadOnlyMany,
 				v1.ReadWriteMany,
 			},
+			VolumeMode: &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
 
@@ -366,14 +436,15 @@ func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
-			Resources:   v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")}},
+			Resources:   v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")}},
+			VolumeMode:  &fs,
 		},
 	}
 
 	index := newPersistentVolumeOrderedIndex()
-	index.store.Add(gce)
-	index.store.Add(ebs)
-	index.store.Add(nfs)
+	require.NoError(t, index.Indexer().Add(gce))
+	require.NoError(t, index.Indexer().Add(ebs))
+	require.NoError(t, index.Indexer().Add(nfs))
 
 	volume, _ := index.findBestMatchForClaim(claim, false)
 	if volume.Name != ebs.Name {
@@ -425,7 +496,27 @@ func TestFindingVolumeWithDifferentAccessModes(t *testing.T) {
 	}
 }
 
+// createVolumeNodeAffinity returns a VolumeNodeAffinity for given key and value.
+func createNodeAffinity(key string, value string) *v1.VolumeNodeAffinity {
+	return &v1.VolumeNodeAffinity{
+		Required: &v1.NodeSelector{
+			NodeSelectorTerms: []v1.NodeSelectorTerm{
+				{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{
+							Key:      key,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{value},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func createTestVolumes() []*v1.PersistentVolume {
+	fs := v1.PersistentVolumeFilesystem
 	// these volumes are deliberately out-of-order to test indexing and sorting
 	return []*v1.PersistentVolume{
 		{
@@ -444,6 +535,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteOnce,
 					v1.ReadOnlyMany,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -463,7 +558,11 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadOnlyMany,
 				},
 				// this one we're pretending is already bound
-				ClaimRef: &v1.ObjectReference{UID: "def456"},
+				ClaimRef:   &v1.ObjectReference{UID: "def456"},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeBound,
 			},
 		},
 		{
@@ -476,13 +575,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse("5G"),
 				},
 				PersistentVolumeSource: v1.PersistentVolumeSource{
-					Glusterfs: &v1.GlusterfsVolumeSource{},
+					Glusterfs: &v1.GlusterfsPersistentVolumeSource{},
 				},
 				AccessModes: []v1.PersistentVolumeAccessMode{
 					v1.ReadWriteOnce,
 					v1.ReadOnlyMany,
 					v1.ReadWriteMany,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -502,7 +605,11 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadOnlyMany,
 				},
 				// this one we're pretending is already bound
-				ClaimRef: &v1.ObjectReference{UID: "abc123"},
+				ClaimRef:   &v1.ObjectReference{UID: "abc123"},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeBound,
 			},
 		},
 		{
@@ -515,13 +622,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse("10G"),
 				},
 				PersistentVolumeSource: v1.PersistentVolumeSource{
-					Glusterfs: &v1.GlusterfsVolumeSource{},
+					Glusterfs: &v1.GlusterfsPersistentVolumeSource{},
 				},
 				AccessModes: []v1.PersistentVolumeAccessMode{
 					v1.ReadWriteOnce,
 					v1.ReadOnlyMany,
 					v1.ReadWriteMany,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -540,6 +651,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteOnce,
 					v1.ReadOnlyMany,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -552,13 +667,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G"),
 				},
 				PersistentVolumeSource: v1.PersistentVolumeSource{
-					Glusterfs: &v1.GlusterfsVolumeSource{},
+					Glusterfs: &v1.GlusterfsPersistentVolumeSource{},
 				},
 				AccessModes: []v1.PersistentVolumeAccessMode{
 					v1.ReadWriteOnce,
 					v1.ReadOnlyMany,
 					v1.ReadWriteMany,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -579,6 +698,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 				AccessModes: []v1.PersistentVolumeAccessMode{
 					v1.ReadWriteOnce,
 				},
+				VolumeMode: &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -600,6 +723,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteOnce,
 				},
 				StorageClassName: classSilver,
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -618,6 +745,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteOnce,
 				},
 				StorageClassName: classSilver,
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -636,6 +767,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteOnce,
 				},
 				StorageClassName: classGold,
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -656,6 +791,10 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteMany,
 				},
 				StorageClassName: classLarge,
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
@@ -676,13 +815,16 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadWriteMany,
 				},
 				StorageClassName: classLarge,
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				UID:         "affinity-pv",
-				Name:        "affinity001",
-				Annotations: getAnnotationWithNodeAffinity("key1", "value1"),
+				UID:  "affinity-pv",
+				Name: "affinity001",
 			},
 			Spec: v1.PersistentVolumeSpec{
 				Capacity: v1.ResourceList{
@@ -696,13 +838,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadOnlyMany,
 				},
 				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value1"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				UID:         "affinity-pv2",
-				Name:        "affinity002",
-				Annotations: getAnnotationWithNodeAffinity("key1", "value1"),
+				UID:  "affinity-pv2",
+				Name: "affinity002",
 			},
 			Spec: v1.PersistentVolumeSpec{
 				Capacity: v1.ResourceList{
@@ -716,13 +862,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadOnlyMany,
 				},
 				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value1"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				UID:         "affinity-prebound",
-				Name:        "affinity003",
-				Annotations: getAnnotationWithNodeAffinity("key1", "value1"),
+				UID:  "affinity-prebound",
+				Name: "affinity003",
 			},
 			Spec: v1.PersistentVolumeSpec{
 				Capacity: v1.ResourceList{
@@ -737,13 +887,17 @@ func createTestVolumes() []*v1.PersistentVolume {
 				},
 				StorageClassName: classWait,
 				ClaimRef:         &v1.ObjectReference{Name: "claim02", Namespace: "myns"},
+				NodeAffinity:     createNodeAffinity("key1", "value1"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				UID:         "affinity-pv3",
-				Name:        "affinity003",
-				Annotations: getAnnotationWithNodeAffinity("key1", "value3"),
+				UID:  "affinity-pv3",
+				Name: "affinity003",
 			},
 			Spec: v1.PersistentVolumeSpec{
 				Capacity: v1.ResourceList{
@@ -757,12 +911,134 @@ func createTestVolumes() []*v1.PersistentVolume {
 					v1.ReadOnlyMany,
 				},
 				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value3"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:  "affinity-pv4-pending",
+				Name: "affinity004-pending",
+			},
+			Spec: v1.PersistentVolumeSpec{
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("200G"),
+				},
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					Local: &v1.LocalVolumeSource{},
+				},
+				AccessModes: []v1.PersistentVolumeAccessMode{
+					v1.ReadWriteOnce,
+					v1.ReadOnlyMany,
+				},
+				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value4"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumePending,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:  "affinity-pv4-failed",
+				Name: "affinity004-failed",
+			},
+			Spec: v1.PersistentVolumeSpec{
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("200G"),
+				},
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					Local: &v1.LocalVolumeSource{},
+				},
+				AccessModes: []v1.PersistentVolumeAccessMode{
+					v1.ReadWriteOnce,
+					v1.ReadOnlyMany,
+				},
+				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value4"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeFailed,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:  "affinity-pv4-released",
+				Name: "affinity004-released",
+			},
+			Spec: v1.PersistentVolumeSpec{
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("200G"),
+				},
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					Local: &v1.LocalVolumeSource{},
+				},
+				AccessModes: []v1.PersistentVolumeAccessMode{
+					v1.ReadWriteOnce,
+					v1.ReadOnlyMany,
+				},
+				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value4"),
+				VolumeMode:       &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeReleased,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:  "affinity-pv4-empty",
+				Name: "affinity004-empty",
+			},
+			Spec: v1.PersistentVolumeSpec{
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("200G"),
+				},
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					Local: &v1.LocalVolumeSource{},
+				},
+				AccessModes: []v1.PersistentVolumeAccessMode{
+					v1.ReadWriteOnce,
+					v1.ReadOnlyMany,
+				},
+				StorageClassName: classWait,
+				NodeAffinity:     createNodeAffinity("key1", "value4"),
+				VolumeMode:       &fs,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:  "gce-pd-vac-silver1",
+				Name: "gce-pd-vac-silver1",
+			},
+			Spec: v1.PersistentVolumeSpec{
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("100G"),
+				},
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{},
+				},
+				AccessModes: []v1.PersistentVolumeAccessMode{
+					v1.ReadWriteOnce,
+					v1.ReadOnlyMany,
+				},
+				VolumeAttributesClassName: &classSilver,
+				VolumeMode:                &fs,
+			},
+			Status: v1.PersistentVolumeStatus{
+				Phase: v1.VolumeAvailable,
 			},
 		},
 	}
 }
 
 func testVolume(name, size string) *v1.PersistentVolume {
+	fs := v1.PersistentVolumeFilesystem
 	return &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
@@ -772,34 +1048,12 @@ func testVolume(name, size string) *v1.PersistentVolume {
 			Capacity:               v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse(size)},
 			PersistentVolumeSource: v1.PersistentVolumeSource{HostPath: &v1.HostPathVolumeSource{}},
 			AccessModes:            []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			VolumeMode:             &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
-}
-
-func getAnnotationWithNodeAffinity(key string, value string) map[string]string {
-	affinity := &v1.NodeAffinity{
-		RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-			NodeSelectorTerms: []v1.NodeSelectorTerm{
-				{
-					MatchExpressions: []v1.NodeSelectorRequirement{
-						{
-							Key:      key,
-							Operator: v1.NodeSelectorOpIn,
-							Values:   []string{value},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	annotations := map[string]string{}
-	err := helper.StorageNodeAffinityToAlphaAnnotation(annotations, affinity)
-	if err != nil {
-		glog.Fatalf("Failed to get node affinity annotation: %v", err)
-	}
-
-	return annotations
 }
 
 func createVolumeModeBlockTestVolume() *v1.PersistentVolume {
@@ -821,6 +1075,9 @@ func createVolumeModeBlockTestVolume() *v1.PersistentVolume {
 				v1.ReadWriteOnce,
 			},
 			VolumeMode: &blockMode,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
 		},
 	}
 }
@@ -845,33 +1102,42 @@ func createVolumeModeFilesystemTestVolume() *v1.PersistentVolume {
 			},
 			VolumeMode: &filesystemMode,
 		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
+		},
+	}
+}
+
+func createVolumeModeNilTestVolume() *v1.PersistentVolume {
+	return &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:  "local-1",
+			Name: "nil-mode",
+		},
+		Spec: v1.PersistentVolumeSpec{
+			Capacity: v1.ResourceList{
+				v1.ResourceName(v1.ResourceStorage): resource.MustParse("10G"),
+			},
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				Local: &v1.LocalVolumeSource{},
+			},
+			AccessModes: []v1.PersistentVolumeAccessMode{
+				v1.ReadWriteOnce,
+			},
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
+		},
 	}
 }
 
 func createTestVolOrderedIndex(pv *v1.PersistentVolume) persistentVolumeOrderedIndex {
 	volFile := newPersistentVolumeOrderedIndex()
-	volFile.store.Add(pv)
+	_ = volFile.Indexer().Add(pv)
 	return volFile
 }
 
-func toggleBlockVolumeFeature(toggleFlag bool, t *testing.T) {
-	if toggleFlag {
-		// Enable alpha feature BlockVolume
-		err := utilfeature.DefaultFeatureGate.Set("BlockVolume=true")
-		if err != nil {
-			t.Errorf("Failed to enable feature gate for BlockVolume: %v", err)
-			return
-		}
-	} else {
-		err := utilfeature.DefaultFeatureGate.Set("BlockVolume=false")
-		if err != nil {
-			t.Errorf("Failed to disable feature gate for BlockVolume: %v", err)
-			return
-		}
-	}
-}
-
-func TestAlphaVolumeModeCheck(t *testing.T) {
+func TestVolumeModeCheck(t *testing.T) {
 
 	blockMode := v1.PersistentVolumeBlock
 	filesystemMode := v1.PersistentVolumeFilesystem
@@ -879,81 +1145,72 @@ func TestAlphaVolumeModeCheck(t *testing.T) {
 	// If feature gate is enabled, VolumeMode will always be defaulted
 	// If feature gate is disabled, VolumeMode is dropped by API and ignored
 	scenarios := map[string]struct {
-		isExpectedMisMatch bool
+		isExpectedMismatch bool
 		vol                *v1.PersistentVolume
 		pvc                *v1.PersistentVolumeClaim
-		enableBlock        bool
 	}{
-		"feature enabled - pvc block and pv filesystem": {
-			isExpectedMisMatch: true,
+		"pvc block and pv filesystem": {
+			isExpectedMismatch: true,
 			vol:                createVolumeModeFilesystemTestVolume(),
 			pvc:                makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:        true,
 		},
-		"feature enabled - pvc filesystem and pv block": {
-			isExpectedMisMatch: true,
+		"pvc filesystem and pv block": {
+			isExpectedMismatch: true,
 			vol:                createVolumeModeBlockTestVolume(),
 			pvc:                makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:        true,
 		},
-		"feature enabled - pvc block and pv block": {
-			isExpectedMisMatch: false,
+		"pvc block and pv block": {
+			isExpectedMismatch: false,
 			vol:                createVolumeModeBlockTestVolume(),
 			pvc:                makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:        true,
 		},
-		"feature enabled - pvc filesystem and pv filesystem": {
-			isExpectedMisMatch: false,
+		"pvc filesystem and pv filesystem": {
+			isExpectedMismatch: false,
 			vol:                createVolumeModeFilesystemTestVolume(),
 			pvc:                makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:        true,
 		},
-		"feature disabled - pvc block and pv filesystem": {
-			isExpectedMisMatch: false,
+		"pvc filesystem and pv nil": {
+			isExpectedMismatch: false,
+			vol:                createVolumeModeNilTestVolume(),
+			pvc:                makeVolumeModePVC("8G", &filesystemMode, nil),
+		},
+		"pvc nil and pv filesystem": {
+			isExpectedMismatch: false,
 			vol:                createVolumeModeFilesystemTestVolume(),
-			pvc:                makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:        false,
+			pvc:                makeVolumeModePVC("8G", nil, nil),
 		},
-		"feature disabled - pvc filesystem and pv block": {
-			isExpectedMisMatch: false,
+		"pvc nil and pv nil": {
+			isExpectedMismatch: false,
+			vol:                createVolumeModeNilTestVolume(),
+			pvc:                makeVolumeModePVC("8G", nil, nil),
+		},
+		"pvc nil and pv block": {
+			isExpectedMismatch: true,
 			vol:                createVolumeModeBlockTestVolume(),
-			pvc:                makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:        false,
+			pvc:                makeVolumeModePVC("8G", nil, nil),
 		},
-		"feature disabled - pvc block and pv block": {
-			isExpectedMisMatch: false,
-			vol:                createVolumeModeBlockTestVolume(),
+		"pvc block and pv nil": {
+			isExpectedMismatch: true,
+			vol:                createVolumeModeNilTestVolume(),
 			pvc:                makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:        false,
-		},
-		"feature disabled - pvc filesystem and pv filesystem": {
-			isExpectedMisMatch: false,
-			vol:                createVolumeModeFilesystemTestVolume(),
-			pvc:                makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:        false,
 		},
 	}
 
 	for name, scenario := range scenarios {
-		toggleBlockVolumeFeature(scenario.enableBlock, t)
-		expectedMisMatch, err := checkVolumeModeMisMatches(&scenario.pvc.Spec, &scenario.vol.Spec)
-		if err != nil {
-			t.Errorf("Unexpected failure for checkVolumeModeMisMatches: %v", err)
-		}
-		// expected to match but either got an error or no returned pvmatch
-		if expectedMisMatch && !scenario.isExpectedMisMatch {
-			t.Errorf("Unexpected failure for scenario, expected not to mismatch on modes but did: %s", name)
-		}
-		if !expectedMisMatch && scenario.isExpectedMisMatch {
-			t.Errorf("Unexpected failure for scenario, did not mismatch on mode when expected to mismatch: %s", name)
-		}
+		t.Run(name, func(t *testing.T) {
+			expectedMismatch := volume.CheckVolumeModeMismatches(&scenario.pvc.Spec, &scenario.vol.Spec)
+			// expected to match but either got an error or no returned pvmatch
+			if expectedMismatch && !scenario.isExpectedMismatch {
+				t.Errorf("Unexpected failure for scenario, expected not to mismatch on modes but did: %s", name)
+			}
+			if !expectedMismatch && scenario.isExpectedMismatch {
+				t.Errorf("Unexpected failure for scenario, did not mismatch on mode when expected to mismatch: %s", name)
+			}
+		})
 	}
-
-	// make sure feature gate is turned off
-	toggleBlockVolumeFeature(false, t)
 }
 
-func TestAlphaFilteringVolumeModes(t *testing.T) {
+func TestFilteringVolumeModes(t *testing.T) {
 	blockMode := v1.PersistentVolumeBlock
 	filesystemMode := v1.PersistentVolumeFilesystem
 
@@ -963,103 +1220,178 @@ func TestAlphaFilteringVolumeModes(t *testing.T) {
 		isExpectedMatch bool
 		vol             persistentVolumeOrderedIndex
 		pvc             *v1.PersistentVolumeClaim
-		enableBlock     bool
 	}{
-		"1-1 feature enabled - pvc block and pv filesystem": {
+		"pvc block and pv filesystem": {
 			isExpectedMatch: false,
 			vol:             createTestVolOrderedIndex(createVolumeModeFilesystemTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:     true,
 		},
-		"1-2 feature enabled - pvc filesystem and pv block": {
+		"pvc filesystem and pv block": {
 			isExpectedMatch: false,
 			vol:             createTestVolOrderedIndex(createVolumeModeBlockTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:     true,
 		},
-		"1-3 feature enabled - pvc block and pv no mode with default filesystem": {
+		"pvc block and pv no mode with default filesystem": {
 			isExpectedMatch: false,
 			vol:             createTestVolOrderedIndex(createVolumeModeFilesystemTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:     true,
 		},
-		"1-4 feature enabled - pvc no mode defaulted to filesystem and pv block": {
+		"pvc no mode defaulted to filesystem and pv block": {
 			isExpectedMatch: false,
 			vol:             createTestVolOrderedIndex(createVolumeModeBlockTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:     true,
 		},
-		"1-5 feature enabled - pvc block and pv block": {
+		"pvc block and pv block": {
 			isExpectedMatch: true,
 			vol:             createTestVolOrderedIndex(createVolumeModeBlockTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:     true,
 		},
-		"1-6 feature enabled - pvc filesystem and pv filesystem": {
+		"pvc filesystem and pv filesystem": {
 			isExpectedMatch: true,
 			vol:             createTestVolOrderedIndex(createVolumeModeFilesystemTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:     true,
 		},
-		"1-7 feature enabled - pvc mode is nil and defaulted and pv mode is nil and defaulted": {
+		"pvc mode is nil and defaulted and pv mode is nil and defaulted": {
 			isExpectedMatch: true,
 			vol:             createTestVolOrderedIndex(createVolumeModeFilesystemTestVolume()),
 			pvc:             makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:     true,
-		},
-		"2-1 feature disabled - pvc mode is nil and pv mode is nil": {
-			isExpectedMatch: true,
-			vol:             createTestVolOrderedIndex(testVolume("nomode-1", "8G")),
-			pvc:             makeVolumeModePVC("8G", nil, nil),
-			enableBlock:     false,
-		},
-		"2-2 feature disabled - pvc mode is block and pv mode is block - fields should be dropped by api and not analyzed with gate disabled": {
-			isExpectedMatch: true,
-			vol:             createTestVolOrderedIndex(createVolumeModeBlockTestVolume()),
-			pvc:             makeVolumeModePVC("8G", &blockMode, nil),
-			enableBlock:     false,
-		},
-		"2-3 feature disabled - pvc mode is filesystem and pv mode is filesystem - fields should be dropped by api and not analyzed with gate disabled": {
-			isExpectedMatch: true,
-			vol:             createTestVolOrderedIndex(createVolumeModeFilesystemTestVolume()),
-			pvc:             makeVolumeModePVC("8G", &filesystemMode, nil),
-			enableBlock:     false,
 		},
 	}
 
 	for name, scenario := range scenarios {
-		toggleBlockVolumeFeature(scenario.enableBlock, t)
-		pvmatch, err := scenario.vol.findBestMatchForClaim(scenario.pvc, false)
-		// expected to match but either got an error or no returned pvmatch
-		if pvmatch == nil && scenario.isExpectedMatch {
-			t.Errorf("Unexpected failure for scenario, no matching volume: %s", name)
-		}
-		if err != nil && scenario.isExpectedMatch {
-			t.Errorf("Unexpected failure for scenario: %s - %+v", name, err)
-		}
-		// expected to not match but either got an error or a returned pvmatch
-		if pvmatch != nil && !scenario.isExpectedMatch {
-			t.Errorf("Unexpected failure for scenario, expected no matching volume: %s", name)
-		}
-		if err != nil && !scenario.isExpectedMatch {
-			t.Errorf("Unexpected failure for scenario: %s - %+v", name, err)
-		}
+		t.Run(name, func(t *testing.T) {
+			pvmatch, err := scenario.vol.findBestMatchForClaim(scenario.pvc, false)
+			// expected to match but either got an error or no returned pvmatch
+			if pvmatch == nil && scenario.isExpectedMatch {
+				t.Errorf("Unexpected failure for scenario, no matching volume: %s", name)
+			}
+			if err != nil && scenario.isExpectedMatch {
+				t.Errorf("Unexpected failure for scenario: %s - %+v", name, err)
+			}
+			// expected to not match but either got an error or a returned pvmatch
+			if pvmatch != nil && !scenario.isExpectedMatch {
+				t.Errorf("Unexpected failure for scenario, expected no matching volume: %s", name)
+			}
+			if err != nil && !scenario.isExpectedMatch {
+				t.Errorf("Unexpected failure for scenario: %s - %+v", name, err)
+			}
+		})
+	}
+}
+
+func TestStorageObjectInUseProtectionFiltering(t *testing.T) {
+	fs := v1.PersistentVolumeFilesystem
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pv1",
+			Annotations: map[string]string{},
+		},
+		Spec: v1.PersistentVolumeSpec{
+			Capacity:               v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")},
+			PersistentVolumeSource: v1.PersistentVolumeSource{HostPath: &v1.HostPathVolumeSource{}},
+			AccessModes:            []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			VolumeMode:             &fs,
+		},
+		Status: v1.PersistentVolumeStatus{
+			Phase: v1.VolumeAvailable,
+		},
 	}
 
-	// make sure feature gate is turned off
-	toggleBlockVolumeFeature(false, t)
+	pvToDelete := pv.DeepCopy()
+	now := metav1.Now()
+	pvToDelete.ObjectMeta.DeletionTimestamp = &now
+
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc1",
+			Namespace: "myns",
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			Resources:   v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")}},
+			VolumeMode:  &fs,
+		},
+	}
+
+	satisfyingTestCases := map[string]struct {
+		isExpectedMatch bool
+		vol             *v1.PersistentVolume
+		pvc             *v1.PersistentVolumeClaim
+	}{
+		"pv deletionTimeStamp not set": {
+			isExpectedMatch: true,
+			vol:             pv,
+			pvc:             pvc,
+		},
+		"pv deletionTimeStamp set": {
+			isExpectedMatch: false,
+			vol:             pvToDelete,
+			pvc:             pvc,
+		},
+	}
+
+	for name, testCase := range satisfyingTestCases {
+		t.Run(name, func(t *testing.T) {
+			err := checkVolumeSatisfyClaim(testCase.vol, testCase.pvc)
+			// expected to match but got an error
+			if err != nil && testCase.isExpectedMatch {
+				t.Errorf("%s: expected to match but got an error: %v", name, err)
+			}
+			// not expected to match but did
+			if err == nil && !testCase.isExpectedMatch {
+				t.Errorf("%s: not expected to match but did", name)
+			}
+		})
+	}
+
+	filteringTestCases := map[string]struct {
+		isExpectedMatch bool
+		vol             persistentVolumeOrderedIndex
+		pvc             *v1.PersistentVolumeClaim
+	}{
+		"pv deletionTimeStamp not set": {
+			isExpectedMatch: true,
+			vol:             createTestVolOrderedIndex(pv),
+			pvc:             pvc,
+		},
+		"pv deletionTimeStamp set": {
+			isExpectedMatch: false,
+			vol:             createTestVolOrderedIndex(pvToDelete),
+			pvc:             pvc,
+		},
+	}
+	for name, testCase := range filteringTestCases {
+		t.Run(name, func(t *testing.T) {
+			pvmatch, err := testCase.vol.findBestMatchForClaim(testCase.pvc, false)
+			// expected to match but either got an error or no returned pvmatch
+			if pvmatch == nil && testCase.isExpectedMatch {
+				t.Errorf("Unexpected failure for testcase, no matching volume: %s", name)
+			}
+			if err != nil && testCase.isExpectedMatch {
+				t.Errorf("Unexpected failure for testcase: %s - %+v", name, err)
+			}
+			// expected to not match but either got an error or a returned pvmatch
+			if pvmatch != nil && !testCase.isExpectedMatch {
+				t.Errorf("Unexpected failure for testcase, expected no matching volume: %s", name)
+			}
+			if err != nil && !testCase.isExpectedMatch {
+				t.Errorf("Unexpected failure for testcase: %s - %+v", name, err)
+			}
+		})
+	}
 }
 
 func TestFindingPreboundVolumes(t *testing.T) {
+	fs := v1.PersistentVolumeFilesystem
 	claim := &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "claim01",
 			Namespace: "myns",
-			SelfLink:  testapi.Default.SelfLink("pvc", ""),
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
-			Resources:   v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1Gi")}},
+			Resources:   v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1Gi")}},
+			VolumeMode:  &fs,
 		},
 	}
 	claimRef, err := ref.GetReference(scheme.Scheme, claim)
@@ -1075,11 +1407,11 @@ func TestFindingPreboundVolumes(t *testing.T) {
 	pvBadMode.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany}
 
 	index := newPersistentVolumeOrderedIndex()
-	index.store.Add(pv1)
-	index.store.Add(pv5)
-	index.store.Add(pv8)
-	index.store.Add(pvBadSize)
-	index.store.Add(pvBadMode)
+	require.NoError(t, index.Indexer().Add(pv1))
+	require.NoError(t, index.Indexer().Add(pv5))
+	require.NoError(t, index.Indexer().Add(pv8))
+	require.NoError(t, index.Indexer().Add(pvBadSize))
+	require.NoError(t, index.Indexer().Add(pvBadMode))
 
 	// expected exact match on size
 	volume, _ := index.findBestMatchForClaim(claim, false)
@@ -1122,7 +1454,7 @@ func TestFindingPreboundVolumes(t *testing.T) {
 func TestBestMatchDelayed(t *testing.T) {
 	volList := newPersistentVolumeOrderedIndex()
 	for _, pv := range createTestVolumes() {
-		volList.store.Add(pv)
+		require.NoError(t, volList.Indexer().Add(pv))
 	}
 
 	// binding through PV controller should be delayed
@@ -1136,120 +1468,8 @@ func TestBestMatchDelayed(t *testing.T) {
 	}
 }
 
-func TestFindMatchVolumeWithNode(t *testing.T) {
-	volumes := createTestVolumes()
-	node1 := &v1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{"key1": "value1"},
-		},
-	}
-	node2 := &v1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{"key1": "value2"},
-		},
-	}
-	node3 := &v1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{"key1": "value3"},
-		},
-	}
-
-	scenarios := map[string]struct {
-		expectedMatch   string
-		claim           *v1.PersistentVolumeClaim
-		node            *v1.Node
-		excludedVolumes map[string]*v1.PersistentVolume
-	}{
-		"success-match": {
-			expectedMatch: "affinity-pv",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-			}),
-			node: node1,
-		},
-		"success-prebound": {
-			expectedMatch: "affinity-prebound",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-				pvc.Name = "claim02"
-			}),
-			node: node1,
-		},
-		"success-exclusion": {
-			expectedMatch: "affinity-pv2",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-			}),
-			node:            node1,
-			excludedVolumes: map[string]*v1.PersistentVolume{"affinity001": nil},
-		},
-		"fail-exclusion": {
-			expectedMatch: "",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-			}),
-			node:            node1,
-			excludedVolumes: map[string]*v1.PersistentVolume{"affinity001": nil, "affinity002": nil},
-		},
-		"fail-accessmode": {
-			expectedMatch: "",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteMany}
-				pvc.Spec.StorageClassName = &classWait
-			}),
-			node: node1,
-		},
-		"fail-nodeaffinity": {
-			expectedMatch: "",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-			}),
-			node: node2,
-		},
-		"fail-prebound-node-affinity": {
-			expectedMatch: "",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-				pvc.Name = "claim02"
-			}),
-			node: node3,
-		},
-		"success-bad-and-good-node-affinity": {
-			expectedMatch: "affinity-pv3",
-			claim: makePVC("100G", func(pvc *v1.PersistentVolumeClaim) {
-				pvc.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-				pvc.Spec.StorageClassName = &classWait
-				pvc.Name = "claim03"
-			}),
-			node: node3,
-		},
-	}
-
-	for name, scenario := range scenarios {
-		volume, err := findMatchingVolume(scenario.claim, volumes, scenario.node, scenario.excludedVolumes, true)
-		if err != nil {
-			t.Errorf("Unexpected error matching volume by claim: %v", err)
-		}
-		if len(scenario.expectedMatch) != 0 && volume == nil {
-			t.Errorf("Expected match but received nil volume for scenario: %s", name)
-		}
-		if len(scenario.expectedMatch) != 0 && volume != nil && string(volume.UID) != scenario.expectedMatch {
-			t.Errorf("Expected %s but got volume %s in scenario %s", scenario.expectedMatch, volume.UID, name)
-		}
-		if len(scenario.expectedMatch) == 0 && volume != nil {
-			t.Errorf("Unexpected match for scenario: %s, matched with %s instead", name, volume.UID)
-		}
-	}
-}
-
 func TestCheckAccessModes(t *testing.T) {
-	volume := &v1.PersistentVolume{
+	pv := &v1.PersistentVolume{
 		Spec: v1.PersistentVolumeSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadWriteMany},
 		},
@@ -1286,7 +1506,7 @@ func TestCheckAccessModes(t *testing.T) {
 	}
 
 	for name, scenario := range scenarios {
-		result := checkAccessModes(scenario.claim, volume)
+		result := volume.CheckAccessModes(scenario.claim, pv)
 		if result != scenario.shouldSucceed {
 			t.Errorf("Test %q failed: Expected %v, got %v", name, scenario.shouldSucceed, result)
 		}

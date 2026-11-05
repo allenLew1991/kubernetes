@@ -17,29 +17,17 @@ limitations under the License.
 package main
 
 import (
-	"flag"
 	"os"
-	"runtime"
 
-	"github.com/golang/glog"
-
-	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/apiserver/pkg/server/signals"
+	"k8s.io/component-base/cli"
 	"k8s.io/sample-apiserver/pkg/cmd/server"
 )
 
 func main() {
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if len(os.Getenv("GOMAXPROCS")) == 0 {
-		runtime.GOMAXPROCS(runtime.NumCPU())
-	}
-
-	stopCh := genericapiserver.SetupSignalHandler()
-	cmd := server.NewCommandStartWardleServer(os.Stdout, os.Stderr, stopCh)
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
-	if err := cmd.Execute(); err != nil {
-		glog.Fatal(err)
-	}
+	ctx := signals.SetupSignalContext()
+	options := server.NewWardleServerOptions(os.Stdout, os.Stderr)
+	cmd := server.NewCommandStartWardleServer(ctx, options, false)
+	code := cli.Run(cmd)
+	os.Exit(code)
 }

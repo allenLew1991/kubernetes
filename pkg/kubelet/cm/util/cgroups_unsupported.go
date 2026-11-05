@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -18,6 +18,7 @@ limitations under the License.
 
 package util
 
+// GetPids gets pids of the desired cgroup
 func GetPids(cgroupPath string) ([]int, error) {
 	return nil, nil
 }

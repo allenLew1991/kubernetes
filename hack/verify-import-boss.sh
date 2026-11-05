@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -14,15 +14,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script checks import restrictions. The script looks for a file called
+# `.import-restrictions` in each directory, then all imports of the package are
+# checked against each "rule" in the file.
+# Usage: `hack/verify-import-boss.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
+kube::util::require-jq
 
-make -C "${KUBE_ROOT}" WHAT=vendor/k8s.io/code-generator/cmd/import-boss
+# Doing it this way is MUCH faster than simply saying "all", and there doesn't
+# seem to be a simpler way to express "this whole workspace".
+packages=()
+kube::util::read-array packages < <(
+    go work edit -json | jq -r '.Use[].DiskPath + "/..."'
+)
 
-$(kube::util::find-binary "import-boss") --verify-only
+GOPROXY=off \
+    go run ./cmd/import-boss -v "${KUBE_VERBOSE:-0}" "${packages[@]}"

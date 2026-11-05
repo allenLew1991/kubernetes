@@ -18,15 +18,18 @@ package history
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"sort"
 	"strconv"
 
-	apps "k8s.io/api/apps/v1beta1"
-	appsinformers "k8s.io/client-go/informers/apps/v1beta1"
+	apps "k8s.io/api/apps/v1"
+	appsinformers "k8s.io/client-go/informers/apps/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	appslisters "k8s.io/client-go/listers/apps/v1beta1"
+	appslisters "k8s.io/client-go/listers/apps/v1"
+	"k8s.io/kubernetes/pkg/controller"
 	hashutil "k8s.io/kubernetes/pkg/util/hash"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -45,59 +48,90 @@ import (
 // ControllerRevisionHashLabel is the label used to indicate the hash value of a ControllerRevision's Data.
 const ControllerRevisionHashLabel = "controller.kubernetes.io/hash"
 
+// ControllerRevisionControllerIndex is the index name for the ControllerRevision controller index.
+const ControllerRevisionControllerIndex = "controllerRevisionController"
+
+// ControllerRevisionControllerIndexKey returns the index key to locate ControllerRevisions with the specified controller ownerReference.
+// If the ownerReference is specified, the key is "namespace/kind/ownerReference.Name/ownerReference.UID".
+// If the ownerReference is nil, the key is just "namespace" for orphan revisions.
+func ControllerRevisionControllerIndexKey(namespace string, ownerReference *metav1.OwnerReference) string {
+	if ownerReference == nil {
+		return namespace
+	}
+	return namespace + "/" + ownerReference.Kind + "/" + ownerReference.Name + "/" + string(ownerReference.UID)
+}
+
+// AddControllerRevisionControllerIndexer adds an indexer for ControllerRevision's controllerRef.UID to the given Informer.
+// This indexer is used to efficiently look up ControllerRevisions by their ControllerRef.UID
+func AddControllerRevisionControllerIndexer(informer cache.SharedIndexInformer) error {
+	if _, exists := informer.GetIndexer().GetIndexers()[ControllerRevisionControllerIndex]; exists {
+		// indexer already exists, do nothing
+		return nil
+	}
+
+	err := informer.AddIndexers(cache.Indexers{
+		ControllerRevisionControllerIndex: func(obj interface{}) ([]string, error) {
+			cr, ok := obj.(*apps.ControllerRevision)
+			if !ok {
+				return nil, nil
+			}
+			// Get the ControllerRef of the ControllerRevision to check if it's managed by a controller.
+			// Index with a non-nil controller (indicating an owned revision) or a nil controller (indicating an orphan revision).
+			return []string{ControllerRevisionControllerIndexKey(cr.Namespace, metav1.GetControllerOfNoCopy(cr))}, nil
+		},
+	})
+	if err != nil {
+		// It's possible that the indexer was added by another controller between the check and the AddIndexers call.
+		// Check again if the indexer was added by another controller, otherwise return the error.
+		if _, exists := informer.GetIndexer().GetIndexers()[ControllerRevisionControllerIndex]; exists {
+			return nil
+		}
+	}
+	return err
+}
+
 // ControllerRevisionName returns the Name for a ControllerRevision in the form prefix-hash. If the length
 // of prefix is greater than 223 bytes, it is truncated to allow for a name that is no larger than 253 bytes.
-func ControllerRevisionName(prefix string, hash uint32) string {
+func ControllerRevisionName(prefix string, hash string) string {
 	if len(prefix) > 223 {
 		prefix = prefix[:223]
 	}
 
-	return fmt.Sprintf("%s-%s", prefix, rand.SafeEncodeString(strconv.FormatInt(int64(hash), 10)))
+	return fmt.Sprintf("%s-%s", prefix, hash)
 }
 
 // NewControllerRevision returns a ControllerRevision with a ControllerRef pointing to parent and indicating that
-// parent is of parentKind. The ControllerRevision has labels matching selector, contains Data equal to data, and
+// parent is of parentKind. The ControllerRevision has labels matching template labels, contains Data equal to data, and
 // has a Revision equal to revision. The collisionCount is used when creating the name of the ControllerRevision
 // so the name is likely unique. If the returned error is nil, the returned ControllerRevision is valid. If the
 // returned error is not nil, the returned ControllerRevision is invalid for use.
 func NewControllerRevision(parent metav1.Object,
 	parentKind schema.GroupVersionKind,
-	selector labels.Selector,
+	templateLabels map[string]string,
 	data runtime.RawExtension,
 	revision int64,
 	collisionCount *int32) (*apps.ControllerRevision, error) {
-	labelMap, err := labels.ConvertSelectorToLabelsMap(selector.String())
-	if err != nil {
-		return nil, err
+	labelMap := make(map[string]string)
+	for k, v := range templateLabels {
+		labelMap[k] = v
 	}
-	blockOwnerDeletion := true
-	isController := true
 	cr := &apps.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: labelMap,
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion:         parentKind.GroupVersion().String(),
-					Kind:               parentKind.Kind,
-					Name:               parent.GetName(),
-					UID:                parent.GetUID(),
-					BlockOwnerDeletion: &blockOwnerDeletion,
-					Controller:         &isController,
-				},
-			},
+			Labels:          labelMap,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(parent, parentKind)},
 		},
 		Data:     data,
 		Revision: revision,
 	}
 	hash := HashControllerRevision(cr, collisionCount)
 	cr.Name = ControllerRevisionName(parent.GetName(), hash)
-	cr.Labels[ControllerRevisionHashLabel] = strconv.FormatInt(int64(hash), 10)
+	cr.Labels[ControllerRevisionHashLabel] = hash
 	return cr, nil
 }
 
 // HashControllerRevision hashes the contents of revision's Data using FNV hashing. If probe is not nil, the byte value
-// of probe is added written to the hash as well.
-func HashControllerRevision(revision *apps.ControllerRevision, probe *int32) uint32 {
+// of probe is added written to the hash as well. The returned hash will be a safe encoded string to avoid bad words.
+func HashControllerRevision(revision *apps.ControllerRevision, probe *int32) string {
 	hf := fnv.New32()
 	if len(revision.Data.Raw) > 0 {
 		hf.Write(revision.Data.Raw)
@@ -108,38 +142,19 @@ func HashControllerRevision(revision *apps.ControllerRevision, probe *int32) uin
 	if probe != nil {
 		hf.Write([]byte(strconv.FormatInt(int64(*probe), 10)))
 	}
-	return hf.Sum32()
-
+	return rand.SafeEncodeString(fmt.Sprint(hf.Sum32()))
 }
 
 // SortControllerRevisions sorts revisions by their Revision.
 func SortControllerRevisions(revisions []*apps.ControllerRevision) {
-	sort.Sort(byRevision(revisions))
+	sort.Stable(byRevision(revisions))
 }
 
 // EqualRevision returns true if lhs and rhs are either both nil, or both point to non-nil ControllerRevisions that
 // contain semantically equivalent data. Otherwise this method returns false.
 func EqualRevision(lhs *apps.ControllerRevision, rhs *apps.ControllerRevision) bool {
-	var lhsHash, rhsHash *uint32
 	if lhs == nil || rhs == nil {
 		return lhs == rhs
-	}
-	if hs, found := lhs.Labels[ControllerRevisionHashLabel]; found {
-		hash, err := strconv.ParseInt(hs, 10, 32)
-		if err == nil {
-			lhsHash = new(uint32)
-			*lhsHash = uint32(hash)
-		}
-	}
-	if hs, found := rhs.Labels[ControllerRevisionHashLabel]; found {
-		hash, err := strconv.ParseInt(hs, 10, 32)
-		if err == nil {
-			rhsHash = new(uint32)
-			*rhsHash = uint32(hash)
-		}
-	}
-	if lhsHash != nil && rhsHash != nil && *lhsHash != *rhsHash {
-		return false
 	}
 	return bytes.Equal(lhs.Data.Raw, rhs.Data.Raw) && apiequality.Semantic.DeepEqual(lhs.Data.Object, rhs.Data.Object)
 }
@@ -163,7 +178,14 @@ func (br byRevision) Len() int {
 	return len(br)
 }
 
+// Less breaks ties first by creation timestamp, then by name
 func (br byRevision) Less(i, j int) bool {
+	if br[i].Revision == br[j].Revision {
+		if br[j].CreationTimestamp.Equal(&br[i].CreationTimestamp) {
+			return br[i].Name < br[j].Name
+		}
+		return br[j].CreationTimestamp.After(br[i].CreationTimestamp.Time)
+	}
 	return br[i].Revision < br[j].Revision
 }
 
@@ -178,7 +200,7 @@ type Interface interface {
 	// ListControllerRevisions lists all ControllerRevisions matching selector and owned by parent or no other
 	// controller. If the returned error is nil the returned slice of ControllerRevisions is valid. If the
 	// returned error is not nil, the returned slice is not valid.
-	ListControllerRevisions(parent metav1.Object, selector labels.Selector) ([]*apps.ControllerRevision, error)
+	ListControllerRevisions(parent metav1.Object, parentKind schema.GroupVersionKind, selector labels.Selector) ([]*apps.ControllerRevision, error)
 	// CreateControllerRevision attempts to create the revision as owned by parent via a ControllerRef. If name
 	// collision occurs, collisionCount (incremented each time collision occurs except for the first time) is
 	// added to the hash of the revision and it is renamed using ControllerRevisionName. Implementations may
@@ -206,8 +228,10 @@ type Interface interface {
 
 // NewHistory returns an instance of Interface that uses client to communicate with the API Server and lister to list
 // ControllerRevisions. This method should be used to create an Interface for all scenarios other than testing.
-func NewHistory(client clientset.Interface, lister appslisters.ControllerRevisionLister) Interface {
-	return &realHistory{client, lister}
+// If indexer is not nil, it will be used to optimize ListControllerRevisions and the indexer must have had
+// AddControllerRevisionControllerIndexer called on it.
+func NewHistory(client clientset.Interface, lister appslisters.ControllerRevisionLister, indexer cache.Indexer) Interface {
+	return &realHistory{client, lister, indexer}
 }
 
 // NewFakeHistory returns an instance of Interface that uses informer to create, update, list, and delete
@@ -217,19 +241,47 @@ func NewFakeHistory(informer appsinformers.ControllerRevisionInformer) Interface
 }
 
 type realHistory struct {
-	client clientset.Interface
-	lister appslisters.ControllerRevisionLister
+	client  clientset.Interface
+	lister  appslisters.ControllerRevisionLister
+	indexer cache.Indexer
 }
 
-func (rh *realHistory) ListControllerRevisions(parent metav1.Object, selector labels.Selector) ([]*apps.ControllerRevision, error) {
+func (rh *realHistory) ListControllerRevisions(parent metav1.Object, parentKind schema.GroupVersionKind, selector labels.Selector) ([]*apps.ControllerRevision, error) {
 	// List all revisions in the namespace that match the selector
-	history, err := rh.lister.ControllerRevisions(parent.GetNamespace()).List(selector)
-	if err != nil {
-		return nil, err
+	var history []*apps.ControllerRevision
+	var err error
+	if rh.indexer != nil {
+		keys := []string{
+			ControllerRevisionControllerIndexKey(parent.GetNamespace(), metav1.NewControllerRef(parent, parentKind)),
+			ControllerRevisionControllerIndexKey(parent.GetNamespace(), nil), // Include orphans
+		}
+
+		for _, key := range keys {
+			objs, err := rh.indexer.ByIndex(ControllerRevisionControllerIndex, key)
+			if err != nil {
+				return nil, err
+			}
+			for _, obj := range objs {
+				cr, ok := obj.(*apps.ControllerRevision)
+				if !ok {
+					continue
+				}
+				if selector.Matches(labels.Set(cr.Labels)) {
+					history = append(history, cr)
+				}
+			}
+		}
+	} else {
+		// Fallback to slow list if no indexer
+		history, err = rh.lister.ControllerRevisions(parent.GetNamespace()).List(selector)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	var owned []*apps.ControllerRevision
 	for i := range history {
-		ref := metav1.GetControllerOf(history[i])
+		ref := metav1.GetControllerOfNoCopy(history[i])
 		if ref == nil || ref.UID == parent.GetUID() {
 			owned = append(owned, history[i])
 		}
@@ -249,10 +301,18 @@ func (rh *realHistory) CreateControllerRevision(parent metav1.Object, revision *
 	// Continue to attempt to create the revision updating the name with a new hash on each iteration
 	for {
 		hash := HashControllerRevision(revision, collisionCount)
-		// Update the revisions name and labels
+		// Update the revisions name
 		clone.Name = ControllerRevisionName(parent.GetName(), hash)
-		created, err := rh.client.AppsV1beta1().ControllerRevisions(parent.GetNamespace()).Create(clone)
+		ns := parent.GetNamespace()
+		created, err := rh.client.AppsV1().ControllerRevisions(ns).Create(context.TODO(), clone, metav1.CreateOptions{})
 		if errors.IsAlreadyExists(err) {
+			exists, err := rh.client.AppsV1().ControllerRevisions(ns).Get(context.TODO(), clone.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			if bytes.Equal(exists.Data.Raw, clone.Data.Raw) {
+				return exists, nil
+			}
 			*collisionCount++
 			continue
 		}
@@ -267,7 +327,7 @@ func (rh *realHistory) UpdateControllerRevision(revision *apps.ControllerRevisio
 			return nil
 		}
 		clone.Revision = newRevision
-		updated, updateErr := rh.client.AppsV1beta1().ControllerRevisions(clone.Namespace).Update(clone)
+		updated, updateErr := rh.client.AppsV1().ControllerRevisions(clone.Namespace).Update(context.TODO(), clone, metav1.UpdateOptions{})
 		if updateErr == nil {
 			return nil
 		}
@@ -284,27 +344,57 @@ func (rh *realHistory) UpdateControllerRevision(revision *apps.ControllerRevisio
 }
 
 func (rh *realHistory) DeleteControllerRevision(revision *apps.ControllerRevision) error {
-	return rh.client.AppsV1beta1().ControllerRevisions(revision.Namespace).Delete(revision.Name, nil)
+	return rh.client.AppsV1().ControllerRevisions(revision.Namespace).Delete(context.TODO(), revision.Name, metav1.DeleteOptions{})
+}
+
+type objectForPatch struct {
+	Metadata objectMetaForPatch `json:"metadata"`
+}
+
+// objectMetaForPatch define object meta struct for patch operation
+type objectMetaForPatch struct {
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
+	UID             types.UID               `json:"uid"`
 }
 
 func (rh *realHistory) AdoptControllerRevision(parent metav1.Object, parentKind schema.GroupVersionKind, revision *apps.ControllerRevision) (*apps.ControllerRevision, error) {
-	// Return an error if the parent does not own the revision
-	if owner := metav1.GetControllerOf(revision); owner != nil {
+	blockOwnerDeletion := true
+	isController := true
+	// Return an error if the revision is not orphan
+	if owner := metav1.GetControllerOfNoCopy(revision); owner != nil {
 		return nil, fmt.Errorf("attempt to adopt revision owned by %v", owner)
 	}
+	addControllerPatch := objectForPatch{
+		Metadata: objectMetaForPatch{
+			UID: revision.UID,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         parentKind.GroupVersion().String(),
+				Kind:               parentKind.Kind,
+				Name:               parent.GetName(),
+				UID:                parent.GetUID(),
+				Controller:         &isController,
+				BlockOwnerDeletion: &blockOwnerDeletion,
+			}},
+		},
+	}
+	patchBytes, err := json.Marshal(&addControllerPatch)
+	if err != nil {
+		return nil, err
+	}
 	// Use strategic merge patch to add an owner reference indicating a controller ref
-	return rh.client.AppsV1beta1().ControllerRevisions(parent.GetNamespace()).Patch(revision.GetName(),
-		types.StrategicMergePatchType, []byte(fmt.Sprintf(
-			`{"metadata":{"ownerReferences":[{"apiVersion":"%s","kind":"%s","name":"%s","uid":"%s","controller":true,"blockOwnerDeletion":true}],"uid":"%s"}}`,
-			parentKind.GroupVersion().String(), parentKind.Kind,
-			parent.GetName(), parent.GetUID(), revision.UID)))
+	return rh.client.AppsV1().ControllerRevisions(parent.GetNamespace()).Patch(context.TODO(), revision.GetName(),
+		types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 }
 
 func (rh *realHistory) ReleaseControllerRevision(parent metav1.Object, revision *apps.ControllerRevision) (*apps.ControllerRevision, error) {
+	dataBytes, err := controller.GenerateDeleteOwnerRefStrategicMergeBytes(revision.UID, []types.UID{parent.GetUID()})
+	if err != nil {
+		return nil, err
+	}
+
 	// Use strategic merge patch to add an owner reference indicating a controller ref
-	released, err := rh.client.AppsV1beta1().ControllerRevisions(revision.GetNamespace()).Patch(revision.GetName(),
-		types.StrategicMergePatchType,
-		[]byte(fmt.Sprintf(`{"metadata":{"ownerReferences":[{"$patch":"delete","uid":"%s"}],"uid":"%s"}}`, parent.GetUID(), revision.UID)))
+	released, err := rh.client.AppsV1().ControllerRevisions(revision.GetNamespace()).Patch(context.TODO(), revision.GetName(),
+		types.StrategicMergePatchType, dataBytes, metav1.PatchOptions{})
 
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -325,7 +415,7 @@ type fakeHistory struct {
 	lister  appslisters.ControllerRevisionLister
 }
 
-func (fh *fakeHistory) ListControllerRevisions(parent metav1.Object, selector labels.Selector) ([]*apps.ControllerRevision, error) {
+func (fh *fakeHistory) ListControllerRevisions(parent metav1.Object, parentKind schema.GroupVersionKind, selector labels.Selector) ([]*apps.ControllerRevision, error) {
 	history, err := fh.lister.ControllerRevisions(parent.GetNamespace()).List(selector)
 	if err != nil {
 		return nil, err
@@ -403,8 +493,6 @@ func (fh *fakeHistory) UpdateControllerRevision(revision *apps.ControllerRevisio
 }
 
 func (fh *fakeHistory) AdoptControllerRevision(parent metav1.Object, parentKind schema.GroupVersionKind, revision *apps.ControllerRevision) (*apps.ControllerRevision, error) {
-	blockOwnerDeletion := true
-	isController := true
 	if owner := metav1.GetControllerOf(revision); owner != nil {
 		return nil, fmt.Errorf("attempt to adopt revision owned by %v", owner)
 	}
@@ -420,16 +508,8 @@ func (fh *fakeHistory) AdoptControllerRevision(parent metav1.Object, parentKind 
 		return nil, errors.NewNotFound(apps.Resource("controllerrevisions"), revision.Name)
 	}
 	clone := revision.DeepCopy()
-	clone.OwnerReferences = append(clone.OwnerReferences, metav1.OwnerReference{
-		APIVersion:         parentKind.GroupVersion().String(),
-		Kind:               parentKind.Kind,
-		Name:               parent.GetName(),
-		UID:                parent.GetUID(),
-		BlockOwnerDeletion: &blockOwnerDeletion,
-		Controller:         &isController,
-	})
+	clone.OwnerReferences = append(clone.OwnerReferences, *metav1.NewControllerRef(parent, parentKind))
 	return clone, fh.indexer.Update(clone)
-
 }
 
 func (fh *fakeHistory) ReleaseControllerRevision(parent metav1.Object, revision *apps.ControllerRevision) (*apps.ControllerRevision, error) {

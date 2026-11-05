@@ -19,21 +19,15 @@ package main
 import (
 	"os"
 
-	utilflag "k8s.io/apiserver/pkg/util/flag"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/logs/json/register" // for JSON log format registration
+	_ "k8s.io/component-base/metrics/prometheus/clientgo"
+	_ "k8s.io/component-base/metrics/prometheus/version" // for version metric registration
 	"k8s.io/kubernetes/cmd/kube-scheduler/app"
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
-	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
 )
 
 func main() {
 	command := app.NewSchedulerCommand()
-
-	utilflag.InitFlags()
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if err := command.Execute(); err != nil {
-		os.Exit(1)
-	}
+	code := cli.Run(command)
+	os.Exit(code)
 }

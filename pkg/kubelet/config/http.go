@@ -14,36 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Reads the pod configuration from an HTTP GET response.
 package config
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 
-	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
+	utilio "k8s.io/utils/io"
 )
 
 type sourceURL struct {
 	url         string
 	header      http.Header
 	nodeName    types.NodeName
-	updates     chan<- interface{}
+	updates     chan<- sourceUpdate
 	data        []byte
 	failureLogs int
 	client      *http.Client
 }
 
-func NewSourceURL(url string, header http.Header, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
+// NewSourceURL specifies the URL where to read the Pod configuration from, then watches it for changes.
+func NewSourceURL(logger klog.Logger, url string, header http.Header, nodeName types.NodeName, period time.Duration, updates chan<- sourceUpdate) {
 	config := &sourceURL{
 		url:      url,
 		header:   header,
@@ -54,35 +53,35 @@ func NewSourceURL(url string, header http.Header, nodeName types.NodeName, perio
 		// read the manifest URL passed to kubelet.
 		client: &http.Client{Timeout: 10 * time.Second},
 	}
-	glog.V(1).Infof("Watching URL %s", url)
-	go wait.Until(config.run, period, wait.NeverStop)
+	logger.V(1).Info("Watching URL", "URL", url)
+	go wait.Until(func() { config.run(logger) }, period, wait.NeverStop)
 }
 
-func (s *sourceURL) run() {
-	if err := s.extractFromURL(); err != nil {
+func (s *sourceURL) run(logger klog.Logger) {
+	if err := s.extractFromURL(logger); err != nil {
 		// Don't log this multiple times per minute. The first few entries should be
 		// enough to get the point across.
 		if s.failureLogs < 3 {
-			glog.Warningf("Failed to read pods from URL: %v", err)
+			logger.Info("Failed to read pods from URL", "err", err)
 		} else if s.failureLogs == 3 {
-			glog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
+			logger.Info("Failed to read pods from URL. Dropping verbosity of this message to V(4)", "err", err)
 		} else {
-			glog.V(4).Infof("Failed to read pods from URL: %v", err)
+			logger.V(4).Info("Failed to read pods from URL", "err", err)
 		}
 		s.failureLogs++
 	} else {
 		if s.failureLogs > 0 {
-			glog.Info("Successfully read pods from URL.")
+			logger.Info("Successfully read pods from URL")
 			s.failureLogs = 0
 		}
 	}
 }
 
-func (s *sourceURL) applyDefaults(pod *api.Pod) error {
-	return applyDefaults(pod, s.url, false, s.nodeName)
+func (s *sourceURL) applyDefaults(logger klog.Logger, pod *api.Pod) error {
+	return applyDefaults(logger, pod, s.url, false, s.nodeName)
 }
 
-func (s *sourceURL) extractFromURL() error {
+func (s *sourceURL) extractFromURL(logger klog.Logger) error {
 	req, err := http.NewRequest("GET", s.url, nil)
 	if err != nil {
 		return err
@@ -93,7 +92,7 @@ func (s *sourceURL) extractFromURL() error {
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := utilio.ReadAtMost(resp.Body, maxConfigLength)
 	if err != nil {
 		return err
 	}
@@ -102,42 +101,42 @@ func (s *sourceURL) extractFromURL() error {
 	}
 	if len(data) == 0 {
 		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
-		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		s.updates <- sourceUpdate{Pods: []*v1.Pod{}}
 		return fmt.Errorf("zero-length data received from %v", s.url)
 	}
 	// Short circuit if the data has not changed since the last time it was read.
-	if bytes.Compare(data, s.data) == 0 {
+	if bytes.Equal(data, s.data) {
 		return nil
 	}
 	s.data = data
 
 	// First try as it is a single pod.
-	parsed, pod, singlePodErr := tryDecodeSinglePod(data, s.applyDefaults)
+	parsed, pod, singlePodErr := tryDecodeSinglePod(logger, data, s.applyDefaults)
 	if parsed {
 		if singlePodErr != nil {
 			// It parsed but could not be used.
 			return singlePodErr
 		}
-		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		s.updates <- sourceUpdate{Pods: []*v1.Pod{pod}}
 		return nil
 	}
 
 	// That didn't work, so try a list of pods.
-	parsed, podList, multiPodErr := tryDecodePodList(data, s.applyDefaults)
+	parsed, podList, multiPodErr := tryDecodePodList(logger, data, s.applyDefaults)
 	if parsed {
 		if multiPodErr != nil {
 			// It parsed but could not be used.
 			return multiPodErr
 		}
-		pods := make([]*v1.Pod, 0)
+		pods := make([]*v1.Pod, 0, len(podList.Items))
 		for i := range podList.Items {
 			pods = append(pods, &podList.Items[i])
 		}
-		s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		s.updates <- sourceUpdate{Pods: pods}
 		return nil
 	}
 
 	return fmt.Errorf("%v: received '%v', but couldn't parse as "+
-		"single (%v) or multiple pods (%v).\n",
+		"single (%v) or multiple pods (%v)",
 		s.url, string(data), singlePodErr, multiPodErr)
 }

@@ -28,8 +28,9 @@ type fakeBackend struct {
 	events []*auditinternal.Event
 }
 
-func (f *fakeBackend) ProcessEvents(events ...*auditinternal.Event) {
+func (f *fakeBackend) ProcessEvents(events ...*auditinternal.Event) bool {
 	f.events = append(f.events, events...)
+	return true
 }
 
 func (f *fakeBackend) Run(stopCh <-chan struct{}) error {
@@ -38,6 +39,10 @@ func (f *fakeBackend) Run(stopCh <-chan struct{}) error {
 
 func (f *fakeBackend) Shutdown() {
 	// Nothing to do here.
+}
+
+func (f *fakeBackend) String() string {
+	return ""
 }
 
 func TestUnion(t *testing.T) {
@@ -73,5 +78,38 @@ func TestUnion(t *testing.T) {
 				t.Errorf("backend %d event %d wanted id %s, got %s", i, j, wantID, event.AuditID)
 			}
 		}
+	}
+}
+
+type cannotMultipleRunBackend struct {
+	started chan struct{}
+}
+
+func (b *cannotMultipleRunBackend) ProcessEvents(events ...*auditinternal.Event) bool {
+	return true
+}
+
+func (b *cannotMultipleRunBackend) Run(stopCh <-chan struct{}) error {
+	close(b.started)
+	return nil
+}
+
+func (b *cannotMultipleRunBackend) Shutdown() {}
+
+func (b *cannotMultipleRunBackend) String() string {
+	return "cannotMultipleRunBackend"
+}
+
+func TestUnionRun(t *testing.T) {
+	backends := []Backend{
+		&cannotMultipleRunBackend{started: make(chan struct{})},
+		&cannotMultipleRunBackend{started: make(chan struct{})},
+		&cannotMultipleRunBackend{started: make(chan struct{})},
+	}
+
+	b := Union(backends...)
+
+	if err := b.Run(make(chan struct{})); err != nil {
+		t.Errorf("union backend run: %v", err)
 	}
 }

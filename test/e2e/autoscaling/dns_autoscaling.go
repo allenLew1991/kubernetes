@@ -17,63 +17,85 @@ limitations under the License.
 package autoscaling
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
 )
 
+// This test requires coredns to be installed on the cluster with autoscaling enabled.
+// Compare your coredns manifest against the command below
+// helm template coredns -n kube-system coredns/coredns --set k8sAppLabelOverride=kube-dns --set fullnameOverride=coredns --set autoscaler.enabled=true
+
+// Constants used in dns-autoscaling test.
 const (
-	DNSdefaultTimeout      = 5 * time.Minute
-	ClusterAddonLabelKey   = "k8s-app"
-	DNSLabelName           = "kube-dns"
-	DNSAutoscalerLabelName = "kube-dns-autoscaler"
+	DNSdefaultTimeout    = 5 * time.Minute
+	ClusterAddonLabelKey = "k8s-app"
+	DNSLabelName         = "kube-dns"
 )
 
-var _ = SIGDescribe("DNS horizontal autoscaling", func() {
+var _ = SIGDescribe(feature.KubeDNSAutoscaler, "DNS horizontal autoscaling", func() {
 	f := framework.NewDefaultFramework("dns-autoscaling")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	var c clientset.Interface
 	var previousParams map[string]string
+	var configMapNames map[string]string
 	var originDNSReplicasCount int
-	var DNSParams_1 DNSParamsLinear
-	var DNSParams_2 DNSParamsLinear
-	var DNSParams_3 DNSParamsLinear
+	var DNSParams1 DNSParamsLinear
+	var DNSParams2 DNSParamsLinear
+	var DNSParams3 DNSParamsLinear
 
-	BeforeEach(func() {
-		framework.SkipUnlessProviderIs("gce", "gke")
+	ginkgo.BeforeEach(func(ctx context.Context) {
 		c = f.ClientSet
 
-		nodeCount := len(framework.GetReadySchedulableNodesOrDie(c).Items)
-		Expect(nodeCount).NotTo(BeZero())
+		nodes, err := e2enode.GetReadySchedulableNodes(ctx, c)
+		framework.ExpectNoError(err, "list ready schedulable nodes")
+		nodeCount := len(nodes.Items)
 
-		By("Collecting original replicas count and DNS scaling params")
-		var err error
-		originDNSReplicasCount, err = getDNSReplicas(c)
-		Expect(err).NotTo(HaveOccurred())
+		ginkgo.By("Collecting original replicas count and DNS scaling params")
 
-		pcm, err := fetchDNSScalingConfigMap(c)
-		Expect(err).NotTo(HaveOccurred())
+		// Check if we are running coredns or kube-dns, the only difference is the name of the autoscaling CM.
+		// The test should be have identically on both dns providers
+		provider, err := detectDNSProvider(ctx, c)
+		if err != nil {
+			e2eskipper.Skipf("Test expects DNS provider: %s", err)
+		}
+
+		originDNSReplicasCount, err = getDNSReplicas(ctx, c)
+		framework.ExpectNoError(err, "get the DNS replica count")
+		configMapNames = map[string]string{
+			"kube-dns": "kube-dns-autoscaler",
+			"coredns":  "coredns-autoscaler",
+		}
+
+		pcm, err := fetchDNSScalingConfigMap(ctx, c, configMapNames[provider])
+		framework.Logf("original DNS scaling params: %v", pcm)
+		framework.ExpectNoError(err, "get DNS scaling ConfigMap %q", configMapNames[provider])
 		previousParams = pcm.Data
 
 		if nodeCount <= 500 {
-			DNSParams_1 = DNSParamsLinear{
+			DNSParams1 = DNSParamsLinear{
 				nodesPerReplica: 1,
 			}
-			DNSParams_2 = DNSParamsLinear{
+			DNSParams2 = DNSParamsLinear{
 				nodesPerReplica: 2,
 			}
-			DNSParams_3 = DNSParamsLinear{
+			DNSParams3 = DNSParamsLinear{
 				nodesPerReplica: 3,
 				coresPerReplica: 3,
 			}
@@ -83,13 +105,13 @@ var _ = SIGDescribe("DNS horizontal autoscaling", func() {
 			// The default setup is: 256 cores/replica, 16 nodes/replica.
 			// With nodeCount > 500, nodes/13, nodes/14, nodes/15 and nodes/16
 			// are different numbers.
-			DNSParams_1 = DNSParamsLinear{
+			DNSParams1 = DNSParamsLinear{
 				nodesPerReplica: 13,
 			}
-			DNSParams_2 = DNSParamsLinear{
+			DNSParams2 = DNSParamsLinear{
 				nodesPerReplica: 14,
 			}
-			DNSParams_3 = DNSParamsLinear{
+			DNSParams3 = DNSParamsLinear{
 				nodesPerReplica: 15,
 				coresPerReplica: 15,
 			}
@@ -98,116 +120,129 @@ var _ = SIGDescribe("DNS horizontal autoscaling", func() {
 
 	// This test is separated because it is slow and need to run serially.
 	// Will take around 5 minutes to run on a 4 nodes cluster.
-	It("[Serial] [Slow] kube-dns-autoscaler should scale kube-dns pods when cluster size changed", func() {
+	f.It(f.WithSerial(), f.WithSlow(), "kube-dns-autoscaler should scale kube-dns pods when cluster size changed", func(ctx context.Context) {
+		numNodes, err := e2enode.TotalRegistered(ctx, c)
+		framework.ExpectNoError(err, "count registered nodes")
 
-		By("Replace the dns autoscaling parameters with testing parameters")
-		err := updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_1)))
-		Expect(err).NotTo(HaveOccurred())
+		configMapNames = map[string]string{
+			"kube-dns": "kube-dns-autoscaler",
+			"coredns":  "coredns-autoscaler",
+		}
+		provider, err := detectDNSProvider(ctx, c)
+		framework.ExpectNoError(err, "detect the cluster DNS provider")
+
+		ginkgo.By("Replace the dns autoscaling parameters with testing parameters")
+		err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams1)))
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
 		defer func() {
-			By("Restoring intial dns autoscaling parameters")
-			Expect(updateDNSScalingConfigMap(c, packDNSScalingConfigMap(previousParams))).NotTo(HaveOccurred())
+			ginkgo.By("Restoring initial dns autoscaling parameters")
+			err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], previousParams))
+			framework.ExpectNoError(err, "update DNS autoscaler configuration")
 
-			By("Wait for number of running and ready kube-dns pods recover")
+			ginkgo.By("Wait for number of running and ready kube-dns pods recover")
 			label := labels.SelectorFromSet(labels.Set(map[string]string{ClusterAddonLabelKey: DNSLabelName}))
-			_, err := framework.WaitForPodsWithLabelRunningReady(c, metav1.NamespaceSystem, label, originDNSReplicasCount, DNSdefaultTimeout)
-			Expect(err).NotTo(HaveOccurred())
+			_, err := e2epod.WaitForPodsWithLabelRunningReady(ctx, c, metav1.NamespaceSystem, label, originDNSReplicasCount, DNSdefaultTimeout)
+			framework.ExpectNoError(err, "wait for pods matching %q in namespace %q to become running and ready", label.String(), metav1.NamespaceSystem)
 		}()
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear := getExpectReplicasFuncLinear(c, &DNSParams_1)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		getExpectReplicasLinear := getExpectReplicasFuncLinear(ctx, c, &DNSParams1)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		originalSizes := make(map[string]int)
-		sum := 0
-		for _, mig := range strings.Split(framework.TestContext.CloudConfig.NodeInstanceGroup, ",") {
-			size, err := framework.GroupSize(mig)
-			Expect(err).NotTo(HaveOccurred())
-			By(fmt.Sprintf("Initial size of %s: %d", mig, size))
-			originalSizes[mig] = size
-			sum += size
-		}
+		ginkgo.By("Manually increase cluster size")
+		cleanupIncreasedSizeFunc := increaseClusterSize(ctx, f, c, numNodes+1)
+		err = WaitForClusterSizeFunc(ctx, c,
+			func(size int) bool { return size == numNodes+1 }, scaleUpTimeout)
+		framework.ExpectNoError(err, "wait for cluster scale-up to %d nodes", numNodes+1)
 
-		By("Manually increase cluster size")
-		increasedSize := 0
-		increasedSizes := make(map[string]int)
-		for key, val := range originalSizes {
-			increasedSizes[key] = val + 1
-			increasedSize += increasedSizes[key]
-		}
-		setMigSizes(increasedSizes)
-		Expect(WaitForClusterSizeFunc(c,
-			func(size int) bool { return size == increasedSize }, scaleUpTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		getExpectReplicasLinear = getExpectReplicasFuncLinear(ctx, c, &DNSParams1)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear = getExpectReplicasFuncLinear(c, &DNSParams_1)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Replace the dns autoscaling parameters with another testing parameters")
+		err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams3)))
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
 
-		By("Replace the dns autoscaling parameters with another testing parameters")
-		err = updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_3)))
-		Expect(err).NotTo(HaveOccurred())
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		getExpectReplicasLinear = getExpectReplicasFuncLinear(ctx, c, &DNSParams3)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear = getExpectReplicasFuncLinear(c, &DNSParams_3)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Restoring cluster size")
+		framework.ExpectNoError(cleanupIncreasedSizeFunc(), "remove pods used to increase cluster size")
 
-		By("Restoring cluster size")
-		setMigSizes(originalSizes)
-		Expect(framework.WaitForReadyNodes(c, sum, scaleDownTimeout)).NotTo(HaveOccurred())
-
-		By("Wait for kube-dns scaled to expected number")
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 	})
 
-	// TODO: Get rid of [DisabledForLargeClusters] tag when issue #55779 is fixed.
-	It("[DisabledForLargeClusters] kube-dns-autoscaler should scale kube-dns pods in both nonfaulty and faulty scenarios", func() {
+	ginkgo.It("kube-dns-autoscaler should scale kube-dns pods in both nonfaulty and faulty scenarios", func(ctx context.Context) {
 
-		By("Replace the dns autoscaling parameters with testing parameters")
-		err := updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_1)))
-		Expect(err).NotTo(HaveOccurred())
+		configMapNames = map[string]string{
+			"kube-dns": "kube-dns-autoscaler",
+			"coredns":  "coredns-autoscaler",
+		}
+		provider, err := detectDNSProvider(ctx, c)
+		framework.ExpectNoError(err, "detect the cluster DNS provider")
+
+		ginkgo.By("Replace the dns autoscaling parameters with testing parameters")
+		cm := packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams1))
+		framework.Logf("Updating the following cm: %v", cm)
+		err = updateDNSScalingConfigMap(ctx, c, cm)
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
 		defer func() {
-			By("Restoring intial dns autoscaling parameters")
-			Expect(updateDNSScalingConfigMap(c, packDNSScalingConfigMap(previousParams))).NotTo(HaveOccurred())
+			ginkgo.By("Restoring initial dns autoscaling parameters")
+			err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], previousParams))
+			framework.ExpectNoError(err, "update DNS autoscaler configuration")
 		}()
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear := getExpectReplicasFuncLinear(c, &DNSParams_1)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		getExpectReplicasLinear := getExpectReplicasFuncLinear(ctx, c, &DNSParams1)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		By("--- Scenario: should scale kube-dns based on changed parameters ---")
-		By("Replace the dns autoscaling parameters with another testing parameters")
-		err = updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_3)))
-		Expect(err).NotTo(HaveOccurred())
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear = getExpectReplicasFuncLinear(c, &DNSParams_3)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("--- Scenario: should scale kube-dns based on changed parameters ---")
+		ginkgo.By("Replace the dns autoscaling parameters with another testing parameters")
+		err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams3)))
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
+		ginkgo.By("Wait for kube-dns scaled to expected number")
+		getExpectReplicasLinear = getExpectReplicasFuncLinear(ctx, c, &DNSParams3)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		By("--- Scenario: should re-create scaling parameters with default value when parameters got deleted ---")
-		By("Delete the ConfigMap for autoscaler")
-		err = deleteDNSScalingConfigMap(c)
-		Expect(err).NotTo(HaveOccurred())
+		ginkgo.By("--- Scenario: should re-create scaling parameters with default value when parameters got deleted ---")
+		ginkgo.By("Delete the ConfigMap for autoscaler")
+		err = deleteDNSScalingConfigMap(ctx, c, configMapNames[provider])
+		framework.ExpectNoError(err, "delete DNS scaling ConfigMap %q", configMapNames[provider])
 
-		By("Wait for the ConfigMap got re-created")
-		_, err = waitForDNSConfigMapCreated(c, DNSdefaultTimeout)
-		Expect(err).NotTo(HaveOccurred())
+		ginkgo.By("Wait for the ConfigMap got re-created")
+		_, err = waitForDNSConfigMapCreated(ctx, c, DNSdefaultTimeout, configMapNames[provider])
+		framework.ExpectNoError(err, "wait for creation of DNS scaling ConfigMap %q", configMapNames[provider])
 
-		By("Replace the dns autoscaling parameters with another testing parameters")
-		err = updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_2)))
-		Expect(err).NotTo(HaveOccurred())
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear = getExpectReplicasFuncLinear(c, &DNSParams_2)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Replace the dns autoscaling parameters with another testing parameters")
+		err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams2)))
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
+		ginkgo.By("Wait for kube-dns/coredns scaled to expected number")
+		getExpectReplicasLinear = getExpectReplicasFuncLinear(ctx, c, &DNSParams2)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 
-		By("--- Scenario: should recover after autoscaler pod got deleted ---")
-		By("Delete the autoscaler pod for kube-dns")
-		Expect(deleteDNSAutoscalerPod(c)).NotTo(HaveOccurred())
+		ginkgo.By("--- Scenario: should recover after autoscaler pod got deleted ---")
+		ginkgo.By("Delete the autoscaler pod for kube-dns/coredns")
+		err = deleteDNSAutoscalerPod(ctx, c)
+		framework.ExpectNoError(err, "delete the DNS autoscaler pod")
 
-		By("Replace the dns autoscaling parameters with another testing parameters")
-		err = updateDNSScalingConfigMap(c, packDNSScalingConfigMap(packLinearParams(&DNSParams_1)))
-		Expect(err).NotTo(HaveOccurred())
-		By("Wait for kube-dns scaled to expected number")
-		getExpectReplicasLinear = getExpectReplicasFuncLinear(c, &DNSParams_1)
-		Expect(waitForDNSReplicasSatisfied(c, getExpectReplicasLinear, DNSdefaultTimeout)).NotTo(HaveOccurred())
+		ginkgo.By("Replace the dns autoscaling parameters with another testing parameters")
+		err = updateDNSScalingConfigMap(ctx, c, packDNSScalingConfigMap(configMapNames[provider], packLinearParams(&DNSParams1)))
+		framework.ExpectNoError(err, "update DNS autoscaler configuration")
+		ginkgo.By("Wait for kube-dns/coredns scaled to expected number")
+		getExpectReplicasLinear = getExpectReplicasFuncLinear(ctx, c, &DNSParams1)
+		err = waitForDNSReplicasSatisfied(ctx, c, getExpectReplicasLinear, DNSdefaultTimeout)
+		framework.ExpectNoError(err, "wait for DNS replica count to match the linear autoscaling policy")
 	})
 })
 
+// DNSParamsLinear is a struct for number of DNS pods.
 type DNSParamsLinear struct {
 	nodesPerReplica float64
 	coresPerReplica float64
@@ -217,47 +252,56 @@ type DNSParamsLinear struct {
 
 type getExpectReplicasFunc func(c clientset.Interface) int
 
-func getExpectReplicasFuncLinear(c clientset.Interface, params *DNSParamsLinear) getExpectReplicasFunc {
+func getExpectReplicasFuncLinear(ctx context.Context, c clientset.Interface, params *DNSParamsLinear) getExpectReplicasFunc {
 	return func(c clientset.Interface) int {
 		var replicasFromNodes float64
 		var replicasFromCores float64
-		nodes := framework.GetReadySchedulableNodesOrDie(c).Items
+		nodes, err := e2enode.GetReadyNodesIncludingTainted(ctx, c)
+		framework.ExpectNoError(err, "list ready nodes including tainted nodes")
 		if params.nodesPerReplica > 0 {
-			replicasFromNodes = math.Ceil(float64(len(nodes)) / params.nodesPerReplica)
+			replicasFromNodes = math.Ceil(float64(len(nodes.Items)) / params.nodesPerReplica)
 		}
 		if params.coresPerReplica > 0 {
-			replicasFromCores = math.Ceil(float64(getScheduableCores(nodes)) / params.coresPerReplica)
+			replicasFromCores = math.Ceil(float64(getSchedulableCores(nodes.Items)) / params.coresPerReplica)
 		}
 		return int(math.Max(1.0, math.Max(replicasFromNodes, replicasFromCores)))
 	}
 }
 
-func getScheduableCores(nodes []v1.Node) int64 {
+func getSchedulableCores(nodes []v1.Node) int64 {
 	var sc resource.Quantity
 	for _, node := range nodes {
 		if !node.Spec.Unschedulable {
-			sc.Add(node.Status.Capacity[v1.ResourceCPU])
+			sc.Add(node.Status.Allocatable[v1.ResourceCPU])
 		}
 	}
-
-	scInt64, scOk := sc.AsInt64()
-	if !scOk {
-		framework.Logf("Unable to compute integer values of schedulable cores in the cluster")
-		return 0
-	}
-	return scInt64
+	return sc.Value()
 }
 
-func fetchDNSScalingConfigMap(c clientset.Interface) (*v1.ConfigMap, error) {
-	cm, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(DNSAutoscalerLabelName, metav1.GetOptions{})
+func detectDNSProvider(ctx context.Context, c clientset.Interface) (string, error) {
+	cm, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx, "coredns-autoscaler", metav1.GetOptions{})
+	if cm != nil && err == nil {
+		return "coredns", nil
+	}
+
+	cm, err = c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx, "kube-dns-autoscaler", metav1.GetOptions{})
+	if cm != nil && err == nil {
+		return "kube-dns", nil
+	}
+
+	return "", fmt.Errorf("the cluster doesn't have kube-dns or coredns autoscaling configured")
+}
+
+func fetchDNSScalingConfigMap(ctx context.Context, c clientset.Interface, configMapName string) (*v1.ConfigMap, error) {
+	cm, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx, configMapName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	return cm, nil
 }
 
-func deleteDNSScalingConfigMap(c clientset.Interface) error {
-	if err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Delete(DNSAutoscalerLabelName, nil); err != nil {
+func deleteDNSScalingConfigMap(ctx context.Context, c clientset.Interface, configMapName string) error {
+	if err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Delete(ctx, configMapName, metav1.DeleteOptions{}); err != nil {
 		return err
 	}
 	framework.Logf("DNS autoscaling ConfigMap deleted.")
@@ -274,16 +318,16 @@ func packLinearParams(params *DNSParamsLinear) map[string]string {
 	return paramsMap
 }
 
-func packDNSScalingConfigMap(params map[string]string) *v1.ConfigMap {
+func packDNSScalingConfigMap(configMapName string, params map[string]string) *v1.ConfigMap {
 	configMap := v1.ConfigMap{}
-	configMap.ObjectMeta.Name = DNSAutoscalerLabelName
+	configMap.ObjectMeta.Name = configMapName
 	configMap.ObjectMeta.Namespace = metav1.NamespaceSystem
 	configMap.Data = params
 	return &configMap
 }
 
-func updateDNSScalingConfigMap(c clientset.Interface, configMap *v1.ConfigMap) error {
-	_, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Update(configMap)
+func updateDNSScalingConfigMap(ctx context.Context, c clientset.Interface, configMap *v1.ConfigMap) error {
+	_, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Update(ctx, configMap, metav1.UpdateOptions{})
 	if err != nil {
 		return err
 	}
@@ -291,10 +335,10 @@ func updateDNSScalingConfigMap(c clientset.Interface, configMap *v1.ConfigMap) e
 	return nil
 }
 
-func getDNSReplicas(c clientset.Interface) (int, error) {
+func getDNSReplicas(ctx context.Context, c clientset.Interface) (int, error) {
 	label := labels.SelectorFromSet(labels.Set(map[string]string{ClusterAddonLabelKey: DNSLabelName}))
 	listOpts := metav1.ListOptions{LabelSelector: label.String()}
-	deployments, err := c.ExtensionsV1beta1().Deployments(metav1.NamespaceSystem).List(listOpts)
+	deployments, err := c.AppsV1().Deployments(metav1.NamespaceSystem).List(ctx, listOpts)
 	if err != nil {
 		return 0, err
 	}
@@ -306,10 +350,10 @@ func getDNSReplicas(c clientset.Interface) (int, error) {
 	return int(*(deployment.Spec.Replicas)), nil
 }
 
-func deleteDNSAutoscalerPod(c clientset.Interface) error {
-	label := labels.SelectorFromSet(labels.Set(map[string]string{ClusterAddonLabelKey: DNSAutoscalerLabelName}))
-	listOpts := metav1.ListOptions{LabelSelector: label.String()}
-	pods, err := c.CoreV1().Pods(metav1.NamespaceSystem).List(listOpts)
+func deleteDNSAutoscalerPod(ctx context.Context, c clientset.Interface) error {
+	selector, _ := labels.Parse(fmt.Sprintf("%s in (kube-dns-autoscaler, coredns-autoscaler)", ClusterAddonLabelKey))
+	listOpts := metav1.ListOptions{LabelSelector: selector.String()}
+	pods, err := c.CoreV1().Pods(metav1.NamespaceSystem).List(ctx, listOpts)
 	if err != nil {
 		return err
 	}
@@ -318,19 +362,19 @@ func deleteDNSAutoscalerPod(c clientset.Interface) error {
 	}
 
 	podName := pods.Items[0].Name
-	if err := c.CoreV1().Pods(metav1.NamespaceSystem).Delete(podName, nil); err != nil {
+	if err := c.CoreV1().Pods(metav1.NamespaceSystem).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
 		return err
 	}
 	framework.Logf("DNS autoscaling pod %v deleted.", podName)
 	return nil
 }
 
-func waitForDNSReplicasSatisfied(c clientset.Interface, getExpected getExpectReplicasFunc, timeout time.Duration) (err error) {
+func waitForDNSReplicasSatisfied(ctx context.Context, c clientset.Interface, getExpected getExpectReplicasFunc, timeout time.Duration) (err error) {
 	var current int
 	var expected int
 	framework.Logf("Waiting up to %v for kube-dns to reach expected replicas", timeout)
-	condition := func() (bool, error) {
-		current, err = getDNSReplicas(c)
+	condition := func(ctx context.Context) (bool, error) {
+		current, err = getDNSReplicas(ctx, c)
 		if err != nil {
 			return false, err
 		}
@@ -342,25 +386,25 @@ func waitForDNSReplicasSatisfied(c clientset.Interface, getExpected getExpectRep
 		return true, nil
 	}
 
-	if err = wait.Poll(2*time.Second, timeout, condition); err != nil {
-		return fmt.Errorf("err waiting for DNS replicas to satisfy %v, got %v: %v", expected, current, err)
+	if err = wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, false, condition); err != nil {
+		return fmt.Errorf("err waiting for DNS replicas to satisfy %v, got %v: %w", expected, current, err)
 	}
 	framework.Logf("kube-dns reaches expected replicas: %v", expected)
 	return nil
 }
 
-func waitForDNSConfigMapCreated(c clientset.Interface, timeout time.Duration) (configMap *v1.ConfigMap, err error) {
-	framework.Logf("Waiting up to %v for DNS autoscaling ConfigMap got re-created", timeout)
-	condition := func() (bool, error) {
-		configMap, err = fetchDNSScalingConfigMap(c)
+func waitForDNSConfigMapCreated(ctx context.Context, c clientset.Interface, timeout time.Duration, configMapName string) (configMap *v1.ConfigMap, err error) {
+	framework.Logf("Waiting up to %v for DNS autoscaling ConfigMap to be re-created", timeout)
+	condition := func(ctx context.Context) (bool, error) {
+		configMap, err = fetchDNSScalingConfigMap(ctx, c, configMapName)
 		if err != nil {
 			return false, nil
 		}
 		return true, nil
 	}
 
-	if err = wait.Poll(time.Second, timeout, condition); err != nil {
-		return nil, fmt.Errorf("err waiting for DNS autoscaling ConfigMap got re-created: %v", err)
+	if err = wait.PollUntilContextTimeout(ctx, time.Second, timeout, false, condition); err != nil {
+		return nil, fmt.Errorf("err waiting for DNS autoscaling ConfigMap got re-created: %w", err)
 	}
 	return configMap, nil
 }

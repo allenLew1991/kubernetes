@@ -19,45 +19,52 @@ package main
 
 import (
 	"flag"
-	"path/filepath"
+	"slices"
 
-	"github.com/golang/glog"
 	"github.com/spf13/pflag"
-	"k8s.io/gengo/args"
+	"k8s.io/klog/v2"
 
-	generatorargs "k8s.io/code-generator/cmd/client-gen/args"
+	"k8s.io/code-generator/cmd/client-gen/args"
 	"k8s.io/code-generator/cmd/client-gen/generators"
+	"k8s.io/code-generator/pkg/util"
+	"k8s.io/gengo/v2"
+	"k8s.io/gengo/v2/generator"
 )
 
 func main() {
-	genericArgs, customArgs := generatorargs.NewDefaults()
+	klog.InitFlags(nil)
+	args := args.New()
 
-	// Override defaults.
-	// TODO: move this out of client-gen
-	genericArgs.GoHeaderFilePath = filepath.Join(args.DefaultSourceTree(), "k8s.io/kubernetes/hack/boilerplate/boilerplate.go.txt")
-	genericArgs.OutputPackagePath = "k8s.io/kubernetes/pkg/client/clientset_generated/"
-
-	genericArgs.AddFlags(pflag.CommandLine)
-	customArgs.AddFlags(pflag.CommandLine, "k8s.io/kubernetes/pkg/apis") // TODO: move this input path out of client-gen
+	args.AddFlags(pflag.CommandLine, "k8s.io/kubernetes/pkg/apis") // TODO: move this input path out of client-gen
+	flag.Set("logtostderr", "true")
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
 
 	// add group version package as input dirs for gengo
-	for _, pkg := range customArgs.Groups {
+	inputPkgs := []string{}
+	for _, pkg := range args.Groups {
 		for _, v := range pkg.Versions {
-			genericArgs.InputDirs = append(genericArgs.InputDirs, v.Package)
+			inputPkgs = append(inputPkgs, v.Package)
 		}
 	}
+	// ensure stable code generation output
+	slices.Sort(inputPkgs)
 
-	if err := generatorargs.Validate(genericArgs); err != nil {
-		glog.Fatalf("Error: %v", err)
+	if err := args.Validate(); err != nil {
+		klog.Fatalf("Error: %v", err)
 	}
 
-	if err := genericArgs.Execute(
-		generators.NameSystems(),
+	myTargets := func(context *generator.Context) []generator.Target {
+		return generators.GetTargets(context, args)
+	}
+
+	if err := gengo.Execute(
+		generators.NameSystems(util.PluralExceptionListToMapOrDie(args.PluralExceptions)),
 		generators.DefaultNameSystem(),
-		generators.Packages,
+		myTargets,
+		gengo.StdBuildTag,
+		inputPkgs,
 	); err != nil {
-		glog.Fatalf("Error: %v", err)
+		klog.Fatalf("Error: %v", err)
 	}
 }

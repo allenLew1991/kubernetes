@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -20,9 +20,8 @@ package util
 
 import (
 	"encoding/base64"
-	"io/ioutil"
+	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -133,7 +132,7 @@ func TestPathsToRemove(t *testing.T) {
 		name     string
 		payload1 map[string]FileProjection
 		payload2 map[string]FileProjection
-		expected sets.String
+		expected sets.Set[string]
 	}{
 		{
 			name: "simple",
@@ -144,7 +143,7 @@ func TestPathsToRemove(t *testing.T) {
 			payload2: map[string]FileProjection{
 				"foo.txt": {Mode: 0644, Data: []byte("foo")},
 			},
-			expected: sets.NewString("bar.txt"),
+			expected: sets.New[string]("bar.txt"),
 		},
 		{
 			name: "simple 2",
@@ -155,7 +154,7 @@ func TestPathsToRemove(t *testing.T) {
 			payload2: map[string]FileProjection{
 				"foo.txt": {Mode: 0644, Data: []byte("foo")},
 			},
-			expected: sets.NewString("zip/bar.txt", "zip"),
+			expected: sets.New[string]("zip/bar.txt", "zip"),
 		},
 		{
 			name: "subdirs 1",
@@ -166,7 +165,7 @@ func TestPathsToRemove(t *testing.T) {
 			payload2: map[string]FileProjection{
 				"foo.txt": {Mode: 0644, Data: []byte("foo")},
 			},
-			expected: sets.NewString("zip/zap/bar.txt", "zip", "zip/zap"),
+			expected: sets.New[string]("zip/zap/bar.txt", "zip", "zip/zap"),
 		},
 		{
 			name: "subdirs 2",
@@ -177,7 +176,7 @@ func TestPathsToRemove(t *testing.T) {
 			payload2: map[string]FileProjection{
 				"foo.txt": {Mode: 0644, Data: []byte("foo")},
 			},
-			expected: sets.NewString("zip/1/2/3/4/bar.txt", "zip", "zip/1", "zip/1/2", "zip/1/2/3", "zip/1/2/3/4"),
+			expected: sets.New[string]("zip/1/2/3/4/bar.txt", "zip", "zip/1", "zip/1/2", "zip/1/2/3", "zip/1/2/3/4"),
 		},
 		{
 			name: "subdirs 3",
@@ -189,7 +188,7 @@ func TestPathsToRemove(t *testing.T) {
 			payload2: map[string]FileProjection{
 				"foo.txt": {Mode: 0644, Data: []byte("foo")},
 			},
-			expected: sets.NewString("zip/1/2/3/4/bar.txt", "zip", "zip/1", "zip/1/2", "zip/1/2/3", "zip/1/2/3/4", "zap", "zap/a", "zap/a/b", "zap/a/b/c", "zap/a/b/c/bar.txt"),
+			expected: sets.New[string]("zip/1/2/3/4/bar.txt", "zip", "zip/1", "zip/1/2", "zip/1/2/3", "zip/1/2/3/4", "zap", "zap/a", "zap/a/b", "zap/a/b/c", "zap/a/b/c/bar.txt"),
 		},
 		{
 			name: "subdirs 4",
@@ -203,7 +202,7 @@ func TestPathsToRemove(t *testing.T) {
 				"foo.txt":           {Mode: 0644, Data: []byte("foo")},
 				"zap/1/2/magic.txt": {Mode: 0644, Data: []byte("indigo")},
 			},
-			expected: sets.NewString("zap/1/2/3/4/bar.txt", "zap/1/2/3", "zap/1/2/3/4", "zap/1/2/3/4/bar.txt", "zap/1/2/c", "zap/1/2/c/bar.txt"),
+			expected: sets.New[string]("zap/1/2/3/4/bar.txt", "zap/1/2/3", "zap/1/2/3/4", "zap/1/2/3/4/bar.txt", "zap/1/2/c", "zap/1/2/c/bar.txt"),
 		},
 		{
 			name: "subdirs 5",
@@ -216,7 +215,7 @@ func TestPathsToRemove(t *testing.T) {
 				"foo.txt":           {Mode: 0644, Data: []byte("foo")},
 				"zap/1/2/magic.txt": {Mode: 0644, Data: []byte("indigo")},
 			},
-			expected: sets.NewString("zap/1/2/3/4/bar.txt", "zap/1/2/3", "zap/1/2/3/4", "zap/1/2/3/4/bar.txt", "zap/1/2/c", "zap/1/2/c/bar.txt"),
+			expected: sets.New[string]("zap/1/2/3/4/bar.txt", "zap/1/2/3", "zap/1/2/3/4", "zap/1/2/3/4/bar.txt", "zap/1/2/c", "zap/1/2/c/bar.txt"),
 		},
 	}
 
@@ -229,13 +228,23 @@ func TestPathsToRemove(t *testing.T) {
 		defer os.RemoveAll(targetDir)
 
 		writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
-		err = writer.Write(tc.payload1)
+		err = writer.Write(tc.payload1, nil)
 		if err != nil {
 			t.Errorf("%v: unexpected error writing: %v", tc.name, err)
 			continue
 		}
 
-		actual, err := writer.pathsToRemove(tc.payload2)
+		dataDirPath := filepath.Join(targetDir, dataDirName)
+		oldTsDir, err := os.Readlink(dataDirPath)
+		if err != nil && os.IsNotExist(err) {
+			t.Errorf("Data symlink does not exist: %v", dataDirPath)
+			continue
+		} else if err != nil {
+			t.Errorf("Unable to read symlink %v: %v", dataDirPath, err)
+			continue
+		}
+
+		actual, err := writer.pathsToRemove(tc.payload2, filepath.Join(targetDir, oldTsDir))
 		if err != nil {
 			t.Errorf("%v: unexpected error determining paths to remove: %v", tc.name, err)
 			continue
@@ -387,7 +396,7 @@ IAAAAAAAsDyZDwU=`
 		defer os.RemoveAll(targetDir)
 
 		writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
-		err = writer.Write(tc.payload)
+		err = writer.Write(tc.payload, nil)
 		if err != nil && tc.success {
 			t.Errorf("%v: unexpected error writing payload: %v", tc.name, err)
 			continue
@@ -564,7 +573,7 @@ func TestUpdate(t *testing.T) {
 
 		writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
 
-		err = writer.Write(tc.first)
+		err = writer.Write(tc.first, nil)
 		if err != nil {
 			t.Errorf("%v: unexpected error writing: %v", tc.name, err)
 			continue
@@ -575,7 +584,7 @@ func TestUpdate(t *testing.T) {
 			continue
 		}
 
-		err = writer.Write(tc.next)
+		err = writer.Write(tc.next, nil)
 		if err != nil {
 			if tc.shouldWrite {
 				t.Errorf("%v: unexpected error writing: %v", tc.name, err)
@@ -733,7 +742,7 @@ func TestMultipleUpdates(t *testing.T) {
 		writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
 
 		for _, payload := range tc.payloads {
-			writer.Write(payload)
+			writer.Write(payload, nil)
 
 			checkVolumeContents(targetDir, tc.name, payload, t)
 		}
@@ -741,20 +750,21 @@ func TestMultipleUpdates(t *testing.T) {
 }
 
 func checkVolumeContents(targetDir, tcName string, payload map[string]FileProjection, t *testing.T) {
+	dataDirPath := filepath.Join(targetDir, dataDirName)
 	// use filepath.Walk to reconstruct the payload, then deep equal
 	observedPayload := make(map[string]FileProjection)
-	visitor := func(path string, info os.FileInfo, err error) error {
-		if info.Mode().IsRegular() || info.IsDir() {
+	visitor := func(path string, info os.FileInfo, _ error) error {
+		if info.IsDir() {
 			return nil
 		}
 
-		relativePath := strings.TrimPrefix(path, targetDir)
+		relativePath := strings.TrimPrefix(path, dataDirPath)
 		relativePath = strings.TrimPrefix(relativePath, "/")
 		if strings.HasPrefix(relativePath, "..") {
 			return nil
 		}
 
-		content, err := ioutil.ReadFile(path)
+		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -769,17 +779,315 @@ func checkVolumeContents(targetDir, tcName string, payload map[string]FileProjec
 		return nil
 	}
 
-	err := filepath.Walk(targetDir, visitor)
+	d, err := os.ReadDir(targetDir)
 	if err != nil {
-		t.Errorf("%v: unexpected error walking directory: %v", tcName, err)
+		t.Errorf("Unable to read dir %v: %v", targetDir, err)
+		return
+	}
+	for _, info := range d {
+		if strings.HasPrefix(info.Name(), "..") {
+			continue
+		}
+		if info.Type()&os.ModeSymlink != 0 {
+			p := filepath.Join(targetDir, info.Name())
+			actual, err := os.Readlink(p)
+			if err != nil {
+				t.Errorf("Unable to read symlink %v: %v", p, err)
+				continue
+			}
+			if err := filepath.Walk(filepath.Join(targetDir, actual), visitor); err != nil {
+				t.Errorf("%v: unexpected error walking directory: %v", tcName, err)
+			}
+		}
 	}
 
 	cleanPathPayload := make(map[string]FileProjection, len(payload))
 	for k, v := range payload {
-		cleanPathPayload[path.Clean(k)] = v
+		cleanPathPayload[filepath.Clean(k)] = v
 	}
 
 	if !reflect.DeepEqual(cleanPathPayload, observedPayload) {
 		t.Errorf("%v: payload and observed payload do not match.", tcName)
+	}
+}
+
+func TestValidatePayload(t *testing.T) {
+	maxPath := strings.Repeat("a", maxPathLength+1)
+
+	cases := []struct {
+		name     string
+		payload  map[string]FileProjection
+		expected sets.Set[string]
+		valid    bool
+	}{
+		{
+			name: "valid payload",
+			payload: map[string]FileProjection{
+				"foo": {},
+				"bar": {},
+			},
+			valid:    true,
+			expected: sets.New[string]("foo", "bar"),
+		},
+		{
+			name: "payload with path length > 4096 is invalid",
+			payload: map[string]FileProjection{
+				maxPath: {},
+			},
+			valid: false,
+		},
+		{
+			name: "payload with absolute path is invalid",
+			payload: map[string]FileProjection{
+				"/dev/null": {},
+			},
+			valid: false,
+		},
+		{
+			name: "payload with reserved path is invalid",
+			payload: map[string]FileProjection{
+				"..sneaky.txt": {},
+			},
+			valid: false,
+		},
+		{
+			name: "payload with doubledot path is invalid",
+			payload: map[string]FileProjection{
+				"foo/../etc/password": {},
+			},
+			valid: false,
+		},
+		{
+			name: "payload with empty path is invalid",
+			payload: map[string]FileProjection{
+				"": {},
+			},
+			valid: false,
+		},
+		{
+			name: "payload with unclean path should be cleaned",
+			payload: map[string]FileProjection{
+				"foo////bar": {},
+			},
+			valid:    true,
+			expected: sets.New[string]("foo/bar"),
+		},
+	}
+	getPayloadPaths := func(payload map[string]FileProjection) sets.Set[string] {
+		paths := sets.New[string]()
+		for path := range payload {
+			paths.Insert(path)
+		}
+		return paths
+	}
+
+	for _, tc := range cases {
+		real, err := validatePayload(tc.payload)
+		if !tc.valid && err == nil {
+			t.Errorf("%v: unexpected success", tc.name)
+		}
+
+		if tc.valid {
+			if err != nil {
+				t.Errorf("%v: unexpected failure: %v", tc.name, err)
+				continue
+			}
+
+			realPaths := getPayloadPaths(real)
+			if !realPaths.Equal(tc.expected) {
+				t.Errorf("%v: unexpected payload paths: %v is not equal to %v", tc.name, realPaths, tc.expected)
+			}
+		}
+
+	}
+}
+
+func TestCreateUserVisibleFiles(t *testing.T) {
+	cases := []struct {
+		name     string
+		payload  map[string]FileProjection
+		expected map[string]string
+	}{
+		{
+			name: "simple path",
+			payload: map[string]FileProjection{
+				"foo": {},
+				"bar": {},
+			},
+			expected: map[string]string{
+				"foo": "..data/foo",
+				"bar": "..data/bar",
+			},
+		},
+		{
+			name: "simple nested path",
+			payload: map[string]FileProjection{
+				"foo/bar":     {},
+				"foo/bar/txt": {},
+				"bar/txt":     {},
+			},
+			expected: map[string]string{
+				"foo": "..data/foo",
+				"bar": "..data/bar",
+			},
+		},
+		{
+			name: "unclean nested path",
+			payload: map[string]FileProjection{
+				"./bar":     {},
+				"foo///bar": {},
+			},
+			expected: map[string]string{
+				"bar": "..data/bar",
+				"foo": "..data/foo",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		targetDir, err := utiltesting.MkTmpdir("atomic-write")
+		if err != nil {
+			t.Errorf("%v: unexpected error creating tmp dir: %v", tc.name, err)
+			continue
+		}
+		defer os.RemoveAll(targetDir)
+
+		dataDirPath := filepath.Join(targetDir, dataDirName)
+		err = os.MkdirAll(dataDirPath, 0755)
+		if err != nil {
+			t.Fatalf("%v: unexpected error creating data path: %v", tc.name, err)
+		}
+
+		writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
+		payload, err := validatePayload(tc.payload)
+		if err != nil {
+			t.Fatalf("%v: unexpected error validating payload: %v", tc.name, err)
+		}
+		err = writer.createUserVisibleFiles(payload)
+		if err != nil {
+			t.Fatalf("%v: unexpected error creating visible files: %v", tc.name, err)
+		}
+
+		for subpath, expectedDest := range tc.expected {
+			visiblePath := filepath.Join(targetDir, subpath)
+			destination, err := os.Readlink(visiblePath)
+			if err != nil && os.IsNotExist(err) {
+				t.Fatalf("%v: visible symlink does not exist: %v", tc.name, visiblePath)
+			} else if err != nil {
+				t.Fatalf("%v: unable to read symlink %v: %v", tc.name, dataDirPath, err)
+			}
+
+			if expectedDest != destination {
+				t.Fatalf("%v: symlink destination %q not same with expected data dir %q", tc.name, destination, expectedDest)
+			}
+		}
+	}
+}
+
+func TestSetPerms(t *testing.T) {
+	targetDir, err := utiltesting.MkTmpdir("atomic-write")
+	if err != nil {
+		t.Fatalf("unexpected error creating tmp dir: %v", err)
+	}
+	defer os.RemoveAll(targetDir)
+
+	// Test that setPerms() is called once and with valid timestamp directory.
+	payload1 := map[string]FileProjection{
+		"foo/bar.txt": {Mode: 0644, Data: []byte("foo")},
+		"bar/zab.txt": {Mode: 0644, Data: []byte("bar")},
+	}
+
+	var setPermsCalled int
+	writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
+	err = writer.Write(payload1, func(subPath string) error {
+		fileInfo, err := os.Stat(filepath.Join(targetDir, subPath))
+		if err != nil {
+			t.Fatalf("unexpected error getting file info: %v", err)
+		}
+		// Ensure that given timestamp directory really exists.
+		if !fileInfo.IsDir() {
+			t.Fatalf("subPath is not a directory: %v", subPath)
+		}
+		setPermsCalled++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error writing: %v", err)
+	}
+	if setPermsCalled != 1 {
+		t.Fatalf("unexpected number of calls to setPerms: %v", setPermsCalled)
+	}
+
+	// Test that errors from setPerms() are propagated.
+	payload2 := map[string]FileProjection{
+		"foo/bar.txt": {Mode: 0644, Data: []byte("foo2")},
+		"bar/zab.txt": {Mode: 0644, Data: []byte("bar2")},
+	}
+
+	err = writer.Write(payload2, func(_ string) error {
+		return fmt.Errorf("error in setPerms")
+	})
+	if err == nil {
+		t.Fatalf("expected error while writing but got nil")
+	}
+	if !strings.Contains(err.Error(), "error in setPerms") {
+		t.Fatalf("unexpected error while writing: %v", err)
+	}
+}
+
+func TestWriteAgainAfterUnexpectedExit(t *testing.T) {
+	testCases := []struct {
+		name       string
+		payload    map[string]FileProjection
+		simulateFn func(targetDir string, payload map[string]FileProjection) error
+	}{
+		{
+			name: "process killed before creating user visible files",
+			payload: map[string]FileProjection{
+				"foo": {Mode: 0644, Data: []byte("foo")},
+				"bar": {Mode: 0644, Data: []byte("bar")},
+			},
+			simulateFn: func(targetDir string, payload map[string]FileProjection) error {
+				for filename := range payload {
+					path := filepath.Join(targetDir, filename)
+					if err := os.RemoveAll(path); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetDir, err := utiltesting.MkTmpdir("atomic-write")
+			if err != nil {
+				t.Fatalf("unexpected error creating tmp dir: %v", err)
+			}
+			defer func() {
+				err := os.RemoveAll(targetDir)
+				if err != nil {
+					t.Errorf("%v: unexpected error removing tmp dir: %v", tc.name, err)
+				}
+			}()
+
+			writer := &AtomicWriter{targetDir: targetDir, logContext: "-test-"}
+			err = writer.Write(tc.payload, nil)
+			if err != nil {
+				t.Fatalf("unexpected error writing payload: %v", err)
+			}
+
+			err = tc.simulateFn(targetDir, tc.payload)
+			if err != nil {
+				t.Fatalf("failed to simulate the unexpected exit: %v", err)
+			}
+
+			err = writer.Write(tc.payload, nil)
+			if err != nil {
+				t.Fatalf("unexpected error writing payload again: %v", err)
+			}
+			checkVolumeContents(targetDir, tc.name, tc.payload, t)
+		})
 	}
 }

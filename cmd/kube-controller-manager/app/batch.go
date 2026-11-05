@@ -17,39 +17,84 @@ limitations under the License.
 // Package app implements a server that runs a set of active
 // components.  This includes replication controllers, service endpoints and
 // nodes.
-//
 package app
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	schedulinginformers "k8s.io/client-go/informers/scheduling/v1beta1"
+
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/cronjob"
 	"k8s.io/kubernetes/pkg/controller/job"
+	"k8s.io/kubernetes/pkg/features"
 )
 
-func startJobController(ctx ControllerContext) (bool, error) {
-	if !ctx.AvailableResources[schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}] {
-		return false, nil
+func newJobControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.JobController,
+		aliases:     []string{"job"},
+		constructor: newJobController,
 	}
-	go job.NewJobController(
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.InformerFactory.Batch().V1().Jobs(),
-		ctx.ClientBuilder.ClientOrDie("job-controller"),
-	).Run(int(ctx.Options.ConcurrentJobSyncs), ctx.Stop)
-	return true, nil
 }
 
-func startCronJobController(ctx ControllerContext) (bool, error) {
-	if !ctx.AvailableResources[schema.GroupVersionResource{Group: "batch", Version: "v1beta1", Resource: "cronjobs"}] {
-		return false, nil
+func newJobController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("job-controller")
+	if err != nil {
+		return nil, err
 	}
-	cjc, err := cronjob.NewCronJobController(
-		ctx.ClientBuilder.ClientOrDie("cronjob-controller"),
+
+	var workloadInformer schedulinginformers.WorkloadInformer
+	var podGroupInformer schedulinginformers.PodGroupInformer
+	if utilfeature.DefaultFeatureGate.Enabled(features.WorkloadWithJob) {
+		workloadInformer = controllerContext.InformerFactory.Scheduling().V1beta1().Workloads()
+		podGroupInformer = controllerContext.InformerFactory.Scheduling().V1beta1().PodGroups()
+	}
+
+	jc, err := job.NewController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Batch().V1().Jobs(),
+		workloadInformer,
+		podGroupInformer,
 	)
 	if err != nil {
-		return true, fmt.Errorf("error creating CronJob controller: %v", err)
+		return nil, fmt.Errorf("creating Job controller: %w", err)
 	}
-	go cjc.Run(ctx.Stop)
-	return true, nil
+
+	return newControllerLoop(func(ctx context.Context) {
+		jc.Run(ctx, int(controllerContext.ComponentConfig.JobController.ConcurrentJobSyncs))
+	}, controllerName), nil
+}
+
+func newCronJobControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.CronJobController,
+		aliases:     []string{"cronjob"},
+		constructor: newCronJobController,
+	}
+}
+
+func newCronJobController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("cronjob-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	cj2c, err := cronjob.NewControllerV2(
+		ctx,
+		controllerContext.InformerFactory.Batch().V1().Jobs(),
+		controllerContext.InformerFactory.Batch().V1().CronJobs(),
+		client,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating CronJob controller V2: %w", err)
+	}
+
+	return newControllerLoop(func(ctx context.Context) {
+		cj2c.Run(ctx, int(controllerContext.ComponentConfig.CronJobController.ConcurrentCronJobSyncs))
+	}, controllerName), nil
 }

@@ -17,7 +17,7 @@ limitations under the License.
 package main
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -27,7 +27,7 @@ import (
 // MarkdownPostProcessing goes though the generated files
 func MarkdownPostProcessing(cmd *cobra.Command, dir string, processor func(string) string) error {
 	for _, c := range cmd.Commands() {
-		if !c.IsAvailableCommand() || c.IsHelpCommand() {
+		if !c.IsAvailableCommand() || c.IsAdditionalHelpTopicCommand() {
 			continue
 		}
 		if err := MarkdownPostProcessing(c, dir, processor); err != nil {
@@ -38,14 +38,14 @@ func MarkdownPostProcessing(cmd *cobra.Command, dir string, processor func(strin
 	basename := strings.Replace(cmd.CommandPath(), " ", "_", -1) + ".md"
 	filename := filepath.Join(dir, basename)
 
-	markdownBytes, err := ioutil.ReadFile(filename)
+	markdownBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return err
 	}
 
 	processedMarkDown := processor(string(markdownBytes))
 
-	return ioutil.WriteFile(filename, []byte(processedMarkDown), 0644)
+	return os.WriteFile(filename, []byte(processedMarkDown), 0644)
 }
 
 // cleanupForInclude parts of markdown that will make difficult to use it as include in the website:

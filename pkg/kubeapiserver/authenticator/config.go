@@ -17,10 +17,17 @@ limitations under the License.
 package authenticator
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
 	"time"
 
-	"github.com/go-openapi/spec"
-
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/authenticatorfactory"
 	"k8s.io/apiserver/pkg/authentication/group"
@@ -33,96 +40,93 @@ import (
 	tokencache "k8s.io/apiserver/pkg/authentication/token/cache"
 	"k8s.io/apiserver/pkg/authentication/token/tokenfile"
 	tokenunion "k8s.io/apiserver/pkg/authentication/token/union"
-	"k8s.io/apiserver/plugin/pkg/authenticator/password/keystone"
-	"k8s.io/apiserver/plugin/pkg/authenticator/password/passwordfile"
-	"k8s.io/apiserver/plugin/pkg/authenticator/request/basicauth"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/apiserver/pkg/server/egressselector"
+	webhookutil "k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/webhook"
-	certutil "k8s.io/client-go/util/cert"
-	"k8s.io/kubernetes/pkg/serviceaccount"
+	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/kube-openapi/pkg/spec3"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 
 	// Initialize all known client auth plugins.
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/kubernetes/pkg/serviceaccount"
 )
 
-type AuthenticatorConfig struct {
-	Anonymous                   bool
-	BasicAuthFile               string
-	BootstrapToken              bool
-	ClientCAFile                string
+// Config contains the data on how to authenticate a request to the Kube API Server
+type Config struct {
+	// Anonymous holds the effective anonymous config, specified either via config file
+	// (hoisted out of AuthenticationConfig) or via flags (constructed from flag-specified values).
+	Anonymous apiserver.AnonymousAuthConfig
+
+	BootstrapToken bool
+
 	TokenAuthFile               string
-	OIDCIssuerURL               string
-	OIDCClientID                string
-	OIDCCAFile                  string
-	OIDCUsernameClaim           string
-	OIDCUsernamePrefix          string
-	OIDCGroupsClaim             string
-	OIDCGroupsPrefix            string
-	ServiceAccountKeyFiles      []string
+	AuthenticationConfig        *apiserver.AuthenticationConfiguration
+	AuthenticationConfigData    string
+	OIDCSigningAlgs             []string
 	ServiceAccountLookup        bool
-	KeystoneURL                 string
-	KeystoneCAFile              string
+	ServiceAccountIssuers       []string
+	APIAudiences                authenticator.Audiences
 	WebhookTokenAuthnConfigFile string
+	WebhookTokenAuthnVersion    string
 	WebhookTokenAuthnCacheTTL   time.Duration
+	// WebhookRetryBackoff specifies the backoff parameters for the authentication webhook retry logic.
+	// This allows us to configure the sleep time at each iteration and the maximum number of retries allowed
+	// before we fail the webhook call in order to limit the fan out that ensues when the system is degraded.
+	WebhookRetryBackoff *wait.Backoff
 
 	TokenSuccessCacheTTL time.Duration
 	TokenFailureCacheTTL time.Duration
 
 	RequestHeaderConfig *authenticatorfactory.RequestHeaderConfig
 
-	// TODO, this is the only non-serializable part of the entire config.  Factor it out into a clientconfig
+	// ServiceAccountPublicKeysGetter returns public keys for verifying service account tokens.
+	ServiceAccountPublicKeysGetter serviceaccount.PublicKeysGetter
+	// ServiceAccountTokenGetter fetches API objects used to verify bound objects in service account token claims.
 	ServiceAccountTokenGetter   serviceaccount.ServiceAccountTokenGetter
+	SecretsWriter               typedv1core.SecretsGetter
 	BootstrapTokenAuthenticator authenticator.Token
+	// ClientCAContentProvider are the options for verifying incoming connections using mTLS and directly assigning to users.
+	// Generally this is the CA bundle file used to authenticate client certificates
+	// If this value is nil, then mutual TLS is disabled.
+	ClientCAContentProvider dynamiccertificates.CAContentProvider
+
+	// Optional field, custom dial function used to connect to webhook
+	CustomDial utilnet.DialFunc
+
+	EgressLookup egressselector.Lookup
+
+	// APIServerID is the ID of the API server
+	APIServerID string
 }
 
 // New returns an authenticator.Request or an error that supports the standard
 // Kubernetes authentication mechanisms.
-func (config AuthenticatorConfig) New() (authenticator.Request, *spec.SecurityDefinitions, error) {
+func (config Config) New(serverLifecycle context.Context) (authenticator.Request, func(context.Context, *apiserver.AuthenticationConfiguration) error, *spec.SecurityDefinitions, spec3.SecuritySchemes, error) {
 	var authenticators []authenticator.Request
 	var tokenAuthenticators []authenticator.Token
-	securityDefinitions := spec.SecurityDefinitions{}
-	hasBasicAuth := false
+	securityDefinitionsV2 := spec.SecurityDefinitions{}
+	securitySchemesV3 := spec3.SecuritySchemes{}
 
 	// front-proxy, BasicAuth methods, local first, then remote
 	// Add the front proxy authenticator if requested
 	if config.RequestHeaderConfig != nil {
-		requestHeaderAuthenticator, err := headerrequest.NewSecure(
-			config.RequestHeaderConfig.ClientCA,
+		requestHeaderAuthenticator := headerrequest.NewDynamicVerifyOptionsSecure(
+			config.RequestHeaderConfig.CAContentProvider.VerifyOptions,
 			config.RequestHeaderConfig.AllowedClientNames,
 			config.RequestHeaderConfig.UsernameHeaders,
+			config.RequestHeaderConfig.UIDHeaders,
 			config.RequestHeaderConfig.GroupHeaders,
 			config.RequestHeaderConfig.ExtraHeaderPrefixes,
 		)
-		if err != nil {
-			return nil, nil, err
-		}
-		authenticators = append(authenticators, requestHeaderAuthenticator)
-	}
-
-	if len(config.BasicAuthFile) > 0 {
-		basicAuth, err := newAuthenticatorFromBasicAuthFile(config.BasicAuthFile)
-		if err != nil {
-			return nil, nil, err
-		}
-		authenticators = append(authenticators, basicAuth)
-		hasBasicAuth = true
-	}
-	if len(config.KeystoneURL) > 0 {
-		keystoneAuth, err := newAuthenticatorFromKeystoneURL(config.KeystoneURL, config.KeystoneCAFile)
-		if err != nil {
-			return nil, nil, err
-		}
-		authenticators = append(authenticators, keystoneAuth)
-		hasBasicAuth = true
+		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences, requestHeaderAuthenticator))
 	}
 
 	// X509 methods
-	if len(config.ClientCAFile) > 0 {
-		certAuth, err := newAuthenticatorFromClientCAFile(config.ClientCAFile)
-		if err != nil {
-			return nil, nil, err
-		}
+	if config.ClientCAContentProvider != nil {
+		certAuth := x509.NewDynamic(config.ClientCAContentProvider.VerifyOptions, x509.CommonNameUserConversion)
 		authenticators = append(authenticators, certAuth)
 	}
 
@@ -130,51 +134,71 @@ func (config AuthenticatorConfig) New() (authenticator.Request, *spec.SecurityDe
 	if len(config.TokenAuthFile) > 0 {
 		tokenAuth, err := newAuthenticatorFromTokenFile(config.TokenAuthFile)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		tokenAuthenticators = append(tokenAuthenticators, tokenAuth)
+		tokenAuthenticators = append(tokenAuthenticators, authenticator.WrapAudienceAgnosticToken(config.APIAudiences, tokenAuth))
 	}
-	if len(config.ServiceAccountKeyFiles) > 0 {
-		serviceAccountAuth, err := newServiceAccountAuthenticator(config.ServiceAccountKeyFiles, config.ServiceAccountLookup, config.ServiceAccountTokenGetter)
+	if config.ServiceAccountPublicKeysGetter != nil {
+		serviceAccountAuth, err := newLegacyServiceAccountAuthenticator(config.ServiceAccountPublicKeysGetter, config.ServiceAccountLookup, config.APIAudiences, config.ServiceAccountTokenGetter, config.SecretsWriter)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		tokenAuthenticators = append(tokenAuthenticators, serviceAccountAuth)
 	}
-	if config.BootstrapToken {
-		if config.BootstrapTokenAuthenticator != nil {
-			// TODO: This can sometimes be nil because of
-			tokenAuthenticators = append(tokenAuthenticators, config.BootstrapTokenAuthenticator)
+	if len(config.ServiceAccountIssuers) > 0 && config.ServiceAccountPublicKeysGetter != nil {
+		serviceAccountAuth, err := newServiceAccountAuthenticator(config.ServiceAccountIssuers, config.ServiceAccountPublicKeysGetter, config.APIAudiences, config.ServiceAccountTokenGetter)
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
+		tokenAuthenticators = append(tokenAuthenticators, serviceAccountAuth)
 	}
+
+	if config.BootstrapToken && config.BootstrapTokenAuthenticator != nil {
+		tokenAuthenticators = append(tokenAuthenticators, authenticator.WrapAudienceAgnosticToken(config.APIAudiences, config.BootstrapTokenAuthenticator))
+	}
+
 	// NOTE(ericchiang): Keep the OpenID Connect after Service Accounts.
 	//
 	// Because both plugins verify JWTs whichever comes first in the union experiences
 	// cache misses for all requests using the other. While the service account plugin
 	// simply returns an error, the OpenID Connect plugin may query the provider to
 	// update the keys, causing performance hits.
-	if len(config.OIDCIssuerURL) > 0 && len(config.OIDCClientID) > 0 {
-		oidcAuth, err := newAuthenticatorFromOIDCIssuerURL(config.OIDCIssuerURL, config.OIDCClientID, config.OIDCCAFile, config.OIDCUsernameClaim, config.OIDCUsernamePrefix, config.OIDCGroupsClaim, config.OIDCGroupsPrefix)
+	var updateAuthenticationConfig func(context.Context, *apiserver.AuthenticationConfiguration) error
+	if config.AuthenticationConfig != nil {
+		initialJWTAuthenticator, err := newJWTAuthenticator(serverLifecycle, config.AuthenticationConfig, config.OIDCSigningAlgs, config.APIAudiences, config.ServiceAccountIssuers, config.EgressLookup, config.APIServerID)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		tokenAuthenticators = append(tokenAuthenticators, oidcAuth)
-	}
-	if len(config.WebhookTokenAuthnConfigFile) > 0 {
-		webhookTokenAuth, err := newWebhookTokenAuthenticator(config.WebhookTokenAuthnConfigFile, config.WebhookTokenAuthnCacheTTL)
-		if err != nil {
-			return nil, nil, err
+
+		jwtAuthenticatorPtr := &atomic.Pointer[jwtAuthenticatorWithCancel]{}
+		jwtAuthenticatorPtr.Store(initialJWTAuthenticator)
+
+		initialIssuers := sets.New[string]()
+		for _, jwt := range config.AuthenticationConfig.JWT {
+			initialIssuers.Insert(jwt.Issuer.URL)
 		}
-		tokenAuthenticators = append(tokenAuthenticators, webhookTokenAuth)
+
+		updateAuthenticationConfig = (&authenticationConfigUpdater{
+			serverLifecycle:     serverLifecycle,
+			config:              config,
+			jwtAuthenticatorPtr: jwtAuthenticatorPtr,
+			issuers:             initialIssuers,
+		}).updateAuthenticationConfig
+
+		tokenAuthenticators = append(tokenAuthenticators,
+			authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+				return jwtAuthenticatorPtr.Load().jwtAuthenticator.AuthenticateToken(ctx, token)
+			}),
+		)
 	}
 
-	if hasBasicAuth {
-		securityDefinitions["HTTPBasic"] = &spec.SecurityScheme{
-			SecuritySchemeProps: spec.SecuritySchemeProps{
-				Type:        "basic",
-				Description: "HTTP Basic authentication",
-			},
+	if len(config.WebhookTokenAuthnConfigFile) > 0 {
+		webhookTokenAuth, err := newWebhookTokenAuthenticator(config)
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
+
+		tokenAuthenticators = append(tokenAuthenticators, webhookTokenAuth)
 	}
 
 	if len(tokenAuthenticators) > 0 {
@@ -182,11 +206,20 @@ func (config AuthenticatorConfig) New() (authenticator.Request, *spec.SecurityDe
 		tokenAuth := tokenunion.New(tokenAuthenticators...)
 		// Optionally cache authentication results
 		if config.TokenSuccessCacheTTL > 0 || config.TokenFailureCacheTTL > 0 {
-			tokenAuth = tokencache.New(tokenAuth, config.TokenSuccessCacheTTL, config.TokenFailureCacheTTL)
+			tokenAuth = tokencache.New(tokenAuth, true, config.TokenSuccessCacheTTL, config.TokenFailureCacheTTL)
 		}
 		authenticators = append(authenticators, bearertoken.New(tokenAuth), websocket.NewProtocolAuthenticator(tokenAuth))
-		securityDefinitions["BearerToken"] = &spec.SecurityScheme{
+
+		securityDefinitionsV2["BearerToken"] = &spec.SecurityScheme{
 			SecuritySchemeProps: spec.SecuritySchemeProps{
+				Type:        "apiKey",
+				Name:        "authorization",
+				In:          "header",
+				Description: "Bearer Token authentication",
+			},
+		}
+		securitySchemesV3["BearerToken"] = &spec3.SecurityScheme{
+			SecuritySchemeProps: spec3.SecuritySchemeProps{
 				Type:        "apiKey",
 				Name:        "authorization",
 				In:          "header",
@@ -196,43 +229,141 @@ func (config AuthenticatorConfig) New() (authenticator.Request, *spec.SecurityDe
 	}
 
 	if len(authenticators) == 0 {
-		if config.Anonymous {
-			return anonymous.NewAuthenticator(), &securityDefinitions, nil
+		if config.Anonymous.Enabled {
+			return anonymous.NewAuthenticator(config.Anonymous.Conditions), nil, &securityDefinitionsV2, securitySchemesV3, nil
 		}
-	}
-
-	switch len(authenticators) {
-	case 0:
-		return nil, &securityDefinitions, nil
+		return nil, nil, &securityDefinitionsV2, securitySchemesV3, nil
 	}
 
 	authenticator := union.New(authenticators...)
 
 	authenticator = group.NewAuthenticatedGroupAdder(authenticator)
 
-	if config.Anonymous {
+	if config.Anonymous.Enabled {
 		// If the authenticator chain returns an error, return an error (don't consider a bad bearer token
 		// or invalid username/password combination anonymous).
-		authenticator = union.NewFailOnError(authenticator, anonymous.NewAuthenticator())
+		authenticator = union.NewFailOnError(authenticator, anonymous.NewAuthenticator(config.Anonymous.Conditions))
 	}
 
-	return authenticator, &securityDefinitions, nil
+	return authenticator, updateAuthenticationConfig, &securityDefinitionsV2, securitySchemesV3, nil
 }
 
-// IsValidServiceAccountKeyFile returns true if a valid public RSA key can be read from the given file
-func IsValidServiceAccountKeyFile(file string) bool {
-	_, err := certutil.PublicKeysFromFile(file)
-	return err == nil
+type jwtAuthenticatorWithCancel struct {
+	jwtAuthenticator authenticator.Token
+	healthCheck      func() error
+	cancel           func()
 }
 
-// newAuthenticatorFromBasicAuthFile returns an authenticator.Request or an error
-func newAuthenticatorFromBasicAuthFile(basicAuthFile string) (authenticator.Request, error) {
-	basicAuthenticator, err := passwordfile.NewCSV(basicAuthFile)
+func newJWTAuthenticator(serverLifecycle context.Context, config *apiserver.AuthenticationConfiguration, oidcSigningAlgs []string, apiAudiences authenticator.Audiences, disallowedIssuers []string, egressLookup egressselector.Lookup, apiServerID string) (_ *jwtAuthenticatorWithCancel, buildErr error) {
+	ctx, cancel := context.WithCancel(serverLifecycle)
+
+	defer func() {
+		if buildErr != nil {
+			cancel()
+		}
+	}()
+	var jwtAuthenticators []authenticator.Token
+	var healthChecks []func() error
+	for _, jwtAuthenticator := range config.JWT {
+		// TODO remove this CAContentProvider indirection
+		var oidcCAContent oidc.CAContentProvider
+		if len(jwtAuthenticator.Issuer.CertificateAuthority) > 0 {
+			var oidcCAError error
+			oidcCAContent, oidcCAError = dynamiccertificates.NewStaticCAContent("oidc-authenticator", []byte(jwtAuthenticator.Issuer.CertificateAuthority))
+			if oidcCAError != nil {
+				return nil, oidcCAError
+			}
+		}
+		oidcAuth, err := oidc.New(ctx, oidc.Options{
+			JWTAuthenticator:     jwtAuthenticator,
+			CAContentProvider:    oidcCAContent,
+			EgressLookup:         egressLookup,
+			SupportedSigningAlgs: oidcSigningAlgs,
+			DisallowedIssuers:    disallowedIssuers,
+			APIServerID:          apiServerID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		jwtAuthenticators = append(jwtAuthenticators, oidcAuth)
+		healthChecks = append(healthChecks, oidcAuth.HealthCheck)
+	}
+	return &jwtAuthenticatorWithCancel{
+		jwtAuthenticator: authenticator.WrapAudienceAgnosticToken(apiAudiences, tokenunion.NewFailOnError(jwtAuthenticators...)), // this handles the empty jwtAuthenticators slice case correctly
+		healthCheck: func() error {
+			var errs []error
+			for _, check := range healthChecks {
+				if err := check(); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return utilerrors.NewAggregate(errs)
+		},
+		cancel: cancel,
+	}, nil
+}
+
+type authenticationConfigUpdater struct {
+	serverLifecycle     context.Context
+	config              Config
+	jwtAuthenticatorPtr *atomic.Pointer[jwtAuthenticatorWithCancel]
+	issuers             sets.Set[string]
+}
+
+// the input ctx controls the timeout for updateAuthenticationConfig to return, not the lifetime of the constructed authenticators.
+func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Context, authConfig *apiserver.AuthenticationConfiguration) error {
+	updatedJWTAuthenticator, err := newJWTAuthenticator(c.serverLifecycle, authConfig, c.config.OIDCSigningAlgs, c.config.APIAudiences, c.config.ServiceAccountIssuers, c.config.EgressLookup, c.config.APIServerID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return basicauth.New(basicAuthenticator), nil
+	var lastErr error
+	if waitErr := wait.PollUntilContextCancel(ctx, 10*time.Second, true, func(_ context.Context) (done bool, err error) {
+		lastErr = updatedJWTAuthenticator.healthCheck()
+		return lastErr == nil, nil
+	}); lastErr != nil || waitErr != nil {
+		updatedJWTAuthenticator.cancel()
+		return utilerrors.NewAggregate([]error{lastErr, waitErr}) // filters out nil errors
+	}
+
+	newIssuers := sets.New[string]()
+	for _, jwt := range authConfig.JWT {
+		newIssuers.Insert(jwt.Issuer.URL)
+	}
+
+	// Determine which issuers were removed (in old but not in new)
+	removedIssuers := c.issuers.Difference(newIssuers)
+
+	oldJWTAuthenticator := c.jwtAuthenticatorPtr.Swap(updatedJWTAuthenticator)
+	c.issuers = newIssuers
+
+	go func() {
+		t := time.NewTimer(time.Minute)
+		defer t.Stop()
+		select {
+		case <-c.serverLifecycle.Done():
+		case <-t.C:
+		}
+		// TODO maybe track requests so we know when this is safe to do
+		oldJWTAuthenticator.cancel()
+
+		// Wait a bit to account for the lack of locks in shouldRecordFunc.
+		// This ensures any in-flight HTTP requests that checked shouldRecordFunc
+		// before the cancel() have time to complete their metric recording.
+		time.Sleep(30 * time.Second)
+
+		// Delete metrics for removed issuers.
+		// Note: If the configuration changes rapidly (e.g., an issuer is removed and then re-added
+		// within the grace period + sleep duration), we may delete metrics for an issuer that is
+		// now back in use. This is an unlikely edge case that would only occur during configuration
+		// churn, and the metrics would be re-established on the next JWKS fetch. The system will
+		// stabilize once configuration changes stop.
+		for _, issuer := range removedIssuers.UnsortedList() {
+			oidc.DeleteJWKSFetchMetrics(issuer, c.config.APIServerID)
+		}
+	}()
+
+	return nil
 }
 
 // newAuthenticatorFromTokenFile returns an authenticator.Token or an error
@@ -245,82 +376,42 @@ func newAuthenticatorFromTokenFile(tokenAuthFile string) (authenticator.Token, e
 	return tokenAuthenticator, nil
 }
 
-// newAuthenticatorFromOIDCIssuerURL returns an authenticator.Token or an error.
-func newAuthenticatorFromOIDCIssuerURL(issuerURL, clientID, caFile, usernameClaim, usernamePrefix, groupsClaim, groupsPrefix string) (authenticator.Token, error) {
-	const noUsernamePrefix = "-"
-
-	if usernamePrefix == "" && usernameClaim != "email" {
-		// Old behavior. If a usernamePrefix isn't provided, prefix all claims other than "email"
-		// with the issuerURL.
-		//
-		// See https://github.com/kubernetes/kubernetes/issues/31380
-		usernamePrefix = issuerURL + "#"
+// newLegacyServiceAccountAuthenticator returns an authenticator.Token or an error
+func newLegacyServiceAccountAuthenticator(publicKeysGetter serviceaccount.PublicKeysGetter, lookup bool, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter, secretsWriter typedv1core.SecretsGetter) (authenticator.Token, error) {
+	if publicKeysGetter == nil {
+		return nil, fmt.Errorf("no public key getter provided")
 	}
-
-	if usernamePrefix == noUsernamePrefix {
-		// Special value indicating usernames shouldn't be prefixed.
-		usernamePrefix = ""
-	}
-
-	tokenAuthenticator, err := oidc.New(oidc.OIDCOptions{
-		IssuerURL:      issuerURL,
-		ClientID:       clientID,
-		CAFile:         caFile,
-		UsernameClaim:  usernameClaim,
-		UsernamePrefix: usernamePrefix,
-		GroupsClaim:    groupsClaim,
-		GroupsPrefix:   groupsPrefix,
-	})
+	validator, err := serviceaccount.NewLegacyValidator(lookup, serviceAccountGetter, secretsWriter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("while creating legacy validator, err: %w", err)
 	}
 
+	tokenAuthenticator := serviceaccount.JWTTokenAuthenticator([]string{serviceaccount.LegacyIssuer}, publicKeysGetter, apiAudiences, validator)
 	return tokenAuthenticator, nil
 }
 
 // newServiceAccountAuthenticator returns an authenticator.Token or an error
-func newServiceAccountAuthenticator(keyfiles []string, lookup bool, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter) (authenticator.Token, error) {
-	allPublicKeys := []interface{}{}
-	for _, keyfile := range keyfiles {
-		publicKeys, err := certutil.PublicKeysFromFile(keyfile)
-		if err != nil {
-			return nil, err
-		}
-		allPublicKeys = append(allPublicKeys, publicKeys...)
+func newServiceAccountAuthenticator(issuers []string, publicKeysGetter serviceaccount.PublicKeysGetter, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter) (authenticator.Token, error) {
+	if publicKeysGetter == nil {
+		return nil, fmt.Errorf("no public key getter provided")
 	}
-
-	tokenAuthenticator := serviceaccount.JWTTokenAuthenticator(allPublicKeys, lookup, serviceAccountGetter)
+	tokenAuthenticator := serviceaccount.JWTTokenAuthenticator(issuers, publicKeysGetter, apiAudiences, serviceaccount.NewValidator(serviceAccountGetter))
 	return tokenAuthenticator, nil
 }
 
-// newAuthenticatorFromClientCAFile returns an authenticator.Request or an error
-func newAuthenticatorFromClientCAFile(clientCAFile string) (authenticator.Request, error) {
-	roots, err := certutil.NewPool(clientCAFile)
+func newWebhookTokenAuthenticator(config Config) (authenticator.Token, error) {
+	if config.WebhookRetryBackoff == nil {
+		return nil, errors.New("retry backoff parameters for authentication webhook has not been specified")
+	}
+
+	clientConfig, err := webhookutil.LoadKubeconfig(config.WebhookTokenAuthnConfigFile, config.CustomDial)
+	if err != nil {
+		return nil, err
+	}
+	webhookTokenAuthenticator, err := webhook.New(clientConfig, config.WebhookTokenAuthnVersion, config.APIAudiences, *config.WebhookRetryBackoff)
 	if err != nil {
 		return nil, err
 	}
 
-	opts := x509.DefaultVerifyOptions()
-	opts.Roots = roots
-
-	return x509.New(opts, x509.CommonNameUserConversion), nil
-}
-
-// newAuthenticatorFromKeystoneURL returns an authenticator.Request or an error
-func newAuthenticatorFromKeystoneURL(keystoneURL string, keystoneCAFile string) (authenticator.Request, error) {
-	keystoneAuthenticator, err := keystone.NewKeystoneAuthenticator(keystoneURL, keystoneCAFile)
-	if err != nil {
-		return nil, err
-	}
-
-	return basicauth.New(keystoneAuthenticator), nil
-}
-
-func newWebhookTokenAuthenticator(webhookConfigFile string, ttl time.Duration) (authenticator.Token, error) {
-	webhookTokenAuthenticator, err := webhook.New(webhookConfigFile, ttl)
-	if err != nil {
-		return nil, err
-	}
-
-	return webhookTokenAuthenticator, nil
+	return tokencache.New(webhookTokenAuthenticator, false, config.WebhookTokenAuthnCacheTTL, config.WebhookTokenAuthnCacheTTL), nil
 }

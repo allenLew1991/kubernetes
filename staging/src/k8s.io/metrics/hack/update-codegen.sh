@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2017 The Kubernetes Authors.
 #
@@ -18,25 +18,25 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_ROOT=$(dirname "${BASH_SOURCE}")/..
-SCRIPT_BASE=${SCRIPT_ROOT}/../..
-CODEGEN_PKG=${CODEGEN_PKG:-$(cd ${SCRIPT_ROOT}; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo k8s.io/code-generator)}
+SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+CODEGEN_PKG=${CODEGEN_PKG:-$(cd "${SCRIPT_ROOT}"; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
 
-# Register function to be called on EXIT to remove generated binary.
-function cleanup {
-  rm -f "${CLIENTGEN:-}"
-}
-trap cleanup EXIT
+source "${CODEGEN_PKG}/kube_codegen.sh"
 
-echo "Building client-gen"
-CLIENTGEN="${PWD}/client-gen-binary"
-go build -o "${CLIENTGEN}" ${CODEGEN_PKG}/cmd/client-gen
-
-PREFIX=k8s.io/metrics/pkg/apis
-INPUT_BASE="--input-base ${PREFIX}"
-CLIENTSET_PATH="--output-package k8s.io/metrics/pkg/client/clientset_generated"
-
-${CLIENTGEN} --clientset-name="clientset" ${INPUT_BASE} --input metrics/v1alpha1 --input metrics/v1beta1 ${CLIENTSET_PATH} --output-base ${SCRIPT_BASE}
+THIS_PKG="k8s.io/metrics"
 
 # we skip informers and listers for metrics, because we don't quite support the requisite operations yet
 # we skip generating the internal clientset as it's not really needed
+
+kube::codegen::gen_helpers \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg/apis"
+
+kube::codegen::gen_client \
+    --output-dir "${SCRIPT_ROOT}/pkg/client" \
+    --output-pkg "${THIS_PKG}/pkg/client" \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --prefers-protobuf \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg/apis"

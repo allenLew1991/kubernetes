@@ -17,11 +17,11 @@ limitations under the License.
 package v1
 
 import (
-	"encoding/json"
+	gojson "encoding/json"
 	"reflect"
 	"testing"
 
-	jsoniter "github.com/json-iterator/go"
+	utiljson "k8s.io/apimachinery/pkg/util/json"
 )
 
 type GroupVersionHolder struct {
@@ -34,24 +34,24 @@ func TestGroupVersionUnmarshalJSON(t *testing.T) {
 		expect GroupVersion
 	}{
 		{[]byte(`{"val": "v1"}`), GroupVersion{"", "v1"}},
-		{[]byte(`{"val": "extensions/v1beta1"}`), GroupVersion{"extensions", "v1beta1"}},
+		{[]byte(`{"val": "apps/v1"}`), GroupVersion{"apps", "v1"}},
 	}
 
 	for _, c := range cases {
 		var result GroupVersionHolder
 		// test golang lib's JSON codec
-		if err := json.Unmarshal([]byte(c.input), &result); err != nil {
+		if err := gojson.Unmarshal([]byte(c.input), &result); err != nil {
 			t.Errorf("JSON codec failed to unmarshal input '%v': %v", c.input, err)
 		}
 		if !reflect.DeepEqual(result.GV, c.expect) {
 			t.Errorf("JSON codec failed to unmarshal input '%s': expected %+v, got %+v", c.input, c.expect, result.GV)
 		}
-		// test the json-iterator codec
-		if err := jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal(c.input, &result); err != nil {
-			t.Errorf("json-iterator codec failed to unmarshal input '%v': %v", c.input, err)
+		// test the utiljson codec
+		if err := utiljson.Unmarshal(c.input, &result); err != nil {
+			t.Errorf("util/json codec failed to unmarshal input '%v': %v", c.input, err)
 		}
 		if !reflect.DeepEqual(result.GV, c.expect) {
-			t.Errorf("json-iterator codec failed to unmarshal input '%s': expected %+v, got %+v", c.input, c.expect, result.GV)
+			t.Errorf("util/json codec failed to unmarshal input '%s': expected %+v, got %+v", c.input, c.expect, result.GV)
 		}
 	}
 }
@@ -62,12 +62,12 @@ func TestGroupVersionMarshalJSON(t *testing.T) {
 		expect []byte
 	}{
 		{GroupVersion{"", "v1"}, []byte(`{"val":"v1"}`)},
-		{GroupVersion{"extensions", "v1beta1"}, []byte(`{"val":"extensions/v1beta1"}`)},
+		{GroupVersion{"apps", "v1"}, []byte(`{"val":"apps/v1"}`)},
 	}
 
 	for _, c := range cases {
 		input := GroupVersionHolder{c.input}
-		result, err := json.Marshal(&input)
+		result, err := gojson.Marshal(&input)
 		if err != nil {
 			t.Errorf("Failed to marshal input '%v': %v", input, err)
 		}

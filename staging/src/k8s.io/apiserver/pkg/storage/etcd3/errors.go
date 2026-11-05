@@ -17,9 +17,15 @@ limitations under the License.
 package etcd3
 
 import (
-	"k8s.io/apimachinery/pkg/api/errors"
+	goerrors "errors"
+	"net/http"
 
-	etcdrpc "github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/storage"
+
+	etcdrpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
 func interpretWatchError(err error) error {
@@ -27,16 +33,57 @@ func interpretWatchError(err error) error {
 	case err == etcdrpc.ErrCompacted:
 		return errors.NewResourceExpired("The resourceVersion for the provided watch is too old.")
 	}
+
+	var corruptobjDeletedErr *corruptObjectDeletedError
+	if goerrors.As(err, &corruptobjDeletedErr) {
+		return &errors.StatusError{
+			ErrStatus: metav1.Status{
+				Status:  metav1.StatusFailure,
+				Code:    http.StatusInternalServerError,
+				Reason:  metav1.StatusReasonStoreReadError,
+				Message: corruptobjDeletedErr.Error(),
+			},
+		}
+	}
+
 	return err
 }
 
-func interpretListError(err error, paging bool) error {
+const (
+	expired         string = "The resourceVersion for the provided list is too old."
+	continueExpired string = "The provided continue parameter is too old " +
+		"to display a consistent list result. You can start a new list without " +
+		"the continue parameter."
+	inconsistentContinue string = "The provided continue parameter is too old " +
+		"to display a consistent list result. You can start a new list without " +
+		"the continue parameter, or use the continue token in this response to " +
+		"retrieve the remainder of the results. Continuing with the provided " +
+		"token results in an inconsistent list - objects that were created, " +
+		"modified, or deleted between the time the first chunk was returned " +
+		"and now may show up in the list."
+)
+
+func interpretListError(err error, paging bool, continueKey, keyPrefix string) error {
 	switch {
 	case err == etcdrpc.ErrCompacted:
 		if paging {
-			return errors.NewResourceExpired("The provided from parameter is too old to display a consistent list result. You must start a new list without the from.")
+			return handleCompactedErrorForPaging(continueKey, keyPrefix)
 		}
-		return errors.NewResourceExpired("The resourceVersion for the provided list is too old.")
+		return errors.NewResourceExpired(expired)
 	}
 	return err
+}
+
+func handleCompactedErrorForPaging(continueKey, keyPrefix string) error {
+	// continueToken.ResoureVersion=-1 means that the apiserver can
+	// continue the list at the latest resource version. We don't use rv=0
+	// for this purpose to distinguish from a bad token that has empty rv.
+	newToken, err := storage.EncodeContinue(continueKey, keyPrefix, -1)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return errors.NewResourceExpired(continueExpired)
+	}
+	statusError := errors.NewResourceExpired(inconsistentContinue)
+	statusError.ErrStatus.ListMeta.Continue = newToken
+	return statusError
 }

@@ -18,61 +18,74 @@ package apimachinery
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"text/tabwriter"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1alpha1 "k8s.io/apimachinery/pkg/apis/meta/v1alpha1"
+	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/kubernetes/pkg/printers"
+	admissionapi "k8s.io/pod-security-admission/api"
+
+	utilversion "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/kubernetes/test/e2e/framework"
-	imageutils "k8s.io/kubernetes/test/utils/image"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 )
+
+var serverPrintVersion = utilversion.MustParseSemantic("v1.10.0")
 
 var _ = SIGDescribe("Servers with support for Table transformation", func() {
 	f := framework.NewDefaultFramework("tables")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	It("should return pod details", func() {
+	ginkgo.BeforeEach(func() {
+		e2eskipper.SkipUnlessServerVersionGTE(serverPrintVersion, f.ClientSet.Discovery())
+	})
+
+	ginkgo.It("should return pod details", func(ctx context.Context) {
 		ns := f.Namespace.Name
 		c := f.ClientSet
 
 		podName := "pod-1"
 		framework.Logf("Creating pod %s", podName)
 
-		_, err := c.CoreV1().Pods(ns).Create(newTablePod(podName))
-		Expect(err).NotTo(HaveOccurred())
+		_, err := c.CoreV1().Pods(ns).Create(ctx, newTablePod(ns, podName), metav1.CreateOptions{})
+		framework.ExpectNoError(err, "failed to create pod %s in namespace: %s", podName, ns)
 
-		table := &metav1alpha1.Table{}
-		err = c.CoreV1().RESTClient().Get().Resource("pods").Namespace(ns).Name(podName).SetHeader("Accept", "application/json;as=Table;v=v1alpha1;g=meta.k8s.io").Do().Into(table)
-		Expect(err).NotTo(HaveOccurred())
+		table := &metav1beta1.Table{}
+		err = c.CoreV1().RESTClient().Get().Resource("pods").Namespace(ns).Name(podName).SetHeader("Accept", "application/json;as=Table;v=v1beta1;g=meta.k8s.io").Do(ctx).Into(table)
+		framework.ExpectNoError(err, "failed to get pod %s in Table form in namespace: %s", podName, ns)
 		framework.Logf("Table: %#v", table)
 
-		Expect(len(table.ColumnDefinitions)).To(BeNumerically(">", 2))
-		Expect(len(table.Rows)).To(Equal(1))
-		Expect(len(table.Rows[0].Cells)).To(Equal(len(table.ColumnDefinitions)))
-		Expect(table.ColumnDefinitions[0].Name).To(Equal("Name"))
-		Expect(table.Rows[0].Cells[0]).To(Equal(podName))
+		gomega.Expect(len(table.ColumnDefinitions)).To(gomega.BeNumerically(">", 2))
+		gomega.Expect(table.Rows).To(gomega.HaveLen(1))
+		gomega.Expect(table.Rows[0].Cells).To(gomega.HaveLen(len(table.ColumnDefinitions)))
+		gomega.Expect(table.ColumnDefinitions[0].Name).To(gomega.Equal("Name"))
+		gomega.Expect(table.Rows[0].Cells[0]).To(gomega.Equal(podName))
 
 		out := printTable(table)
-		Expect(out).To(MatchRegexp("^NAME\\s"))
-		Expect(out).To(MatchRegexp("\npod-1\\s"))
+		gomega.Expect(out).To(gomega.MatchRegexp("^NAME\\s"))
+		gomega.Expect(out).To(gomega.MatchRegexp("\npod-1\\s"))
 		framework.Logf("Table:\n%s", out)
 	})
 
-	It("should return chunks of table results for list calls", func() {
+	ginkgo.It("should return chunks of table results for list calls", func(ctx context.Context) {
 		ns := f.Namespace.Name
 		c := f.ClientSet
 		client := c.CoreV1().PodTemplates(ns)
 
-		By("creating a large number of resources")
-		workqueue.Parallelize(5, 20, func(i int) {
+		ginkgo.By("creating a large number of resources")
+		workqueue.ParallelizeUntil(ctx, 5, 20, func(i int) {
 			for tries := 3; tries >= 0; tries-- {
-				_, err := client.Create(&v1.PodTemplate{
+				_, err := client.Create(ctx, &v1.PodTemplate{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fmt.Sprintf("template-%04d", i),
 					},
@@ -83,98 +96,93 @@ var _ = SIGDescribe("Servers with support for Table transformation", func() {
 							},
 						},
 					},
-				})
+				}, metav1.CreateOptions{})
 				if err == nil {
 					return
 				}
 				framework.Logf("Got an error creating template %d: %v", i, err)
 			}
-			Fail("Unable to create template %d, exiting", i)
+			framework.Failf("Unable to create template %d, exiting", i)
 		})
 
-		pagedTable := &metav1alpha1.Table{}
+		pagedTable := &metav1beta1.Table{}
 		err := c.CoreV1().RESTClient().Get().Namespace(ns).Resource("podtemplates").
 			VersionedParams(&metav1.ListOptions{Limit: 2}, metav1.ParameterCodec).
-			SetHeader("Accept", "application/json;as=Table;v=v1alpha1;g=meta.k8s.io").
-			Do().Into(pagedTable)
-		Expect(err).NotTo(HaveOccurred())
-		// TODO: kops PR job is still using etcd2, which prevents this feature from working. Remove this check when kops is upgraded to etcd3
-		if len(pagedTable.Rows) > 2 {
-			framework.Skipf("ERROR: This cluster does not support chunking, which means it is running etcd2 and not supported.")
-		}
-		Expect(len(pagedTable.Rows)).To(Equal(2))
-		Expect(pagedTable.ResourceVersion).ToNot(Equal(""))
-		Expect(pagedTable.SelfLink).ToNot(Equal(""))
-		Expect(pagedTable.Continue).ToNot(Equal(""))
-		Expect(pagedTable.Rows[0].Cells[0]).To(Equal("template-0000"))
-		Expect(pagedTable.Rows[1].Cells[0]).To(Equal("template-0001"))
+			SetHeader("Accept", "application/json;as=Table;v=v1beta1;g=meta.k8s.io").
+			Do(ctx).Into(pagedTable)
+		framework.ExpectNoError(err, "failed to get pod templates in Table form in namespace: %s", ns)
+		gomega.Expect(pagedTable.Rows).To(gomega.HaveLen(2))
+		gomega.Expect(pagedTable.ResourceVersion).ToNot(gomega.BeEmpty())
+		gomega.Expect(pagedTable.Continue).ToNot(gomega.BeEmpty())
+		gomega.Expect(pagedTable.Rows[0].Cells[0]).To(gomega.Equal("template-0000"))
+		gomega.Expect(pagedTable.Rows[1].Cells[0]).To(gomega.Equal("template-0001"))
 
 		err = c.CoreV1().RESTClient().Get().Namespace(ns).Resource("podtemplates").
 			VersionedParams(&metav1.ListOptions{Continue: pagedTable.Continue}, metav1.ParameterCodec).
-			SetHeader("Accept", "application/json;as=Table;v=v1alpha1;g=meta.k8s.io").
-			Do().Into(pagedTable)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(len(pagedTable.Rows)).To(BeNumerically(">", 0))
-		Expect(pagedTable.Rows[0].Cells[0]).To(Equal("template-0002"))
+			SetHeader("Accept", "application/json;as=Table;v=v1beta1;g=meta.k8s.io").
+			Do(ctx).Into(pagedTable)
+		framework.ExpectNoError(err, "failed to get pod templates in Table form in namespace: %s", ns)
+		gomega.Expect(pagedTable.Rows).ToNot(gomega.BeEmpty())
+		gomega.Expect(pagedTable.Rows[0].Cells[0]).To(gomega.Equal("template-0002"))
 	})
 
-	It("should return generic metadata details across all namespaces for nodes", func() {
+	ginkgo.It("should return generic metadata details across all namespaces for nodes", func(ctx context.Context) {
 		c := f.ClientSet
 
-		table := &metav1alpha1.Table{}
-		err := c.CoreV1().RESTClient().Get().Resource("nodes").SetHeader("Accept", "application/json;as=Table;v=v1alpha1;g=meta.k8s.io").Do().Into(table)
-		Expect(err).NotTo(HaveOccurred())
+		table := &metav1beta1.Table{}
+		err := c.CoreV1().RESTClient().Get().Resource("nodes").SetHeader("Accept", "application/json;as=Table;v=v1beta1;g=meta.k8s.io").Do(ctx).Into(table)
+		framework.ExpectNoError(err, "failed to get nodes in Table form across all namespaces")
 		framework.Logf("Table: %#v", table)
 
-		Expect(len(table.ColumnDefinitions)).To(BeNumerically(">=", 2))
-		Expect(len(table.Rows)).To(BeNumerically(">=", 1))
-		Expect(len(table.Rows[0].Cells)).To(Equal(len(table.ColumnDefinitions)))
-		Expect(table.ColumnDefinitions[0].Name).To(Equal("Name"))
-		Expect(table.ResourceVersion).ToNot(Equal(""))
-		Expect(table.SelfLink).ToNot(Equal(""))
+		gomega.Expect(len(table.ColumnDefinitions)).To(gomega.BeNumerically(">=", 2))
+		gomega.Expect(table.Rows).ToNot(gomega.BeEmpty())
+		gomega.Expect(table.Rows[0].Cells).To(gomega.HaveLen(len(table.ColumnDefinitions)))
+		gomega.Expect(table.ColumnDefinitions[0].Name).To(gomega.Equal("Name"))
+		gomega.Expect(table.ResourceVersion).ToNot(gomega.BeEmpty())
 
 		out := printTable(table)
-		Expect(out).To(MatchRegexp("^NAME\\s"))
+		gomega.Expect(out).To(gomega.MatchRegexp("^NAME\\s"))
 		framework.Logf("Table:\n%s", out)
 	})
 
-	It("should return a 406 for a backend which does not implement metadata", func() {
+	/*
+			    Release: v1.16
+				Testname: API metadata HTTP return
+				Description: Issue a HTTP request to the API.
+		        HTTP request MUST return a HTTP status code of 406.
+	*/
+	framework.ConformanceIt("should return a 406 for a backend which does not implement metadata", func(ctx context.Context) {
 		c := f.ClientSet
 
-		table := &metav1alpha1.Table{}
-		err := c.CoreV1().RESTClient().Get().Resource("services").SetHeader("Accept", "application/json;as=Table;v=v1alpha1;g=meta.k8s.io").Do().Into(table)
-		Expect(err).To(HaveOccurred())
-		Expect(err.(errors.APIStatus).Status().Code).To(Equal(int32(406)))
+		table := &metav1beta1.Table{}
+		sar := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				NonResourceAttributes: &authorizationv1.NonResourceAttributes{
+					Path: "/",
+					Verb: "get",
+				},
+			},
+		}
+		err := c.AuthorizationV1().RESTClient().Post().Resource("selfsubjectaccessreviews").SetHeader("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io").Body(sar).Do(ctx).Into(table)
+		gomega.Expect(err).To(gomega.HaveOccurred(), "failed to return error when posting self subject access review: %+v, to a backend that does not implement metadata", sar)
+		gomega.Expect(err.(apierrors.APIStatus)).To(gomega.HaveField("Status().Code", gomega.Equal(int32(406))))
 	})
 })
 
-func printTable(table *metav1alpha1.Table) string {
+func printTable(table *metav1beta1.Table) string {
 	buf := &bytes.Buffer{}
 	tw := tabwriter.NewWriter(buf, 5, 8, 1, ' ', 0)
-	err := printers.PrintTable(table, tw, printers.PrintOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	printer := printers.NewTablePrinter(printers.PrintOptions{})
+	err := printer.PrintObj(table, tw)
+	framework.ExpectNoError(err, "failed to print table: %+v", table)
 	tw.Flush()
 	return buf.String()
 }
 
-func newTablePod(podName string) *v1.Pod {
-	containerName := fmt.Sprintf("%s-container", podName)
+func newTablePod(ns, podName string) *v1.Pod {
 	port := 8080
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: podName,
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{
-				{
-					Name:  containerName,
-					Image: imageutils.GetE2EImage(imageutils.Porter),
-					Env:   []v1.EnvVar{{Name: fmt.Sprintf("SERVE_PORT_%d", port), Value: "foo"}},
-					Ports: []v1.ContainerPort{{ContainerPort: int32(port)}},
-				},
-			},
-			RestartPolicy: v1.RestartPolicyNever,
-		},
-	}
+	pod := e2epod.NewAgnhostPod(ns, podName, nil, nil, []v1.ContainerPort{{ContainerPort: int32(port)}}, "porter")
+	pod.Spec.Containers[0].Env = []v1.EnvVar{{Name: fmt.Sprintf("SERVE_PORT_%d", port), Value: "foo"}}
+	pod.Spec.RestartPolicy = v1.RestartPolicyNever
 	return pod
 }

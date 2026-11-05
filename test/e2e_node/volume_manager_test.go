@@ -14,34 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
+	"fmt"
+	"path/filepath"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"fmt"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = framework.KubeDescribe("Kubelet Volume Manager", func() {
+var _ = SIGDescribe("Kubelet Volume Manager", func() {
 	f := framework.NewDefaultFramework("kubelet-volume-manager")
-	Describe("Volume Manager", func() {
-		Context("On terminatation of pod with memory backed volume", func() {
-			It("should remove the volume from the node", func() {
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	ginkgo.Describe("Volume Manager", func() {
+		ginkgo.Context("On termination of pod with memory backed volume", func() {
+			f.It("should remove the volume from the node", f.WithNodeConformance(), func(ctx context.Context) {
 				var (
 					memoryBackedPod *v1.Pod
 					volumeName      string
 				)
-				By("Creating a pod with a memory backed volume that exits success without restart", func() {
+				ginkgo.By("Creating a pod with a memory backed volume that exits success without restart", func() {
 					volumeName = "memory-volume"
-					memoryBackedPod = f.PodClient().Create(&v1.Pod{
+					memoryBackedPod = e2epod.NewPodClient(f).Create(ctx, &v1.Pod{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "pod" + string(uuid.NewUUID()),
 							Namespace: f.Namespace.Name,
@@ -71,16 +74,16 @@ var _ = framework.KubeDescribe("Kubelet Volume Manager", func() {
 							},
 						},
 					})
-					err := framework.WaitForPodSuccessInNamespace(f.ClientSet, memoryBackedPod.Name, f.Namespace.Name)
-					Expect(err).NotTo(HaveOccurred())
+					err := e2epod.WaitForPodSuccessInNamespace(ctx, f.ClientSet, memoryBackedPod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
 				})
-				By("Verifying the memory backed volume was removed from node", func() {
+				ginkgo.By("Verifying the memory backed volume was removed from node", func() {
 					volumePath := fmt.Sprintf("/tmp/%s/volumes/kubernetes.io~empty-dir/%s", string(memoryBackedPod.UID), volumeName)
 					var err error
-					for i := 0; i < 10; i++ {
+					for range 10 {
 						// need to create a new verification pod on each pass since updates
 						//to the HostPath volume aren't propogated to the pod
-						pod := f.PodClient().Create(&v1.Pod{
+						pod := e2epod.NewPodClient(f).Create(ctx, &v1.Pod{
 							ObjectMeta: metav1.ObjectMeta{
 								Name:      "pod" + string(uuid.NewUUID()),
 								Namespace: f.Namespace.Name,
@@ -104,23 +107,21 @@ var _ = framework.KubeDescribe("Kubelet Volume Manager", func() {
 									{
 										Name: "kubelet-pods",
 										VolumeSource: v1.VolumeSource{
-											// TODO: remove hardcoded kubelet volume directory path
-											// framework.TestContext.KubeVolumeDir is currently not populated for node e2e
-											HostPath: &v1.HostPathVolumeSource{Path: "/var/lib/kubelet/pods"},
+											HostPath: &v1.HostPathVolumeSource{Path: filepath.Join(framework.TestContext.KubeletRootDir, "pods")},
 										},
 									},
 								},
 							},
 						})
-						err = framework.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+						err = e2epod.WaitForPodSuccessInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
 						gp := int64(1)
-						f.PodClient().Delete(pod.Name, &metav1.DeleteOptions{GracePeriodSeconds: &gp})
+						_ = e2epod.NewPodClient(f).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &gp})
 						if err == nil {
 							break
 						}
 						<-time.After(10 * time.Second)
 					}
-					Expect(err).NotTo(HaveOccurred())
+					framework.ExpectNoError(err)
 				})
 			})
 		})

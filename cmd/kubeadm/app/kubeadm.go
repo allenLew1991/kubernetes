@@ -17,20 +17,32 @@ limitations under the License.
 package app
 
 import (
+	"flag"
 	"os"
 
 	"github.com/spf13/pflag"
 
-	_ "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/install"
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd"
 )
 
 // Run creates and executes new kubeadm command
 func Run() error {
-	// We do not want these flags to show up in --help
-	pflag.CommandLine.MarkHidden("version")
-	pflag.CommandLine.MarkHidden("google-json-key")
-	pflag.CommandLine.MarkHidden("log-flush-frequency")
+	var allFlags flag.FlagSet
+	klog.InitFlags(&allFlags)
+	// only add the flags that are still supported for kubeadm
+	allFlags.VisitAll(func(f *flag.Flag) {
+		switch f.Name {
+		// kubeadm only exposes the klog flags covered in https://features.k8s.io/2845
+		case "v", "vmodule":
+			flag.CommandLine.Var(f.Value, f.Name, f.Usage)
+		}
+	})
+
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 
 	cmd := cmd.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
 	return cmd.Execute()

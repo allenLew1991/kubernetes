@@ -423,7 +423,7 @@ func normalizeElementOrder(patch, serverOnly, patchOrder, serverOrder []interfac
 // scan from the place of last insertion in `right` to the end of `right`,
 // the place is before the first item that is greater than the item we want to insert.
 // example usage: using server-only items as left and patch items as right. We insert server-only items
-// to patch list. We use the order of live object as record for comparision.
+// to patch list. We use the order of live object as record for comparison.
 func mergeSortedSlice(left, right, serverOrder []interface{}, mergeKey string, kind reflect.Kind) []interface{} {
 	// Returns if l is less than r, and if both have been found.
 	// If l and r both present and l is in front of r, l is less than r.
@@ -880,6 +880,29 @@ func StrategicMergeMapPatchUsingLookupPatchMeta(original, patch JSONMap, schema 
 	return mergeMap(original, patch, schema, mergeOptions)
 }
 
+// MergeStrategicMergeMapPatchUsingLookupPatchMeta merges strategic merge
+// patches retaining `null` fields and parallel lists. If 2 patches change the
+// same fields and the latter one will override the former one. If you don't
+// want that happen, you need to run func MergingMapsHaveConflicts before
+// merging these patches. Applying the resulting merged merge patch to a JSONMap
+// yields the same as merging each strategic merge patch to the JSONMap in
+// succession.
+func MergeStrategicMergeMapPatchUsingLookupPatchMeta(schema LookupPatchMeta, patches ...JSONMap) (JSONMap, error) {
+	mergeOptions := MergeOptions{
+		MergeParallelList:    false,
+		IgnoreUnmatchedNulls: false,
+	}
+	merged := JSONMap{}
+	var err error
+	for _, patch := range patches {
+		merged, err = mergeMap(merged, patch, schema, mergeOptions)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return merged, nil
+}
+
 // handleDirectiveInMergeMap handles the patch directive when merging 2 maps.
 func handleDirectiveInMergeMap(directive interface{}, patch map[string]interface{}) (map[string]interface{}, error) {
 	if directive == replaceDirective {
@@ -964,10 +987,10 @@ func validatePatchWithSetOrderList(patchList, setOrderList interface{}, mergeKey
 		return nil
 	}
 
-	var nonDeleteList, toDeleteList []interface{}
+	var nonDeleteList []interface{}
 	var err error
 	if len(mergeKey) > 0 {
-		nonDeleteList, toDeleteList, err = extractToDeleteItems(typedPatchList)
+		nonDeleteList, _, err = extractToDeleteItems(typedPatchList)
 		if err != nil {
 			return err
 		}
@@ -991,11 +1014,10 @@ func validatePatchWithSetOrderList(patchList, setOrderList interface{}, mergeKey
 		setOrderIndex++
 	}
 	// If patchIndex is inbound but setOrderIndex if out of bound mean there are items mismatching between the patch list and setElementOrder list.
-	// the second check is is a sanity check, and should always be true if the first is true.
+	// the second check is a sanity check, and should always be true if the first is true.
 	if patchIndex < len(nonDeleteList) && setOrderIndex >= len(typedSetOrderList) {
 		return fmt.Errorf("The order in patch list:\n%v\n doesn't match %s list:\n%v\n", typedPatchList, setElementOrderDirectivePrefix, setOrderList)
 	}
-	typedPatchList = append(nonDeleteList, toDeleteList...)
 	return nil
 }
 
@@ -1084,7 +1106,7 @@ func applyRetainKeysDirective(original, patch map[string]interface{}, options Me
 // Then, sort them by the relative order in setElementOrder, patch list and live list.
 // The precedence is $setElementOrder > order in patch list > order in live list.
 // This function will delete the item after merging it to prevent process it again in the future.
-// Ref: https://git.k8s.io/community/contributors/design-proposals/cli/preserve-order-in-strategic-merge-patch.md
+// Ref: https://git.k8s.io/design-proposals-archive/cli/preserve-order-in-strategic-merge-patch.md
 func mergePatchIntoOriginal(original, patch map[string]interface{}, schema LookupPatchMeta, mergeOptions MergeOptions) error {
 	for key, patchV := range patch {
 		// Do nothing if there is no ordering directive
@@ -1160,7 +1182,13 @@ func mergePatchIntoOriginal(original, patch map[string]interface{}, schema Looku
 			merged = originalFieldValue
 		case !foundOriginal && foundPatch:
 			// list was added
-			merged = patchFieldValue
+			v, keep := removeDirectives(patchFieldValue)
+			if !keep {
+				// Shouldn't be possible since patchFieldValue is a slice
+				continue
+			}
+
+			merged = v.([]interface{})
 		case foundOriginal && foundPatch:
 			merged, err = mergeSliceHandler(originalList, patchList, subschema,
 				patchStrategy, patchMeta.GetPatchMergeKey(), false, mergeOptions)
@@ -1248,6 +1276,42 @@ func partitionMapsByPresentInList(original, partitionBy []interface{}, mergeKey 
 	return patch, serverOnly, nil
 }
 
+// Removes directives from an object and returns value to use instead and whether
+// or not the field/index should even be kept
+// May modify input
+func removeDirectives(obj interface{}) (interface{}, bool) {
+	if obj == nil {
+		return obj, true
+	} else if typedV, ok := obj.(map[string]interface{}); ok {
+		if _, hasDirective := typedV[directiveMarker]; hasDirective {
+			return nil, false
+		}
+
+		for k, v := range typedV {
+			var keep bool
+			typedV[k], keep = removeDirectives(v)
+			if !keep {
+				delete(typedV, k)
+			}
+		}
+		return typedV, true
+	} else if typedV, ok := obj.([]interface{}); ok {
+		var res []interface{}
+		if typedV != nil {
+			// Make sure res is non-nil if patch is non-nil
+			res = []interface{}{}
+		}
+		for _, v := range typedV {
+			if newV, keep := removeDirectives(v); keep {
+				res = append(res, newV)
+			}
+		}
+		return res, true
+	} else {
+		return obj, true
+	}
+}
+
 // Merge fields from a patch map into the original map. Note: This may modify
 // both the original map and the patch because getting a deep copy of a map in
 // golang is highly non-trivial.
@@ -1297,10 +1361,12 @@ func mergeMap(original, patch map[string]interface{}, schema LookupPatchMeta, me
 		// original. Otherwise, check if we want to preserve it or skip it.
 		// Preserving the null value is useful when we want to send an explicit
 		// delete to the API server.
+		// In some cases, this may lead to inconsistent behavior with create.
+		// ref: https://github.com/kubernetes/kubernetes/issues/123304
+		// To avoid breaking compatibility,
+		// we made corresponding changes on the client side to ensure that the create and patch behaviors are idempotent.
 		if patchV == nil {
-			if _, ok := original[k]; ok {
-				delete(original, k)
-			}
+			delete(original, k)
 			if mergeOptions.IgnoreUnmatchedNulls {
 				continue
 			}
@@ -1308,15 +1374,31 @@ func mergeMap(original, patch map[string]interface{}, schema LookupPatchMeta, me
 
 		_, ok := original[k]
 		if !ok {
-			// If it's not in the original document, just take the patch value.
-			original[k] = patchV
+			if !isDeleteList {
+				// If it's not in the original document, just take the patch value.
+				if mergeOptions.IgnoreUnmatchedNulls {
+					discardNullValuesFromPatch(patchV)
+				}
+				original[k], ok = removeDirectives(patchV)
+				if !ok {
+					delete(original, k)
+				}
+			}
 			continue
 		}
 
 		originalType := reflect.TypeOf(original[k])
 		patchType := reflect.TypeOf(patchV)
 		if originalType != patchType {
-			original[k] = patchV
+			if !isDeleteList {
+				if mergeOptions.IgnoreUnmatchedNulls {
+					discardNullValuesFromPatch(patchV)
+				}
+				original[k], ok = removeDirectives(patchV)
+				if !ok {
+					delete(original, k)
+				}
+			}
 			continue
 		}
 		// If they're both maps or lists, recurse into the value.
@@ -1342,13 +1424,36 @@ func mergeMap(original, patch map[string]interface{}, schema LookupPatchMeta, me
 			}
 			original[k], err = mergeSliceHandler(original[k], patchV, subschema, patchStrategy, patchMeta.GetPatchMergeKey(), isDeleteList, mergeOptions)
 		default:
-			original[k] = patchV
+			original[k], ok = removeDirectives(patchV)
+			if !ok {
+				// if patchV itself is a directive, then don't keep it
+				delete(original, k)
+			}
 		}
 		if err != nil {
 			return nil, err
 		}
 	}
 	return original, nil
+}
+
+// discardNullValuesFromPatch discards all null property values from patch.
+// It traverses all slices and map types.
+func discardNullValuesFromPatch(patchV interface{}) {
+	switch patchV := patchV.(type) {
+	case map[string]interface{}:
+		for k, v := range patchV {
+			if v == nil {
+				delete(patchV, k)
+			} else {
+				discardNullValuesFromPatch(v)
+			}
+		}
+	case []interface{}:
+		for _, v := range patchV {
+			discardNullValuesFromPatch(v)
+		}
+	}
 }
 
 // mergeMapHandler handles how to merge `patchV` whose key is `key` with `original` respecting
@@ -1376,7 +1481,8 @@ func mergeSliceHandler(original, patch interface{}, schema LookupPatchMeta,
 		return nil, err
 	}
 
-	if fieldPatchStrategy == mergeDirective {
+	// Delete lists are handled the same way regardless of what the field's patch strategy is
+	if fieldPatchStrategy == mergeDirective || isDeleteList {
 		return mergeSlice(typedOriginal, typedPatch, schema, fieldPatchMergeKey, mergeOptions, isDeleteList)
 	} else {
 		return typedPatch, nil
@@ -1721,9 +1827,7 @@ func (ss SortableSliceOfMaps) Less(i, j int) bool {
 }
 
 func (ss SortableSliceOfMaps) Swap(i, j int) {
-	tmp := ss.s[i]
-	ss.s[i] = ss.s[j]
-	ss.s[j] = tmp
+	ss.s[i], ss.s[j] = ss.s[j], ss.s[i]
 }
 
 func deduplicateAndSortScalars(s []interface{}) []interface{} {
@@ -1769,9 +1873,7 @@ func (ss SortableSliceOfScalars) Less(i, j int) bool {
 }
 
 func (ss SortableSliceOfScalars) Swap(i, j int) {
-	tmp := ss.s[i]
-	ss.s[i] = ss.s[j]
-	ss.s[j] = tmp
+	ss.s[i], ss.s[j] = ss.s[j], ss.s[i]
 }
 
 // Returns the type of the elements of N slice(s). If the type is different,
@@ -1853,7 +1955,7 @@ func mergingMapFieldsHaveConflicts(
 			return true, nil
 		}
 		return slicesHaveConflicts(leftType, rightType, schema, fieldPatchStrategy, fieldPatchMergeKey)
-	case string, float64, bool, int, int64, nil:
+	case string, float64, bool, int64, nil:
 		return !reflect.DeepEqual(left, right), nil
 	default:
 		return true, fmt.Errorf("unknown type: %v", reflect.TypeOf(left))
@@ -2109,7 +2211,7 @@ func sliceTypeAssertion(original, patch interface{}) ([]interface{}, []interface
 }
 
 // extractRetainKeysPatchStrategy process patch strategy, which is a string may contains multiple
-// patch strategies seperated by ",". It returns a boolean var indicating if it has
+// patch strategies separated by ",". It returns a boolean var indicating if it has
 // retainKeys strategies and a string for the other strategy.
 func extractRetainKeysPatchStrategy(strategies []string) (bool, string, error) {
 	switch len(strategies) {

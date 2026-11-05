@@ -1,13 +1,11 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- mikedanese
-- timothysc
+  - jefftree
 reviewers:
-- wojtek-t
-- deads2k
-- mikedanese
-- gmarek
-- eparis
-- timothysc
-- ingvagabund
-- resouer
-- goltermann
+  - wojtek-t
+  - deads2k
+  - ingvagabund
+  - jefftree
+emeritus_approvers:
+  - timothysc

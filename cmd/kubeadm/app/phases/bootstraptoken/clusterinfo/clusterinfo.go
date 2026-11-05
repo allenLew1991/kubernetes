@@ -19,16 +19,18 @@ package clusterinfo
 import (
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
-	rbachelper "k8s.io/kubernetes/pkg/apis/rbac/v1"
-	bootstrapapi "k8s.io/kubernetes/pkg/bootstrap/api"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 const (
@@ -37,17 +39,23 @@ const (
 )
 
 // CreateBootstrapConfigMapIfNotExists creates the kube-public ConfigMap if it doesn't exist already
-func CreateBootstrapConfigMapIfNotExists(client clientset.Interface, file string) error {
+func CreateBootstrapConfigMapIfNotExists(client clientset.Interface, kubeconfig *clientcmdapi.Config) error {
 
-	fmt.Printf("[bootstraptoken] Creating the %q ConfigMap in the %q namespace\n", bootstrapapi.ConfigMapClusterInfo, metav1.NamespacePublic)
+	fmt.Printf("[bootstrap-token] Creating the %q ConfigMap in the %q namespace\n", bootstrapapi.ConfigMapClusterInfo, metav1.NamespacePublic)
 
-	adminConfig, err := clientcmd.LoadFromFile(file)
-	if err != nil {
-		return fmt.Errorf("failed to load admin kubeconfig [%v]", err)
+	// Clone the kubeconfig so that it's not mutated.
+	adminConfig := kubeconfig.DeepCopy()
+	if err := clientcmdapi.FlattenConfig(adminConfig); err != nil {
+		return err
+	}
+
+	if adminConfig.Contexts[adminConfig.CurrentContext] == nil {
+		return errors.New("invalid kubeconfig")
 	}
 
 	adminCluster := adminConfig.Contexts[adminConfig.CurrentContext].Cluster
 	// Copy the cluster from admin.conf to the bootstrap kubeconfig, contains the CA cert and the server URL
+	klog.V(1).Infoln("[bootstrap-token] copying the cluster from admin.conf to the bootstrap kubeconfig")
 	bootstrapConfig := &clientcmdapi.Config{
 		Clusters: map[string]*clientcmdapi.Cluster{
 			"": adminConfig.Clusters[adminCluster],
@@ -59,7 +67,8 @@ func CreateBootstrapConfigMapIfNotExists(client clientset.Interface, file string
 	}
 
 	// Create or update the ConfigMap in the kube-public namespace
-	return apiclient.CreateOrUpdateConfigMap(client, &v1.ConfigMap{
+	klog.V(1).Infoln("[bootstrap-token] creating/updating ConfigMap in kube-public namespace")
+	return apiclient.CreateOrUpdate(client.CoreV1().ConfigMaps(metav1.NamespacePublic), &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      bootstrapapi.ConfigMapClusterInfo,
 			Namespace: metav1.NamespacePublic,
@@ -72,20 +81,26 @@ func CreateBootstrapConfigMapIfNotExists(client clientset.Interface, file string
 
 // CreateClusterInfoRBACRules creates the RBAC rules for exposing the cluster-info ConfigMap in the kube-public namespace to unauthenticated users
 func CreateClusterInfoRBACRules(client clientset.Interface) error {
-	err := apiclient.CreateOrUpdateRole(client, &rbac.Role{
+	klog.V(1).Infoln("creating the RBAC rules for exposing the cluster-info ConfigMap in the kube-public namespace")
+	err := apiclient.CreateOrUpdate(client.RbacV1().Roles(metav1.NamespacePublic), &rbac.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      BootstrapSignerClusterRoleName,
 			Namespace: metav1.NamespacePublic,
 		},
 		Rules: []rbac.PolicyRule{
-			rbachelper.NewRule("get").Groups("").Resources("configmaps").Names(bootstrapapi.ConfigMapClusterInfo).RuleOrDie(),
+			{
+				Verbs:         []string{"get"},
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{bootstrapapi.ConfigMapClusterInfo},
+			},
 		},
 	})
 	if err != nil {
 		return err
 	}
 
-	return apiclient.CreateOrUpdateRoleBinding(client, &rbac.RoleBinding{
+	return apiclient.CreateOrUpdate(client.RbacV1().RoleBindings(metav1.NamespacePublic), &rbac.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      BootstrapSignerClusterRoleName,
 			Namespace: metav1.NamespacePublic,

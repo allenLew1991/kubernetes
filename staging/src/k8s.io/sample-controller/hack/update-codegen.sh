@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2017 The Kubernetes Authors.
 #
@@ -18,17 +18,45 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_ROOT=$(dirname ${BASH_SOURCE})/..
-CODEGEN_PKG=${CODEGEN_PKG:-$(cd ${SCRIPT_ROOT}; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
+SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+CODEGEN_PKG=${CODEGEN_PKG:-$(cd "${SCRIPT_ROOT}"; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
 
-# generate the code with:
-# --output-base    because this script should also be able to run inside the vendor dir of
-#                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
-#                  instead of the $GOPATH directly. For normal projects this can be dropped.
-${CODEGEN_PKG}/generate-groups.sh "deepcopy,client,informer,lister" \
-  k8s.io/sample-controller/pkg/client k8s.io/sample-controller/pkg/apis \
-  samplecontroller:v1alpha1 \
-  --output-base "$(dirname ${BASH_SOURCE})/../../.."
+source "${CODEGEN_PKG}/kube_codegen.sh"
 
-# To use your own boilerplate text append:
-#   --go-header-file ${SCRIPT_ROOT}/hack/custom-boilerplate.go.txt
+THIS_PKG="k8s.io/sample-controller"
+
+kube::codegen::gen_helpers \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg/apis"
+
+if [[ -n "${API_KNOWN_VIOLATIONS_DIR:-}" ]]; then
+    report_filename="${API_KNOWN_VIOLATIONS_DIR}/sample_controller_violation_exceptions.list"
+    if [[ "${UPDATE_API_KNOWN_VIOLATIONS:-}" == "true" ]]; then
+        update_report="--update-report"
+    fi
+fi
+
+kube::codegen::gen_openapi \
+    --output-dir "${SCRIPT_ROOT}/pkg/generated/openapi" \
+    --output-pkg "k8s.io/${THIS_PKG}/pkg/generated/openapi" \
+    --report-filename "${report_filename:-"/dev/null"}" \
+    --output-model-name-file "zz_generated.model_name.go" \
+    ${update_report:+"${update_report}"} \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    "${SCRIPT_ROOT}/pkg/apis"
+
+kube::codegen::gen_client \
+    --with-watch \
+    --with-applyconfig \
+    --applyconfig-openapi-schema <(go run k8s.io/sample-controller/pkg/generated/openapi/cmd/models-schema) \
+    --output-dir "${SCRIPT_ROOT}/pkg/generated" \
+    --output-pkg "${THIS_PKG}/pkg/generated" \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg/apis"
+
+kube::codegen::gen_register \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg/apis"

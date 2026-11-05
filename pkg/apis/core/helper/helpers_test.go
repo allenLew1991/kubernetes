@@ -17,11 +17,9 @@ limitations under the License.
 package helper
 
 import (
-	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/pkg/apis/core"
 )
 
@@ -62,7 +60,7 @@ func TestIsStandardResource(t *testing.T) {
 		{"requests.hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardResourceName(tc.input) != tc.output {
+		if IsStandardResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
@@ -79,89 +77,68 @@ func TestIsStandardContainerResource(t *testing.T) {
 		{"hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardContainerResourceName(tc.input) != tc.output {
+		if IsStandardContainerResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
 }
 
-func TestAddToNodeAddresses(t *testing.T) {
+func TestIsNodeAllocatableResource(t *testing.T) {
 	testCases := []struct {
-		existing []core.NodeAddress
-		toAdd    []core.NodeAddress
-		expected []core.NodeAddress
+		input  string
+		output bool
 	}{
-		{
-			existing: []core.NodeAddress{},
-			toAdd:    []core.NodeAddress{},
-			expected: []core.NodeAddress{},
-		},
-		{
-			existing: []core.NodeAddress{},
-			toAdd: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeHostName, Address: "localhost"},
-			},
-			expected: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeHostName, Address: "localhost"},
-			},
-		},
-		{
-			existing: []core.NodeAddress{},
-			toAdd: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-			},
-			expected: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-			},
-		},
-		{
-			existing: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeInternalIP, Address: "10.1.1.1"},
-			},
-			toAdd: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeHostName, Address: "localhost"},
-			},
-			expected: []core.NodeAddress{
-				{Type: core.NodeExternalIP, Address: "1.1.1.1"},
-				{Type: core.NodeInternalIP, Address: "10.1.1.1"},
-				{Type: core.NodeHostName, Address: "localhost"},
-			},
-		},
+		{"cpu", true},
+		{"memory", true},
+		{"ephemeral-storage", false},
+		{"hugepages-2Mi", true},
+		{"disk", false},
+		{"blah", false},
 	}
-
 	for i, tc := range testCases {
-		AddToNodeAddresses(&tc.existing, tc.toAdd...)
-		if !Semantic.DeepEqual(tc.expected, tc.existing) {
-			t.Errorf("case[%d], expected: %v, got: %v", i, tc.expected, tc.existing)
+		if IsNodeAllocatableResourceName(core.ResourceName(tc.input)) != tc.output {
+			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
 }
 
 func TestGetAccessModesFromString(t *testing.T) {
 	modes := GetAccessModesFromString("ROX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
 
 	modes = GetAccessModesFromString("ROX,RWX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
-	if !containsAccessMode(modes, core.ReadWriteMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
 	}
 
 	modes = GetAccessModesFromString("RWO,ROX,RWX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteOnce) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOnce, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
-	if !containsAccessMode(modes, core.ReadWriteMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
+	}
+
+	modes = GetAccessModesFromString("RWO,ROX,RWX,RWOP")
+	if !ContainsAccessMode(modes, core.ReadWriteOnce) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOnce, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadWriteOncePod) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOncePod, modes)
 	}
 }
 
@@ -172,204 +149,6 @@ func TestRemoveDuplicateAccessModes(t *testing.T) {
 	modes = removeDuplicateAccessModes(modes)
 	if len(modes) != 2 {
 		t.Errorf("Expected 2 distinct modes in set but found %v", len(modes))
-	}
-}
-
-func TestNodeSelectorRequirementsAsSelector(t *testing.T) {
-	matchExpressions := []core.NodeSelectorRequirement{{
-		Key:      "foo",
-		Operator: core.NodeSelectorOpIn,
-		Values:   []string{"bar", "baz"},
-	}}
-	mustParse := func(s string) labels.Selector {
-		out, e := labels.Parse(s)
-		if e != nil {
-			panic(e)
-		}
-		return out
-	}
-	tc := []struct {
-		in        []core.NodeSelectorRequirement
-		out       labels.Selector
-		expectErr bool
-	}{
-		{in: nil, out: labels.Nothing()},
-		{in: []core.NodeSelectorRequirement{}, out: labels.Nothing()},
-		{
-			in:  matchExpressions,
-			out: mustParse("foo in (baz,bar)"),
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "foo",
-				Operator: core.NodeSelectorOpExists,
-				Values:   []string{"bar", "baz"},
-			}},
-			expectErr: true,
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "foo",
-				Operator: core.NodeSelectorOpGt,
-				Values:   []string{"1"},
-			}},
-			out: mustParse("foo>1"),
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "bar",
-				Operator: core.NodeSelectorOpLt,
-				Values:   []string{"7"},
-			}},
-			out: mustParse("bar<7"),
-		},
-	}
-
-	for i, tc := range tc {
-		out, err := NodeSelectorRequirementsAsSelector(tc.in)
-		if err == nil && tc.expectErr {
-			t.Errorf("[%v]expected error but got none.", i)
-		}
-		if err != nil && !tc.expectErr {
-			t.Errorf("[%v]did not expect error but got: %v", i, err)
-		}
-		if !reflect.DeepEqual(out, tc.out) {
-			t.Errorf("[%v]expected:\n\t%+v\nbut got:\n\t%+v", i, tc.out, out)
-		}
-	}
-}
-
-func TestSysctlsFromPodAnnotation(t *testing.T) {
-	type Test struct {
-		annotation  string
-		expectValue []core.Sysctl
-		expectErr   bool
-	}
-	for i, test := range []Test{
-		{
-			annotation:  "",
-			expectValue: nil,
-		},
-		{
-			annotation: "foo.bar",
-			expectErr:  true,
-		},
-		{
-			annotation: "=123",
-			expectErr:  true,
-		},
-		{
-			annotation:  "foo.bar=",
-			expectValue: []core.Sysctl{{Name: "foo.bar", Value: ""}},
-		},
-		{
-			annotation:  "foo.bar=42",
-			expectValue: []core.Sysctl{{Name: "foo.bar", Value: "42"}},
-		},
-		{
-			annotation: "foo.bar=42,",
-			expectErr:  true,
-		},
-		{
-			annotation:  "foo.bar=42,abc.def=1",
-			expectValue: []core.Sysctl{{Name: "foo.bar", Value: "42"}, {Name: "abc.def", Value: "1"}},
-		},
-	} {
-		sysctls, err := SysctlsFromPodAnnotation(test.annotation)
-		if test.expectErr && err == nil {
-			t.Errorf("[%v]expected error but got none", i)
-		} else if !test.expectErr && err != nil {
-			t.Errorf("[%v]did not expect error but got: %v", i, err)
-		} else if !reflect.DeepEqual(sysctls, test.expectValue) {
-			t.Errorf("[%v]expect value %v but got %v", i, test.expectValue, sysctls)
-		}
-	}
-}
-
-// TODO: remove when alpha support for topology constraints is removed
-func TestGetNodeAffinityFromAnnotations(t *testing.T) {
-	testCases := []struct {
-		annotations map[string]string
-		expectErr   bool
-	}{
-		{
-			annotations: nil,
-			expectErr:   false,
-		},
-		{
-			annotations: map[string]string{},
-			expectErr:   false,
-		},
-		{
-			annotations: map[string]string{
-				core.AlphaStorageNodeAffinityAnnotation: `{
-					"requiredDuringSchedulingIgnoredDuringExecution": { 
-						"nodeSelectorTerms": [ 
-							{ "matchExpressions": [
-								{ "key": "test-key1",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								},
-								{ "key": "test-key2",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								}
-							]}
-						]}
-					}`,
-			},
-			expectErr: false,
-		},
-		{
-			annotations: map[string]string{
-				core.AlphaStorageNodeAffinityAnnotation: `[{
-					"requiredDuringSchedulingIgnoredDuringExecution": { 
-						"nodeSelectorTerms": [ 
-							{ "matchExpressions": [
-								{ "key": "test-key1",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								},
-								{ "key": "test-key2",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								}
-							]}
-						]}
-					}]`,
-			},
-			expectErr: true,
-		},
-		{
-			annotations: map[string]string{
-				core.AlphaStorageNodeAffinityAnnotation: `{
-					"requiredDuringSchedulingIgnoredDuringExecution": { 
-						"nodeSelectorTerms":  
-							 "matchExpressions": [
-								{ "key": "test-key1",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								},
-								{ "key": "test-key2",
-								  "operator": "In",
-								  "values": ["test-value1", "test-value2"]
-								}
-							]}
-						}
-					}`,
-			},
-			expectErr: true,
-		},
-	}
-
-	for i, tc := range testCases {
-		_, err := GetStorageNodeAffinityFromAnnotation(tc.annotations)
-		if err == nil && tc.expectErr {
-			t.Errorf("[%v]expected error but got none.", i)
-		}
-		if err != nil && !tc.expectErr {
-			t.Errorf("[%v]did not expect error but got: %v", i, err)
-		}
 	}
 }
 
@@ -398,6 +177,106 @@ func TestIsHugePageResourceName(t *testing.T) {
 	for _, testCase := range testCases {
 		if testCase.result != IsHugePageResourceName(testCase.name) {
 			t.Errorf("resource: %v expected result: %v", testCase.name, testCase.result)
+		}
+	}
+}
+
+func TestIsHugePageResourceValueDivisibleOverflow(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		name     core.ResourceName
+		quantity string
+		result   bool
+	}{
+		{"request at the int64 limit, page size 1", "hugepages-1", "9223372036854775807", true},
+		{"request at the int64 limit, not a multiple", "hugepages-2Mi", "9223372036854775807", false},
+		{"request past int64", "hugepages-2Mi", "9223372036854775808", false},
+		{"request well past int64", "hugepages-2Mi", "1e30", false},
+		{"request past int64, page size dividing MaxInt64", "hugepages-7", "9223372036854775808", false},
+		{"negative request past int64", "hugepages-2Mi", "-1e30", false},
+		{"page size whose milli value exceeds int64", "hugepages-16Pi", "16Pi", false},
+		{"page size past int64", "hugepages-1e19", "1", false},
+		{"page size well past int64", "hugepages-1e30", "1", false},
+		{"page size below one byte", "hugepages-0.5", "1", false},
+	}
+	for _, testCase := range testCases {
+		if testCase.result != IsHugePageResourceValueDivisible(testCase.name, resource.MustParse(testCase.quantity)) {
+			t.Errorf("%s: resource: %v quantity: %v expected result: %v", testCase.desc, testCase.name, testCase.quantity, testCase.result)
+		}
+	}
+}
+
+func TestIsHugePageResourceValueDivisibleRounding(t *testing.T) {
+	// Both operands are rounded to whole bytes before the comparison.
+	testCases := []struct {
+		desc     string
+		name     core.ResourceName
+		quantity string
+		result   bool
+	}{
+		{"2Mi written in milli", "hugepages-2Mi", "2097152000m", true},
+		{"half a byte below 2Mi rounds up to it", "hugepages-2Mi", "2097151500m", true},
+		{"half a byte above 2Mi rounds away from it", "hugepages-2Mi", "2097152500m", false},
+		{"page size with trailing zeros", "hugepages-17179869184.000000000", "34359738368", true},
+		{"page size half a milli below 2 bytes", "hugepages-1.9995", "2", true},
+	}
+	for _, testCase := range testCases {
+		if testCase.result != IsHugePageResourceValueDivisible(testCase.name, resource.MustParse(testCase.quantity)) {
+			t.Errorf("%s: resource: %v quantity: %v expected result: %v", testCase.desc, testCase.name, testCase.quantity, testCase.result)
+		}
+	}
+}
+
+func TestIsHugePageResourceValueDivisible(t *testing.T) {
+	testCases := []struct {
+		name     core.ResourceName
+		quantity resource.Quantity
+		result   bool
+	}{
+		{
+			name:     core.ResourceName("hugepages-2Mi"),
+			quantity: resource.MustParse("4Mi"),
+			result:   true,
+		},
+		{
+			name:     core.ResourceName("hugepages-2Mi"),
+			quantity: resource.MustParse("5Mi"),
+			result:   false,
+		},
+		{
+			name:     core.ResourceName("hugepages-1Gi"),
+			quantity: resource.MustParse("2Gi"),
+			result:   true,
+		},
+		{
+			name:     core.ResourceName("hugepages-1Gi"),
+			quantity: resource.MustParse("2.1Gi"),
+			result:   false,
+		},
+		{
+			name:     core.ResourceName("hugepages-1Mi"),
+			quantity: resource.MustParse("2.1Mi"),
+			result:   false,
+		},
+		{
+			name:     core.ResourceName("hugepages-64Ki"),
+			quantity: resource.MustParse("128Ki"),
+			result:   true,
+		},
+		{
+			name:     core.ResourceName("hugepages-"),
+			quantity: resource.MustParse("128Ki"),
+			result:   false,
+		},
+		{
+			name:     core.ResourceName("hugepages"),
+			quantity: resource.MustParse("128Ki"),
+			result:   false,
+		},
+	}
+	for _, testCase := range testCases {
+		if testCase.result != IsHugePageResourceValueDivisible(testCase.name, testCase.quantity) {
+			t.Errorf("resource: %v storage:%v expected result: %v", testCase.name, testCase.quantity, testCase.result)
 		}
 	}
 }
@@ -475,10 +354,6 @@ func TestIsOvercommitAllowed(t *testing.T) {
 			allowed: true,
 		},
 		{
-			name:    core.ResourceNvidiaGPU,
-			allowed: false,
-		},
-		{
 			name:    HugePageResourceName(resource.MustParse("2Mi")),
 			allowed: false,
 		},
@@ -487,5 +362,120 @@ func TestIsOvercommitAllowed(t *testing.T) {
 		if testCase.allowed != IsOvercommitAllowed(testCase.name) {
 			t.Errorf("Unexpected result for %v", testCase.name)
 		}
+	}
+}
+
+func TestIsServiceIPSet(t *testing.T) {
+	testCases := []struct {
+		input  core.ServiceSpec
+		output bool
+		name   string
+	}{
+		{
+			name: "nil cluster ip",
+			input: core.ServiceSpec{
+				ClusterIPs: nil,
+			},
+
+			output: false,
+		},
+		{
+			name: "headless service",
+			input: core.ServiceSpec{
+				ClusterIP:  "None",
+				ClusterIPs: []string{"None"},
+			},
+			output: false,
+		},
+		// true cases
+		{
+			name: "one ipv4",
+			input: core.ServiceSpec{
+				ClusterIP:  "1.2.3.4",
+				ClusterIPs: []string{"1.2.3.4"},
+			},
+			output: true,
+		},
+		{
+			name: "one ipv6",
+			input: core.ServiceSpec{
+				ClusterIP:  "2001::1",
+				ClusterIPs: []string{"2001::1"},
+			},
+			output: true,
+		},
+		{
+			name: "v4, v6",
+			input: core.ServiceSpec{
+				ClusterIP:  "1.2.3.4",
+				ClusterIPs: []string{"1.2.3.4", "2001::1"},
+			},
+			output: true,
+		},
+		{
+			name: "v6, v4",
+			input: core.ServiceSpec{
+				ClusterIP:  "2001::1",
+				ClusterIPs: []string{"2001::1", "1.2.3.4"},
+			},
+
+			output: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := core.Service{
+				Spec: tc.input,
+			}
+			if IsServiceIPSet(&s) != tc.output {
+				t.Errorf("case, input: %v, expected: %v, got: %v", tc.input, tc.output, !tc.output)
+			}
+		})
+	}
+}
+
+func TestHasInvalidLabelValueInNodeSelectorTerms(t *testing.T) {
+	testCases := []struct {
+		name   string
+		terms  []core.NodeSelectorTerm
+		expect bool
+	}{
+		{
+			name: "valid values",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"far"},
+				}},
+			}},
+			expect: false,
+		},
+		{
+			name:   "empty terms",
+			terms:  []core.NodeSelectorTerm{},
+			expect: false,
+		},
+		{
+			name: "invalid label value",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"-1"},
+				}},
+			}},
+			expect: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasInvalidLabelValueInNodeSelectorTerms(tc.terms)
+			if got != tc.expect {
+				t.Errorf("exepct %v, got %v", tc.expect, got)
+			}
+		})
 	}
 }

@@ -18,6 +18,5 @@ package node
 
 import "k8s.io/kubernetes/test/e2e/framework"
 
-func SIGDescribe(text string, body func()) bool {
-	return framework.KubeDescribe("[sig-node] "+text, body)
-}
+// SIGDescribe annotates the test with the SIG label.
+var SIGDescribe = framework.SIGDescribe("node")

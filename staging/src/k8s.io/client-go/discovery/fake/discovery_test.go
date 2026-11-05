@@ -17,14 +17,19 @@ limitations under the License.
 package fake_test
 
 import (
+	"errors"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
+	"k8s.io/ktesting"
 )
 
 func TestFakingServerVersion(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	client := fakeclientset.NewSimpleClientset()
 	fakeDiscovery, ok := client.Discovery().(*fakediscovery.FakeDiscovery)
 	if !ok {
@@ -36,11 +41,76 @@ func TestFakingServerVersion(t *testing.T) {
 		GitCommit: testGitCommit,
 	}
 
-	sv, err := client.Discovery().ServerVersion()
+	sv, err := client.Discovery().(*fakediscovery.FakeDiscovery).ServerVersionWithContext(tCtx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if sv.GitCommit != testGitCommit {
 		t.Fatalf("unexpected faked discovery return value: %q", sv.GitCommit)
+	}
+}
+
+func TestFakingServerVersionWithError(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	expectedError := errors.New("an error occurred")
+	fakeClient := fakeclientset.NewSimpleClientset()
+	fakeClient.Discovery().(*fakediscovery.FakeDiscovery).PrependReactor("*", "*", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, expectedError
+	})
+
+	_, err := fakeClient.Discovery().(*fakediscovery.FakeDiscovery).ServerVersionWithContext(tCtx)
+	if err == nil {
+		t.Fatal("ServerVersion should return error, returned nil instead")
+	}
+	if err != expectedError {
+		t.Fatal("ServerVersion should return expected error, returned different error instead")
+	}
+}
+
+func TestFakingServerResourcesForGroupVersionWithError(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	expectedError := errors.New("an error occurred")
+	fakeClient := fakeclientset.NewClientset()
+	fakeClient.Discovery().(*fakediscovery.FakeDiscovery).PrependReactor("*", "*", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, expectedError
+	})
+
+	result, err := fakeClient.Discovery().(*fakediscovery.FakeDiscovery).ServerResourcesForGroupVersionWithContext(tCtx, "dummy.group.io/v1beta2")
+	if result != nil {
+		t.Errorf(`expect result to be nil but got "%v" instead`, result)
+	}
+	if !errors.Is(err, expectedError) {
+		t.Errorf(`expect error to be "%v" but got "%v" instead`, expectedError, err)
+	}
+}
+
+func TestFakingServerGroupsWithError(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	expectedError := errors.New("an error occurred")
+	fakeClient := fakeclientset.NewClientset()
+	fakeClient.Discovery().(*fakediscovery.FakeDiscovery).PrependReactor("*", "*", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, expectedError
+	})
+
+	result, err := fakeClient.Discovery().(*fakediscovery.FakeDiscovery).ServerGroupsWithContext(tCtx)
+	if result != nil {
+		t.Errorf(`expect result to be nil but got "%v" instead`, result)
+	}
+	if !errors.Is(err, expectedError) {
+		t.Errorf(`expect error to be "%v" but got "%v" instead`, expectedError, err)
+	}
+}
+
+func TestFakingServerGroupsAndResourcesWithError(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	expectedError := errors.New("an error occurred")
+	fakeClient := fakeclientset.NewClientset()
+	fakeClient.Discovery().(*fakediscovery.FakeDiscovery).PrependReactor("get", "resource", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, expectedError
+	})
+
+	_, _, err := fakeClient.Discovery().(*fakediscovery.FakeDiscovery).ServerGroupsAndResourcesWithContext(tCtx)
+	if !errors.Is(err, expectedError) {
+		t.Errorf(`expect error to be "%v" but got "%v" instead`, expectedError, err)
 	}
 }

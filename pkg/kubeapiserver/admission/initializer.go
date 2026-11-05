@@ -17,100 +17,71 @@ limitations under the License.
 package admission
 
 import (
-	"k8s.io/apimachinery/pkg/api/meta"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apiserver/pkg/admission"
-	webhookconfig "k8s.io/apiserver/pkg/admission/plugin/webhook/config"
-	"k8s.io/apiserver/pkg/authorization/authorizer"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
-	"k8s.io/kubernetes/pkg/quota"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	policyloader "k8s.io/kubernetes/pkg/admission/plugin/policy/manifest/loader"
+	webhookloader "k8s.io/kubernetes/pkg/admission/plugin/webhook/manifest/loader"
 )
 
 // TODO add a `WantsToRun` which takes a stopCh.  Might make it generic.
 
-// WantsInternalKubeClientSet defines a function which sets ClientSet for admission plugins that need it
-type WantsInternalKubeClientSet interface {
-	SetInternalKubeClientSet(internalclientset.Interface)
-	admission.InitializationValidator
-}
-
-// WantsInternalKubeInformerFactory defines a function which sets InformerFactory for admission plugins that need it
-type WantsInternalKubeInformerFactory interface {
-	SetInternalKubeInformerFactory(informers.SharedInformerFactory)
-	admission.InitializationValidator
-}
-
-// WantsCloudConfig defines a function which sets CloudConfig for admission plugins that need it.
-type WantsCloudConfig interface {
-	SetCloudConfig([]byte)
-}
-
-// WantsRESTMapper defines a function which sets RESTMapper for admission plugins that need it.
-type WantsRESTMapper interface {
-	SetRESTMapper(meta.RESTMapper)
-}
-
-// WantsQuotaConfiguration defines a function which sets quota configuration for admission plugins that need it.
-type WantsQuotaConfiguration interface {
-	SetQuotaConfiguration(quota.Configuration)
-	admission.InitializationValidator
-}
-
 // PluginInitializer is used for initialization of the Kubernetes specific admission plugins.
 type PluginInitializer struct {
-	internalClient                    internalclientset.Interface
-	externalClient                    clientset.Interface
-	informers                         informers.SharedInformerFactory
-	authorizer                        authorizer.Authorizer
-	cloudConfig                       []byte
-	restMapper                        meta.RESTMapper
-	quotaConfiguration                quota.Configuration
-	serviceResolver                   webhookconfig.ServiceResolver
-	authenticationInfoResolverWrapper webhookconfig.AuthenticationInfoResolverWrapper
+	loaders *initializer.ManifestLoaders
 }
 
 var _ admission.PluginInitializer = &PluginInitializer{}
 
 // NewPluginInitializer constructs new instance of PluginInitializer
-// TODO: switch these parameters to use the builder pattern or just make them
-// all public, this construction method is pointless boilerplate.
-func NewPluginInitializer(
-	internalClient internalclientset.Interface,
-	sharedInformers informers.SharedInformerFactory,
-	cloudConfig []byte,
-	restMapper meta.RESTMapper,
-	quotaConfiguration quota.Configuration,
-) *PluginInitializer {
+func NewPluginInitializer() *PluginInitializer {
 	return &PluginInitializer{
-		internalClient:     internalClient,
-		informers:          sharedInformers,
-		cloudConfig:        cloudConfig,
-		restMapper:         restMapper,
-		quotaConfiguration: quotaConfiguration,
+		loaders: newManifestLoaders(),
 	}
 }
 
 // Initialize checks the initialization interfaces implemented by each plugin
 // and provide the appropriate initialization data
 func (i *PluginInitializer) Initialize(plugin admission.Interface) {
-	if wants, ok := plugin.(WantsInternalKubeClientSet); ok {
-		wants.SetInternalKubeClientSet(i.internalClient)
+	if wants, ok := plugin.(initializer.WantsManifestLoaders); ok {
+		wants.SetManifestLoaders(i.loaders)
 	}
+}
 
-	if wants, ok := plugin.(WantsInternalKubeInformerFactory); ok {
-		wants.SetInternalKubeInformerFactory(i.informers)
+func newManifestLoaders() *initializer.ManifestLoaders {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ManifestBasedAdmissionControlConfig) {
+		return &initializer.ManifestLoaders{}
 	}
-
-	if wants, ok := plugin.(WantsCloudConfig); ok {
-		wants.SetCloudConfig(i.cloudConfig)
-	}
-
-	if wants, ok := plugin.(WantsRESTMapper); ok {
-		wants.SetRESTMapper(i.restMapper)
-	}
-
-	if wants, ok := plugin.(WantsQuotaConfiguration); ok {
-		wants.SetQuotaConfiguration(i.quotaConfiguration)
+	return &initializer.ManifestLoaders{
+		LoadValidatingWebhookManifests: func(dir string) ([]*admissionregistrationv1.ValidatingWebhookConfiguration, string, error) {
+			result, err := webhookloader.LoadValidatingManifests(dir)
+			if err != nil {
+				return nil, "", err
+			}
+			return result.Configurations, result.Hash, nil
+		},
+		LoadMutatingWebhookManifests: func(dir string) ([]*admissionregistrationv1.MutatingWebhookConfiguration, string, error) {
+			result, err := webhookloader.LoadMutatingManifests(dir)
+			if err != nil {
+				return nil, "", err
+			}
+			return result.Configurations, result.Hash, nil
+		},
+		LoadValidatingPolicyManifests: func(dir string) ([]*admissionregistrationv1.ValidatingAdmissionPolicy, []*admissionregistrationv1.ValidatingAdmissionPolicyBinding, string, error) {
+			manifests, err := policyloader.LoadValidatingManifestsFromDirectory(dir)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			return manifests.Policies, manifests.Bindings, manifests.Hash, nil
+		},
+		LoadMutatingPolicyManifests: func(dir string) ([]*admissionregistrationv1.MutatingAdmissionPolicy, []*admissionregistrationv1.MutatingAdmissionPolicyBinding, string, error) {
+			manifests, err := policyloader.LoadMutatingManifestsFromDirectory(dir)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			return manifests.Policies, manifests.Bindings, manifests.Hash, nil
+		},
 	}
 }

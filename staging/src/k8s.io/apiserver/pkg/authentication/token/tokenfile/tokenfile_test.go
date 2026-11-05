@@ -17,7 +17,7 @@ limitations under the License.
 package tokenfile
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"reflect"
 	"testing"
@@ -85,13 +85,13 @@ token7,user7,uid7,"group1,group2",otherdata
 		},
 	}
 	for i, testCase := range testCases {
-		user, ok, err := auth.AuthenticateToken(testCase.Token)
+		resp, ok, err := auth.AuthenticateToken(context.Background(), testCase.Token)
 		if testCase.User == nil {
-			if user != nil {
-				t.Errorf("%d: unexpected non-nil user %#v", i, user)
+			if resp != nil {
+				t.Errorf("%d: unexpected non-nil user %#v", i, resp.User)
 			}
-		} else if !reflect.DeepEqual(testCase.User, user) {
-			t.Errorf("%d: expected user %#v, got %#v", i, testCase.User, user)
+		} else if !reflect.DeepEqual(testCase.User, resp.User) {
+			t.Errorf("%d: expected user %#v, got %#v", i, testCase.User, resp.User)
 		}
 
 		if testCase.Ok != ok {
@@ -136,14 +136,14 @@ func TestEmptyTokenTokenFile(t *testing.T) {
 }
 
 func newWithContents(t *testing.T, contents string) (auth *TokenAuthenticator, err error) {
-	f, err := ioutil.TempFile("", "tokenfile_test")
+	f, err := os.CreateTemp("", "tokenfile_test")
 	if err != nil {
 		t.Fatalf("unexpected error creating tokenfile: %v", err)
 	}
 	f.Close()
 	defer os.Remove(f.Name())
 
-	if err := ioutil.WriteFile(f.Name(), []byte(contents), 0700); err != nil {
+	if err := os.WriteFile(f.Name(), []byte(contents), 0700); err != nil {
 		t.Fatalf("unexpected error writing tokenfile: %v", err)
 	}
 

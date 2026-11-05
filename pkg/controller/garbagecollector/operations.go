@@ -17,105 +17,102 @@ limitations under the License.
 package garbagecollector
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-
-	"github.com/golang/glog"
+	"reflect"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
 )
+
+// cluster scoped resources don't have namespaces.  Default to the item's namespace, but clear it for cluster scoped resources
+func resourceDefaultNamespace(namespaced bool, defaultNamespace string) string {
+	if namespaced {
+		return defaultNamespace
+	}
+	return ""
+}
 
 // apiResource consults the REST mapper to translate an <apiVersion, kind,
 // namespace> tuple to a unversioned.APIResource struct.
-func (gc *GarbageCollector) apiResource(apiVersion, kind string) (*metav1.APIResource, error) {
+func (gc *GarbageCollector) apiResource(apiVersion, kind string) (schema.GroupVersionResource, bool, error) {
 	fqKind := schema.FromAPIVersionAndKind(apiVersion, kind)
 	mapping, err := gc.restMapper.RESTMapping(fqKind.GroupKind(), fqKind.Version)
 	if err != nil {
-		return nil, newRESTMappingError(kind, apiVersion)
+		return schema.GroupVersionResource{}, false, newRESTMappingError(kind, apiVersion)
 	}
-	glog.V(5).Infof("map kind %s, version %s to resource %s", kind, apiVersion, mapping.Resource)
-	resource := metav1.APIResource{
-		Name:       mapping.Resource,
-		Namespaced: mapping.Scope == meta.RESTScopeNamespace,
-		Kind:       kind,
-	}
-	return &resource, nil
+	return mapping.Resource, mapping.Scope == meta.RESTScopeNamespace, nil
 }
 
-func (gc *GarbageCollector) deleteObject(item objectReference, policy *metav1.DeletionPropagation) error {
-	fqKind := schema.FromAPIVersionAndKind(item.APIVersion, item.Kind)
-	client, err := gc.clientPool.ClientForGroupVersionKind(fqKind)
-	if err != nil {
-		return err
-	}
-	resource, err := gc.apiResource(item.APIVersion, item.Kind)
+func (gc *GarbageCollector) deleteObject(item objectReference, resourceVersion string, ownersAtResourceVersion []metav1.OwnerReference, policy *metav1.DeletionPropagation) error {
+	resource, namespaced, err := gc.apiResource(item.APIVersion, item.Kind)
 	if err != nil {
 		return err
 	}
 	uid := item.UID
 	preconditions := metav1.Preconditions{UID: &uid}
+	if len(resourceVersion) > 0 {
+		preconditions.ResourceVersion = &resourceVersion
+	}
 	deleteOptions := metav1.DeleteOptions{Preconditions: &preconditions, PropagationPolicy: policy}
-	return client.Resource(resource, item.Namespace).Delete(item.Name, &deleteOptions)
+	resourceClient := gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace))
+	err = resourceClient.Delete(context.TODO(), item.Name, deleteOptions)
+	if errors.IsConflict(err) && len(resourceVersion) > 0 {
+		// check if the ownerReferences changed
+		liveObject, liveErr := resourceClient.Get(context.TODO(), item.Name, metav1.GetOptions{})
+		if errors.IsNotFound(liveErr) {
+			// object we wanted to delete is gone, return NotFound so caller can handle it consistently
+			return liveErr
+		}
+		if liveErr == nil && liveObject.UID == item.UID && liveObject.ResourceVersion != resourceVersion && reflect.DeepEqual(liveObject.OwnerReferences, ownersAtResourceVersion) {
+			// object changed, causing a conflict error, but ownerReferences did not change.
+			// retry delete without resourceVersion precondition so rapid updates unrelated to ownerReferences don't starve GC
+			return gc.deleteObject(item, "", nil, policy)
+		}
+	}
+	return err
 }
 
-func (gc *GarbageCollector) getObject(item objectReference) (*unstructured.Unstructured, error) {
-	fqKind := schema.FromAPIVersionAndKind(item.APIVersion, item.Kind)
-	client, err := gc.clientPool.ClientForGroupVersionKind(fqKind)
+func (gc *GarbageCollector) getObject(item objectReference) (*metav1.PartialObjectMetadata, error) {
+	resource, namespaced, err := gc.apiResource(item.APIVersion, item.Kind)
 	if err != nil {
 		return nil, err
 	}
-	resource, err := gc.apiResource(item.APIVersion, item.Kind)
-	if err != nil {
-		return nil, err
+	namespace := resourceDefaultNamespace(namespaced, item.Namespace)
+	if namespaced && len(namespace) == 0 {
+		// the type is namespaced, but we have no namespace coordinate.
+		// the only way this can happen is if a cluster-scoped object referenced this type as an owner.
+		return nil, namespacedOwnerOfClusterScopedObjectErr
 	}
-	return client.Resource(resource, item.Namespace).Get(item.Name, metav1.GetOptions{})
+	return gc.metadataClient.Resource(resource).Namespace(namespace).Get(context.TODO(), item.Name, metav1.GetOptions{})
 }
 
-func (gc *GarbageCollector) updateObject(item objectReference, obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
-	fqKind := schema.FromAPIVersionAndKind(item.APIVersion, item.Kind)
-	client, err := gc.clientPool.ClientForGroupVersionKind(fqKind)
+func (gc *GarbageCollector) patchObject(item objectReference, patch []byte, pt types.PatchType) (*metav1.PartialObjectMetadata, error) {
+	resource, namespaced, err := gc.apiResource(item.APIVersion, item.Kind)
 	if err != nil {
 		return nil, err
 	}
-	resource, err := gc.apiResource(item.APIVersion, item.Kind)
-	if err != nil {
-		return nil, err
-	}
-	return client.Resource(resource, item.Namespace).Update(obj)
+	return gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace)).Patch(context.TODO(), item.Name, pt, patch, metav1.PatchOptions{})
 }
 
-func (gc *GarbageCollector) patchObject(item objectReference, patch []byte) (*unstructured.Unstructured, error) {
-	fqKind := schema.FromAPIVersionAndKind(item.APIVersion, item.Kind)
-	client, err := gc.clientPool.ClientForGroupVersionKind(fqKind)
-	if err != nil {
-		return nil, err
-	}
-	resource, err := gc.apiResource(item.APIVersion, item.Kind)
-	if err != nil {
-		return nil, err
-	}
-	return client.Resource(resource, item.Namespace).Patch(item.Name, types.StrategicMergePatchType, patch)
-}
-
-// TODO: Using Patch when strategicmerge supports deleting an entry from a
-// slice of a base type.
-func (gc *GarbageCollector) removeFinalizer(owner *node, targetFinalizer string) error {
+func (gc *GarbageCollector) removeFinalizer(logger klog.Logger, owner *node, targetFinalizer string) error {
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		ownerObject, err := gc.getObject(owner.identity)
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("cannot finalize owner %s, because cannot get it: %v. The garbage collector will retry later.", owner.identity, err)
+			return fmt.Errorf("cannot finalize owner %s, because cannot get it: %v. The garbage collector will retry later", owner.identity, err)
 		}
 		accessor, err := meta.Accessor(ownerObject)
 		if err != nil {
-			return fmt.Errorf("cannot access the owner object %v: %v. The garbage collector will retry later.", ownerObject, err)
+			return fmt.Errorf("cannot access the owner object %v: %v. The garbage collector will retry later", ownerObject, err)
 		}
 		finalizers := accessor.GetFinalizers()
 		var newFinalizers []string
@@ -128,16 +125,25 @@ func (gc *GarbageCollector) removeFinalizer(owner *node, targetFinalizer string)
 			newFinalizers = append(newFinalizers, f)
 		}
 		if !found {
-			glog.V(5).Infof("the orphan finalizer is already removed from object %s", owner.identity)
+			logger.V(5).Info("finalizer already removed from object", "finalizer", targetFinalizer, "object", owner.identity)
 			return nil
 		}
+
 		// remove the owner from dependent's OwnerReferences
-		ownerObject.SetFinalizers(newFinalizers)
-		_, err = gc.updateObject(owner.identity, ownerObject)
+		patch, err := json.Marshal(&objectForFinalizersPatch{
+			ObjectMetaForFinalizersPatch: ObjectMetaForFinalizersPatch{
+				ResourceVersion: accessor.GetResourceVersion(),
+				Finalizers:      newFinalizers,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("unable to finalize %s due to an error serializing patch: %v", owner.identity, err)
+		}
+		_, err = gc.patchObject(owner.identity, patch, types.MergePatchType)
 		return err
 	})
 	if errors.IsConflict(err) {
-		return fmt.Errorf("updateMaxRetries(%d) has reached. The garbage collector will retry later for owner %v.", retry.DefaultBackoff.Steps, owner.identity)
+		return fmt.Errorf("updateMaxRetries(%d) has reached. The garbage collector will retry later for owner %v", retry.DefaultBackoff.Steps, owner.identity)
 	}
 	return err
 }

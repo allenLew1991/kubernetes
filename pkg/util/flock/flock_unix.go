@@ -1,4 +1,4 @@
-// +build linux darwin freebsd openbsd netbsd dragonfly
+//go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -23,7 +23,7 @@ import "golang.org/x/sys/unix"
 // Acquire acquires a lock on a file for the duration of the process. This method
 // is reentrant.
 func Acquire(path string) error {
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR, 0600)
+	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0600)
 	if err != nil {
 		return err
 	}

@@ -61,22 +61,23 @@ func Initialize(c Capabilities) {
 }
 
 // Setup the capability set.  It wraps Initialize for improving usability.
-func Setup(allowPrivileged bool, privilegedSources PrivilegedSources, perConnectionBytesPerSec int64) {
+func Setup(allowPrivileged bool, perConnectionBytesPerSec int64) {
 	Initialize(Capabilities{
 		AllowPrivileged:                        allowPrivileged,
-		PrivilegedSources:                      privilegedSources,
 		PerConnectionBandwidthLimitBytesPerSec: perConnectionBytesPerSec,
 	})
 }
 
-// SetForTests sets capabilities for tests.  Convenience method for testing.  This should only be called from tests.
-func SetForTests(c Capabilities) {
+// ResetForTest resets the capabilities to a given state for testing purposes.
+// This function should only be called from tests.
+func ResetForTest() {
 	capInstance.lock.Lock()
 	defer capInstance.lock.Unlock()
-	capInstance.capabilities = &c
+	capInstance.capabilities = nil
+	capInstance.once = sync.Once{}
 }
 
-// Returns a read-only copy of the system capabilities.
+// Get returns a read-only copy of the system capabilities.
 func Get() Capabilities {
 	capInstance.lock.Lock()
 	defer capInstance.lock.Unlock()

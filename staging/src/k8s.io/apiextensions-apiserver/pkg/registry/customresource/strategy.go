@@ -17,82 +17,355 @@ limitations under the License.
 package customresource
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
-	"github.com/go-openapi/validate"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 
+	v1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/model"
+	structurallisttype "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/listtype"
+	schemaobjectmeta "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/objectmeta"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/storage"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
+	"k8s.io/apiserver/pkg/cel/common"
+	"k8s.io/apiserver/pkg/registry/generic"
+	apiserverstorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-
-	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
+	"k8s.io/client-go/util/jsonpath"
 )
 
-type customResourceDefinitionStorageStrategy struct {
+// customResourceStrategy implements behavior for CustomResources for a single
+// version
+type customResourceStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
 
-	namespaceScoped bool
-	validator       customResourceValidator
+	namespaceScoped    bool
+	validator          customResourceValidator
+	structuralSchema   *structuralschema.Structural
+	celValidator       *cel.Validator
+	status             *apiextensions.CustomResourceSubresourceStatus
+	scale              *apiextensions.CustomResourceSubresourceScale
+	kind               schema.GroupVersionKind
+	selectableFieldSet []selectableField
 }
 
-func NewStrategy(typer runtime.ObjectTyper, namespaceScoped bool, kind schema.GroupVersionKind, validator *validate.SchemaValidator) customResourceDefinitionStorageStrategy {
-	return customResourceDefinitionStorageStrategy{
+type selectableField struct {
+	name      string
+	fieldPath *jsonpath.JSONPath
+	err       error
+}
+
+func NewStrategy(typer runtime.ObjectTyper, namespaceScoped bool, kind schema.GroupVersionKind, schemaValidator, statusSchemaValidator validation.SchemaValidator, structuralSchema *structuralschema.Structural, status *apiextensions.CustomResourceSubresourceStatus, scale *apiextensions.CustomResourceSubresourceScale, selectableFields []v1.SelectableField) customResourceStrategy {
+	var celValidator *cel.Validator
+	celValidator = cel.NewValidator(structuralSchema, true, celconfig.PerCallLimit) // CEL programs are compiled and cached here
+
+	strategy := customResourceStrategy{
 		ObjectTyper:     typer,
 		NameGenerator:   names.SimpleNameGenerator,
 		namespaceScoped: namespaceScoped,
+		status:          status,
+		scale:           scale,
 		validator: customResourceValidator{
-			namespaceScoped: namespaceScoped,
-			kind:            kind,
-			validator:       validator,
+			namespaceScoped:       namespaceScoped,
+			kind:                  kind,
+			schemaValidator:       schemaValidator,
+			statusSchemaValidator: statusSchemaValidator,
 		},
+		structuralSchema: structuralSchema,
+		celValidator:     celValidator,
+		kind:             kind,
 	}
+	strategy.selectableFieldSet = prepareSelectableFields(selectableFields)
+	return strategy
 }
 
-func (a customResourceDefinitionStorageStrategy) NamespaceScoped() bool {
+func prepareSelectableFields(selectableFields []v1.SelectableField) []selectableField {
+	result := make([]selectableField, len(selectableFields))
+	for i, sf := range selectableFields {
+		name := strings.TrimPrefix(sf.JSONPath, ".")
+
+		parser := jsonpath.New("selectableField")
+		parser.AllowMissingKeys(true)
+		err := parser.Parse("{" + sf.JSONPath + "}")
+		if err == nil {
+			result[i] = selectableField{
+				name:      name,
+				fieldPath: parser,
+			}
+		} else {
+			result[i] = selectableField{
+				name: name,
+				err:  err,
+			}
+		}
+	}
+
+	return result
+}
+
+func (a customResourceStrategy) NamespaceScoped() bool {
 	return a.namespaceScoped
 }
 
-func (customResourceDefinitionStorageStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (a customResourceStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{}
+
+	if a.status != nil {
+		fields[fieldpath.APIVersion(a.kind.GroupVersion().String())] = fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		)
+	}
+
+	return fields
 }
 
-func (customResourceDefinitionStorageStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+// PrepareForCreate clears the status of a CustomResource before creation.
+func (a customResourceStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	if a.status != nil {
+		customResourceObject := obj.(*unstructured.Unstructured)
+		customResource := customResourceObject.UnstructuredContent()
+
+		// create cannot set status
+		delete(customResource, "status")
+	}
+
+	accessor, _ := meta.Accessor(obj)
+	accessor.SetGeneration(1)
 }
 
-func (a customResourceDefinitionStorageStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
-	return a.validator.Validate(ctx, obj)
+// PrepareForUpdate clears fields that are not allowed to be set by end users on update.
+func (a customResourceStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newCustomResourceObject := obj.(*unstructured.Unstructured)
+	oldCustomResourceObject := old.(*unstructured.Unstructured)
+
+	newCustomResource := newCustomResourceObject.UnstructuredContent()
+	oldCustomResource := oldCustomResourceObject.UnstructuredContent()
+
+	// If the /status subresource endpoint is installed, update is not allowed to set status.
+	if a.status != nil {
+		_, ok1 := newCustomResource["status"]
+		_, ok2 := oldCustomResource["status"]
+		switch {
+		case ok2:
+			newCustomResource["status"] = oldCustomResource["status"]
+		case ok1:
+			delete(newCustomResource, "status")
+		}
+	}
+
+	// except for the changes to `metadata`, any other changes
+	// cause the generation to increment.
+	newCopyContent := copyNonMetadata(newCustomResource)
+	oldCopyContent := copyNonMetadata(oldCustomResource)
+	if !apiequality.Semantic.DeepEqual(newCopyContent, oldCopyContent) {
+		oldAccessor, _ := meta.Accessor(oldCustomResourceObject)
+		newAccessor, _ := meta.Accessor(newCustomResourceObject)
+		newAccessor.SetGeneration(oldAccessor.GetGeneration() + 1)
+	}
 }
 
-func (customResourceDefinitionStorageStrategy) AllowCreateOnUpdate() bool {
+func copyNonMetadata(original map[string]interface{}) map[string]interface{} {
+	ret := make(map[string]interface{})
+	for key, val := range original {
+		if key == "metadata" {
+			continue
+		}
+		ret[key] = val
+	}
+	return ret
+}
+
+// Validate validates a new CustomResource.
+func (a customResourceStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return field.ErrorList{field.Invalid(field.NewPath(""), u, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", obj))}
+	}
+
+	var errs field.ErrorList
+	errs = append(errs, a.validator.Validate(ctx, u, a.scale)...)
+
+	// validate embedded resources
+	errs = append(errs, schemaobjectmeta.Validate(ctx, nil, u.Object, a.structuralSchema, false)...)
+
+	// validate x-kubernetes-list-type "map" and "set" invariant
+	errs = append(errs, structurallisttype.ValidateListSetsAndMaps(nil, a.structuralSchema, u.Object)...)
+
+	// validate x-kubernetes-validations rules
+	if celValidator := a.celValidator; celValidator != nil {
+		if has, err := hasBlockingErr(errs); has {
+			errs = append(errs, err)
+		} else {
+			err, _ := celValidator.Validate(ctx, nil, a.structuralSchema, u.Object, nil, celconfig.RuntimeCELCostBudget)
+			errs = append(errs, err...)
+		}
+	}
+
+	return errs
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (a customResourceStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return generateWarningsFromObj(obj, nil)
+}
+
+func generateWarningsFromObj(obj, old runtime.Object) []string {
+	var allWarnings []string
+	fldPath := field.NewPath("metadata", "finalizers")
+	newObjAccessor, err := meta.Accessor(obj)
+	if err != nil {
+		return allWarnings
+	}
+
+	newAdded := sets.NewString(newObjAccessor.GetFinalizers()...)
+	if old != nil {
+		oldObjAccessor, err := meta.Accessor(old)
+		if err != nil {
+			return allWarnings
+		}
+		newAdded = newAdded.Difference(sets.NewString(oldObjAccessor.GetFinalizers()...))
+	}
+
+	for _, finalizer := range newAdded.List() {
+		allWarnings = append(allWarnings, validateKubeFinalizerName(finalizer, fldPath)...)
+	}
+
+	return allWarnings
+}
+
+// Canonicalize normalizes the object after validation.
+func (customResourceStrategy) Canonicalize(obj runtime.Object) {
+}
+
+// AllowCreateOnUpdate is false for CustomResources; this means a POST is
+// needed to create one.
+func (customResourceStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (customResourceDefinitionStorageStrategy) AllowUnconditionalUpdate() bool {
+// AllowUnconditionalUpdate is the default update policy for CustomResource objects.
+func (customResourceStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (customResourceDefinitionStorageStrategy) Canonicalize(obj runtime.Object) {
+// ValidateUpdate is the default update validation for an end user updating status.
+func (a customResourceStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	uNew, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return field.ErrorList{field.Invalid(field.NewPath(""), obj, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", obj))}
+	}
+	uOld, ok := old.(*unstructured.Unstructured)
+	if !ok {
+		return field.ErrorList{field.Invalid(field.NewPath(""), old, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", old))}
+	}
+
+	var options []validation.ValidationOption
+	var celOptions []cel.Option
+	correlatedObject := common.NewCorrelatedObject(uNew.Object, uOld.Object, &model.Structural{Structural: a.structuralSchema})
+	options = append(options, validation.WithRatcheting(correlatedObject))
+	celOptions = append(celOptions, cel.WithRatcheting(correlatedObject))
+
+	var errs field.ErrorList
+	errs = append(errs, a.validator.ValidateUpdate(ctx, uNew, uOld, a.scale, options...)...)
+
+	// Checks the embedded objects. We don't make a difference between update and create for those.
+	errs = append(errs, schemaobjectmeta.Validate(ctx, nil, uNew.Object, a.structuralSchema, false)...)
+
+	// ratcheting validation of x-kubernetes-list-type value map and set
+	if oldErrs := structurallisttype.ValidateListSetsAndMaps(nil, a.structuralSchema, uOld.Object); len(oldErrs) == 0 {
+		errs = append(errs, structurallisttype.ValidateListSetsAndMaps(nil, a.structuralSchema, uNew.Object)...)
+	}
+
+	// validate x-kubernetes-validations rules
+	if celValidator := a.celValidator; celValidator != nil {
+		if has, err := hasBlockingErr(errs); has {
+			errs = append(errs, err)
+		} else {
+			err, _ := celValidator.Validate(ctx, nil, a.structuralSchema, uNew.Object, uOld.Object, celconfig.RuntimeCELCostBudget, celOptions...)
+			errs = append(errs, err...)
+		}
+	}
+
+	// No-op if not attached to context
+	validation.Metrics.ObserveRatchetingTime(*correlatedObject.Duration)
+	return errs
 }
 
-func (a customResourceDefinitionStorageStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	return a.validator.ValidateUpdate(ctx, obj, old)
+// WarningsOnUpdate returns warnings for the given update.
+func (a customResourceStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return generateWarningsFromObj(obj, old)
 }
 
-func (a customResourceDefinitionStorageStrategy) GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+// GetAttrs returns labels and fields of a given object for filtering purposes.
+func (a customResourceStrategy) GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, err
 	}
-	return labels.Set(accessor.GetLabels()), objectMetaFieldsSet(accessor, a.namespaceScoped), accessor.GetInitializers() != nil, nil
+	sFields, err := a.selectableFields(obj, accessor)
+	if err != nil {
+		return nil, nil, err
+	}
+	return accessor.GetLabels(), sFields, nil
+}
+
+// selectableFields returns a field set that can be used for filter selection.
+// This includes metadata.name, metadata.namespace and all custom selectable fields.
+func (a customResourceStrategy) selectableFields(obj runtime.Object, objectMeta metav1.Object) (fields.Set, error) {
+	objectMetaFields := objectMetaFieldsSet(objectMeta, a.namespaceScoped)
+	var selectableFieldsSet fields.Set
+
+	if len(a.selectableFieldSet) > 0 {
+		us, ok := obj.(runtime.Unstructured)
+		if !ok {
+			return nil, fmt.Errorf("unexpected error casting a custom resource to unstructured")
+		}
+		uc := us.UnstructuredContent()
+
+		selectableFieldsSet = fields.Set{}
+		for _, sf := range a.selectableFieldSet {
+			if sf.err != nil {
+				return nil, fmt.Errorf("unexpected error parsing jsonPath: %w", sf.err)
+			}
+			results, err := sf.fieldPath.FindResults(uc)
+			if err != nil {
+				return nil, fmt.Errorf("unexpected error finding value with jsonPath: %w", err)
+			}
+			var value any
+
+			if len(results) > 0 && len(results[0]) > 0 {
+				if len(results) > 1 || len(results[0]) > 1 {
+					return nil, fmt.Errorf("unexpectedly received more than one JSON path result")
+				}
+				value = results[0][0].Interface()
+			}
+
+			if value != nil {
+				selectableFieldsSet[sf.name] = fmt.Sprint(value)
+			} else {
+				selectableFieldsSet[sf.name] = ""
+			}
+		}
+	}
+	return generic.MergeFieldsSets(objectMetaFields, selectableFieldsSet), nil
 }
 
 // objectMetaFieldsSet returns a fields that represent the ObjectMeta.
@@ -108,80 +381,23 @@ func objectMetaFieldsSet(objectMeta metav1.Object, namespaceScoped bool) fields.
 	}
 }
 
-func (a customResourceDefinitionStorageStrategy) MatchCustomResourceDefinitionStorage(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
-	return storage.SelectionPredicate{
+// MatchCustomResourceDefinitionStorage is the filter used by the generic etcd backend to route
+// watch events from etcd to clients of the apiserver only interested in specific
+// labels/fields.
+func (a customResourceStrategy) MatchCustomResourceDefinitionStorage(label labels.Selector, field fields.Selector) apiserverstorage.SelectionPredicate {
+	return apiserverstorage.SelectionPredicate{
 		Label:    label,
 		Field:    field,
 		GetAttrs: a.GetAttrs,
 	}
 }
 
-type customResourceValidator struct {
-	namespaceScoped bool
-	kind            schema.GroupVersionKind
-	validator       *validate.SchemaValidator
-}
-
-func (a customResourceValidator) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
+// OpenAPIv3 type/maxLength/maxItems/MaxProperties/required/enum violation/wrong type field validation failures are viewed as blocking err for CEL validation
+func hasBlockingErr(errs field.ErrorList) (bool, *field.Error) {
+	for _, err := range errs {
+		if err.Type == field.ErrorTypeNotSupported || err.Type == field.ErrorTypeRequired || err.Type == field.ErrorTypeTooLong || err.Type == field.ErrorTypeTooMany || err.Type == field.ErrorTypeTypeInvalid {
+			return true, field.Invalid(nil, nil, "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation")
+		}
 	}
-	typeAccessor, err := meta.TypeAccessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("kind"), nil, err.Error())}
-	}
-	if typeAccessor.GetKind() != a.kind.Kind {
-		return field.ErrorList{field.Invalid(field.NewPath("kind"), typeAccessor.GetKind(), fmt.Sprintf("must be %v", a.kind.Kind))}
-	}
-	if typeAccessor.GetAPIVersion() != a.kind.Group+"/"+a.kind.Version {
-		return field.ErrorList{field.Invalid(field.NewPath("apiVersion"), typeAccessor.GetAPIVersion(), fmt.Sprintf("must be %v", a.kind.Group+"/"+a.kind.Version))}
-	}
-
-	customResourceObject, ok := obj.(*unstructured.Unstructured)
-	// this will never happen.
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), customResourceObject, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", customResourceObject))}
-	}
-
-	customResource := customResourceObject.UnstructuredContent()
-	if err = apiservervalidation.ValidateCustomResource(customResource, a.validator); err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath(""), customResource, err.Error())}
-	}
-
-	return validation.ValidateObjectMetaAccessor(accessor, a.namespaceScoped, validation.NameIsDNSSubdomain, field.NewPath("metadata"))
-}
-
-func (a customResourceValidator) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	objAccessor, err := meta.Accessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-	oldAccessor, err := meta.Accessor(old)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-	typeAccessor, err := meta.TypeAccessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("kind"), nil, err.Error())}
-	}
-	if typeAccessor.GetKind() != a.kind.Kind {
-		return field.ErrorList{field.Invalid(field.NewPath("kind"), typeAccessor.GetKind(), fmt.Sprintf("must be %v", a.kind.Kind))}
-	}
-	if typeAccessor.GetAPIVersion() != a.kind.Group+"/"+a.kind.Version {
-		return field.ErrorList{field.Invalid(field.NewPath("apiVersion"), typeAccessor.GetAPIVersion(), fmt.Sprintf("must be %v", a.kind.Group+"/"+a.kind.Version))}
-	}
-
-	customResourceObject, ok := obj.(*unstructured.Unstructured)
-	// this will never happen.
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), customResourceObject, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", customResourceObject))}
-	}
-
-	customResource := customResourceObject.UnstructuredContent()
-	if err = apiservervalidation.ValidateCustomResource(customResource, a.validator); err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath(""), customResource, err.Error())}
-	}
-
-	return validation.ValidateObjectMetaAccessorUpdate(objAccessor, oldAccessor, field.NewPath("metadata"))
+	return false, nil
 }

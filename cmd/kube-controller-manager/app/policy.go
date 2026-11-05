@@ -17,35 +17,50 @@ limitations under the License.
 // Package app implements a server that runs a set of active
 // components.  This includes replication controllers, service endpoints and
 // nodes.
-//
 package app
 
 import (
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"context"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/scale"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/disruption"
-
-	"github.com/golang/glog"
 )
 
-func startDisruptionController(ctx ControllerContext) (bool, error) {
-	var group = "policy"
-	var version = "v1beta1"
-	var resource = "poddisruptionbudgets"
-
-	if !ctx.AvailableResources[schema.GroupVersionResource{Group: group, Version: version, Resource: resource}] {
-		glog.Infof(
-			"Refusing to start disruption because resource %q in group %q is not available.",
-			resource, group+"/"+version)
-		return false, nil
+func newDisruptionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.DisruptionController,
+		aliases:     []string{"disruption"},
+		constructor: newDisruptionController,
 	}
-	go disruption.NewDisruptionController(
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.InformerFactory.Policy().V1beta1().PodDisruptionBudgets(),
-		ctx.InformerFactory.Core().V1().ReplicationControllers(),
-		ctx.InformerFactory.Extensions().V1beta1().ReplicaSets(),
-		ctx.InformerFactory.Extensions().V1beta1().Deployments(),
-		ctx.InformerFactory.Apps().V1beta1().StatefulSets(),
-		ctx.ClientBuilder.ClientOrDie("disruption-controller"),
-	).Run(ctx.Stop)
-	return true, nil
+}
+
+func newDisruptionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("disruption-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(client.Discovery())
+	scaleClient, err := controllerContext.ClientBuilder.ScaleClient("disruption-controller", controllerContext.RESTMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+	if err != nil {
+		return nil, err
+	}
+
+	dc := disruption.NewDisruptionController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Policy().V1().PodDisruptionBudgets(),
+		controllerContext.InformerFactory.Core().V1().ReplicationControllers(),
+		controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
+		controllerContext.InformerFactory.Apps().V1().Deployments(),
+		controllerContext.InformerFactory.Apps().V1().StatefulSets(),
+		client,
+		controllerContext.RESTMapper,
+		scaleClient,
+		client.Discovery(),
+	)
+	return newControllerLoop(func(ctx context.Context) {
+		dc.Run(ctx, int(controllerContext.ComponentConfig.DisruptionController.ConcurrentDisruptionSyncs))
+	}, controllerName), nil
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package filters
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -28,12 +29,13 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	apifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	fcmetrics "k8s.io/apiserver/pkg/util/flowcontrol/metrics"
 )
 
-func createMaxInflightServer(callsWg, blockWg *sync.WaitGroup, disableCallsWg *bool, disableCallsWgMutex *sync.Mutex, nonMutating, mutating int) *httptest.Server {
+func createMaxInflightServer(t *testing.T, callsWg, blockWg *sync.WaitGroup, disableCallsWg *bool, disableCallsWgMutex *sync.Mutex, nonMutating, mutating int) *httptest.Server {
+	fcmetrics.Register()
 	longRunningRequestCheck := BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString("proxy"))
 
-	requestContextMapper := apirequest.NewRequestContextMapper()
 	requestInfoFactory := &apirequest.RequestInfoFactory{APIPrefixes: sets.NewString("apis", "api"), GrouplessAPIPrefixes: sets.NewString("api")}
 	handler := WithMaxInFlightLimit(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,30 +49,24 @@ func createMaxInflightServer(callsWg, blockWg *sync.WaitGroup, disableCallsWg *b
 			if waitForCalls {
 				callsWg.Done()
 			}
+			t.Logf("About to blockWg.Wait(), requestURI=%v, remoteAddr=%v", r.RequestURI, r.RemoteAddr)
 			blockWg.Wait()
+			t.Logf("Returned from blockWg.Wait(), requestURI=%v, remoteAddr=%v", r.RequestURI, r.RemoteAddr)
 		}),
 		nonMutating,
 		mutating,
-		requestContextMapper,
 		longRunningRequestCheck,
 	)
-	handler = withFakeUser(handler, requestContextMapper)
-	handler = apifilters.WithRequestInfo(handler, requestInfoFactory, requestContextMapper)
-	handler = apirequest.WithRequestContext(handler, requestContextMapper)
+	handler = withFakeUser(handler)
+	handler = apifilters.WithRequestInfo(handler, requestInfoFactory)
 
 	return httptest.NewServer(handler)
 }
 
-func withFakeUser(handler http.Handler, requestContextMapper apirequest.RequestContextMapper) http.Handler {
+func withFakeUser(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, ok := requestContextMapper.Get(r)
-		if !ok {
-			handleError(w, r, fmt.Errorf("no context found for request, handler chain must be wrong"))
-			return
-		}
-
 		if len(r.Header["Groups"]) > 0 {
-			requestContextMapper.Update(r, apirequest.WithUser(ctx, &user.DefaultInfo{
+			r = r.WithContext(apirequest.WithUser(r.Context(), &user.DefaultInfo{
 				Groups: r.Header["Groups"],
 			}))
 		}
@@ -79,13 +75,13 @@ func withFakeUser(handler http.Handler, requestContextMapper apirequest.RequestC
 }
 
 // Tests that MaxInFlightLimit works, i.e.
-// - "long" requests such as proxy or watch, identified by regexp are not accounted despite
-//   hanging for the long time,
-// - "short" requests are correctly accounted, i.e. there can be only size of channel passed to the
-//   constructor in flight at any given moment,
-// - subsequent "short" requests are rejected instantly with appropriate error,
-// - subsequent "long" requests are handled normally,
-// - we correctly recover after some "short" requests finish, i.e. we can process new ones.
+//   - "long" requests such as proxy or watch, identified by regexp are not accounted despite
+//     hanging for the long time,
+//   - "short" requests are correctly accounted, i.e. there can be only size of channel passed to the
+//     constructor in flight at any given moment,
+//   - subsequent "short" requests are rejected instantly with appropriate error,
+//   - subsequent "long" requests are handled normally,
+//   - we correctly recover after some "short" requests finish, i.e. we can process new ones.
 func TestMaxInFlightNonMutating(t *testing.T) {
 	const AllowedNonMutatingInflightRequestsNo = 3
 
@@ -109,8 +105,12 @@ func TestMaxInFlightNonMutating(t *testing.T) {
 	waitForCalls := true
 	waitForCallsMutex := sync.Mutex{}
 
-	server := createMaxInflightServer(calls, block, &waitForCalls, &waitForCallsMutex, AllowedNonMutatingInflightRequestsNo, 1)
+	server := createMaxInflightServer(t, calls, block, &waitForCalls, &waitForCallsMutex, AllowedNonMutatingInflightRequestsNo, 1)
 	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartMaxInFlightWatermarkMaintenance(ctx.Done())
 
 	// These should hang, but not affect accounting.  use a query param match
 	for i := 0; i < AllowedNonMutatingInflightRequestsNo; i++ {
@@ -189,8 +189,12 @@ func TestMaxInFlightMutating(t *testing.T) {
 	waitForCalls := true
 	waitForCallsMutex := sync.Mutex{}
 
-	server := createMaxInflightServer(calls, block, &waitForCalls, &waitForCallsMutex, 1, AllowedMutatingInflightRequestsNo)
+	server := createMaxInflightServer(t, calls, block, &waitForCalls, &waitForCallsMutex, 1, AllowedMutatingInflightRequestsNo)
 	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartMaxInFlightWatermarkMaintenance(ctx.Done())
 
 	// These should hang and be accounted, i.e. saturate the server
 	for i := 0; i < AllowedMutatingInflightRequestsNo; i++ {
@@ -281,8 +285,12 @@ func TestMaxInFlightSkipsMasters(t *testing.T) {
 	waitForCalls := true
 	waitForCallsMutex := sync.Mutex{}
 
-	server := createMaxInflightServer(calls, block, &waitForCalls, &waitForCallsMutex, 1, AllowedMutatingInflightRequestsNo)
+	server := createMaxInflightServer(t, calls, block, &waitForCalls, &waitForCallsMutex, 1, AllowedMutatingInflightRequestsNo)
 	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartMaxInFlightWatermarkMaintenance(ctx.Done())
 
 	// These should hang and be accounted, i.e. saturate the server
 	for i := 0; i < AllowedMutatingInflightRequestsNo; i++ {

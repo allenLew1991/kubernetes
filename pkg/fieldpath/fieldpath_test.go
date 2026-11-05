@@ -24,6 +24,30 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func BenchmarkFormatMap(b *testing.B) {
+	var s string
+	m := map[string]string{
+		"spec.pod.beta.kubernetes.io/statefulset-index": "1",
+		"Www.k8s.io/test":                                        "1",
+		"foo":                                                    "bar",
+		"flannel.alpha.coreos.com/backend-data":                  `{"VNI":1,"VtepMAC":"ce:f9:c7:a4:de:64"}`,
+		"flannel.alpha.coreos.com/backend-type":                  "vxlan",
+		"flannel.alpha.coreos.com/kube-subnet-manager":           "true",
+		"flannel.alpha.coreos.com/public-ip":                     "192.168.19.160",
+		"management.cattle.io/pod-limits":                        `{"cpu":"11400m","memory":"7965Mi"}`,
+		"management.cattle.io/pod-requests":                      `{"cpu":"2482m","memory":"7984Mi","pods":"26"}`,
+		"node.alpha.kubernetes.io/ttl":                           "0",
+		"volumes.kubernetes.io/controller-managed-attach-detach": "true",
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s = FormatMap(m)
+	}
+	// Avoid compiler optimizations
+	_ = s
+}
+
 func TestExtractFieldPathAsString(t *testing.T) {
 	cases := []struct {
 		name                    string
@@ -33,9 +57,10 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		expectedMessageFragment string
 	}{
 		{
-			name:      "not an API object",
-			fieldPath: "metadata.name",
-			obj:       "",
+			name:                    "not an API object",
+			fieldPath:               "metadata.name",
+			obj:                     "",
+			expectedMessageFragment: "object does not implement the Object interfaces",
 		},
 		{
 			name:      "ok - namespace",
@@ -108,6 +133,28 @@ func TestExtractFieldPathAsString(t *testing.T) {
 			expectedValue: "1",
 		},
 		{
+			name:      "ok - uid",
+			fieldPath: "metadata.uid",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: "b70b3269-858e-12a8-9cf2-1232a194038a",
+				},
+			},
+			expectedValue: "b70b3269-858e-12a8-9cf2-1232a194038a",
+		},
+		{
+			name:      "ok - label",
+			fieldPath: "metadata.labels['something']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"something": "label value",
+					},
+				},
+			},
+			expectedValue: "label value",
+		},
+		{
 			name:      "invalid expression",
 			fieldPath: "metadata.whoops",
 			obj: &v1.Pod{
@@ -136,6 +183,12 @@ func TestExtractFieldPathAsString(t *testing.T) {
 				},
 			},
 			expectedMessageFragment: "invalid key subscript in metadata.labels",
+		},
+		{
+			name:                    "invalid subscript",
+			fieldPath:               "metadata.notexisting['something']",
+			obj:                     &v1.Pod{},
+			expectedMessageFragment: "fieldPath \"metadata.notexisting['something']\" does not support subscript",
 		},
 	}
 
@@ -237,5 +290,74 @@ func TestSplitMaybeSubscriptedPath(t *testing.T) {
 			t.Errorf("SplitMaybeSubscriptedPath(%q) = (%q, %q, true), expect (%q, %q, true)",
 				tc.fieldPath, path, subscript, tc.expectedPath, tc.expectedSubscript)
 		}
+	}
+}
+
+// TestFormatMap
+func TestFormatMap(t *testing.T) {
+	type args struct {
+		m map[string]string
+	}
+	tests := []struct {
+		name       string
+		args       args
+		wantFmtStr string
+	}{
+		{
+			name: "nil",
+			args: args{
+				m: nil,
+			},
+			wantFmtStr: "",
+		},
+		{
+			name: "label",
+			args: args{
+				m: map[string]string{
+					"beta.kubernetes.io/os":                 "linux",
+					"kubernetes.io/arch":                    "amd64",
+					"kubernetes.io/hostname":                "master01",
+					"kubernetes.io/os":                      "linux",
+					"node-role.kubernetes.io/control-plane": "true",
+					"node-role.kubernetes.io/master":        "true",
+				},
+			},
+			wantFmtStr: `beta.kubernetes.io/os="linux"
+kubernetes.io/arch="amd64"
+kubernetes.io/hostname="master01"
+kubernetes.io/os="linux"
+node-role.kubernetes.io/control-plane="true"
+node-role.kubernetes.io/master="true"`,
+		},
+		{
+			name: "annotation",
+			args: args{
+				m: map[string]string{
+					"flannel.alpha.coreos.com/backend-data":                  `{"VNI":1,"VtepMAC":"ce:f9:c7:a4:de:64"}`,
+					"flannel.alpha.coreos.com/backend-type":                  "vxlan",
+					"flannel.alpha.coreos.com/kube-subnet-manager":           "true",
+					"flannel.alpha.coreos.com/public-ip":                     "192.168.19.160",
+					"management.cattle.io/pod-limits":                        `{"cpu":"11400m","memory":"7965Mi"}`,
+					"management.cattle.io/pod-requests":                      `{"cpu":"2482m","memory":"7984Mi","pods":"26"}`,
+					"node.alpha.kubernetes.io/ttl":                           "0",
+					"volumes.kubernetes.io/controller-managed-attach-detach": "true",
+				},
+			},
+			wantFmtStr: `flannel.alpha.coreos.com/backend-data="{\"VNI\":1,\"VtepMAC\":\"ce:f9:c7:a4:de:64\"}"
+flannel.alpha.coreos.com/backend-type="vxlan"
+flannel.alpha.coreos.com/kube-subnet-manager="true"
+flannel.alpha.coreos.com/public-ip="192.168.19.160"
+management.cattle.io/pod-limits="{\"cpu\":\"11400m\",\"memory\":\"7965Mi\"}"
+management.cattle.io/pod-requests="{\"cpu\":\"2482m\",\"memory\":\"7984Mi\",\"pods\":\"26\"}"
+node.alpha.kubernetes.io/ttl="0"
+volumes.kubernetes.io/controller-managed-attach-detach="true"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if gotFmtStr := FormatMap(tt.args.m); gotFmtStr != tt.wantFmtStr {
+				t.Errorf("FormatMap() = %v, want %v", gotFmtStr, tt.wantFmtStr)
+			}
+		})
 	}
 }

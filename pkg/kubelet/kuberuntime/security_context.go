@@ -17,27 +17,37 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/api/core/v1"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
-	"k8s.io/kubernetes/pkg/security/apparmor"
+	v1 "k8s.io/api/core/v1"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	runtimeutil "k8s.io/kubernetes/pkg/kubelet/kuberuntime/util"
 	"k8s.io/kubernetes/pkg/securitycontext"
 )
 
 // determineEffectiveSecurityContext gets container's security context from v1.Pod and v1.Container.
-func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container, uid *int64, username string) *runtimeapi.LinuxContainerSecurityContext {
+func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(ctx context.Context, pod *v1.Pod, container *v1.Container, uid *int64, username string) (*runtimeapi.LinuxContainerSecurityContext, error) {
 	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
 	synthesized := convertToRuntimeSecurityContext(effectiveSc)
 	if synthesized == nil {
-		synthesized = &runtimeapi.LinuxContainerSecurityContext{}
+		synthesized = &runtimeapi.LinuxContainerSecurityContext{
+			MaskedPaths:   securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount),
+			ReadonlyPaths: securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount),
+		}
+	}
+	var err error
+
+	synthesized.Seccomp, err = m.getSeccompProfile(pod.Annotations, container.Name, pod.Spec.SecurityContext, container.SecurityContext, m.seccompDefault)
+	if err != nil {
+		return nil, err
 	}
 
-	// set SeccompProfilePath.
-	synthesized.SeccompProfilePath = m.getSeccompProfileFromAnnotations(pod.Annotations, container.Name)
-
 	// set ApparmorProfile.
-	synthesized.ApparmorProfile = apparmor.GetProfileNameFromPodAnnotations(pod.Annotations, container.Name)
+	synthesized.Apparmor, synthesized.ApparmorProfile, err = getAppArmorProfile(pod, container)
+	if err != nil {
+		return nil, err
+	}
 
 	// set RunAsUser.
 	if synthesized.RunAsUser == nil {
@@ -48,11 +58,11 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	}
 
 	// set namespace options and supplemental groups.
-	synthesized.NamespaceOptions = &runtimeapi.NamespaceOption{
-		HostNetwork: pod.Spec.HostNetwork,
-		HostIpc:     pod.Spec.HostIPC,
-		HostPid:     pod.Spec.HostPID,
+	namespaceOptions, err := runtimeutil.NamespacesForPod(ctx, pod, m.runtimeHelper, m.runtimeClassManager)
+	if err != nil {
+		return nil, err
 	}
+	synthesized.NamespaceOptions = namespaceOptions
 	podSc := pod.Spec.SecurityContext
 	if podSc != nil {
 		if podSc.FSGroup != nil {
@@ -64,6 +74,14 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 				synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, int64(sg))
 			}
 		}
+
+		if podSc.SupplementalGroupsPolicy != nil {
+			policyValue, ok := runtimeapi.SupplementalGroupsPolicy_value[string(*podSc.SupplementalGroupsPolicy)]
+			if !ok {
+				return nil, fmt.Errorf("unsupported supplementalGroupsPolicy: %s", string(*podSc.SupplementalGroupsPolicy))
+			}
+			synthesized.SupplementalGroupsPolicy = runtimeapi.SupplementalGroupsPolicy(policyValue)
+		}
 	}
 	if groups := m.runtimeHelper.GetExtraSupplementalGroupsForPod(pod); len(groups) > 0 {
 		synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, groups...)
@@ -71,32 +89,10 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 
 	synthesized.NoNewPrivs = securitycontext.AddNoNewPrivileges(effectiveSc)
 
-	return synthesized
-}
+	synthesized.MaskedPaths = securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount)
+	synthesized.ReadonlyPaths = securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount)
 
-// verifyRunAsNonRoot verifies RunAsNonRoot.
-func verifyRunAsNonRoot(pod *v1.Pod, container *v1.Container, uid *int64, username string) error {
-	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
-	// If the option is not set, or if running as root is allowed, return nil.
-	if effectiveSc == nil || effectiveSc.RunAsNonRoot == nil || !*effectiveSc.RunAsNonRoot {
-		return nil
-	}
-
-	if effectiveSc.RunAsUser != nil {
-		if *effectiveSc.RunAsUser == 0 {
-			return fmt.Errorf("container's runAsUser breaks non-root policy")
-		}
-		return nil
-	}
-
-	switch {
-	case uid != nil && *uid == 0:
-		return fmt.Errorf("container has runAsNonRoot and image will run as root")
-	case uid == nil && len(username) > 0:
-		return fmt.Errorf("container has runAsNonRoot and image has non-numeric user (%s), cannot verify user is non-root", username)
-	default:
-		return nil
-	}
+	return synthesized, nil
 }
 
 // convertToRuntimeSecurityContext converts v1.SecurityContext to runtimeapi.SecurityContext.
@@ -111,6 +107,9 @@ func convertToRuntimeSecurityContext(securityContext *v1.SecurityContext) *runti
 	}
 	if securityContext.RunAsUser != nil {
 		sc.RunAsUser = &runtimeapi.Int64Value{Value: int64(*securityContext.RunAsUser)}
+	}
+	if securityContext.RunAsGroup != nil {
+		sc.RunAsGroup = &runtimeapi.Int64Value{Value: int64(*securityContext.RunAsGroup)}
 	}
 	if securityContext.Privileged != nil {
 		sc.Privileged = *securityContext.Privileged

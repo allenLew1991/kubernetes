@@ -17,11 +17,11 @@ limitations under the License.
 package discovery
 
 import (
-	"errors"
+	"context"
 	"net/http"
 	"sync"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,16 +29,24 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
-	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 // GroupManager is an interface that allows dynamic mutation of the existing webservice to handle
 // API groups being added or removed.
 type GroupManager interface {
+	GroupLister
+
 	AddGroup(apiGroup metav1.APIGroup)
 	RemoveGroup(groupName string)
-
+	ServeHTTP(resp http.ResponseWriter, req *http.Request)
 	WebService() *restful.WebService
+}
+
+// GroupLister knows how to list APIGroups for discovery.
+type GroupLister interface {
+	// Groups returns APIGroups for discovery, filling in ServerAddressByClientCIDRs
+	// based on data in req.
+	Groups(ctx context.Context, req *http.Request) ([]metav1.APIGroup, error)
 }
 
 // rootAPIsHandler creates a webservice serving api group discovery.
@@ -48,8 +56,7 @@ type rootAPIsHandler struct {
 	// addresses is used to build cluster IPs for discovery.
 	addresses Addresses
 
-	serializer    runtime.NegotiatedSerializer
-	contextMapper request.RequestContextMapper
+	serializer runtime.NegotiatedSerializer
 
 	// Map storing information about all groups to be exposed in discovery response.
 	// The map is from name to the group.
@@ -59,17 +66,16 @@ type rootAPIsHandler struct {
 	apiGroupNames []string
 }
 
-func NewRootAPIsHandler(addresses Addresses, serializer runtime.NegotiatedSerializer, contextMapper request.RequestContextMapper) *rootAPIsHandler {
+func NewRootAPIsHandler(addresses Addresses, serializer runtime.NegotiatedSerializer) *rootAPIsHandler {
 	// Because in release 1.1, /apis returns response with empty APIVersion, we
 	// use stripVersionNegotiatedSerializer to keep the response backwards
 	// compatible.
 	serializer = stripVersionNegotiatedSerializer{serializer}
 
 	return &rootAPIsHandler{
-		addresses:     addresses,
-		serializer:    serializer,
-		apiGroups:     map[string]metav1.APIGroup{},
-		contextMapper: contextMapper,
+		addresses:  addresses,
+		serializer: serializer,
+		apiGroups:  map[string]metav1.APIGroup{},
 	}
 }
 
@@ -98,30 +104,40 @@ func (s *rootAPIsHandler) RemoveGroup(groupName string) {
 	}
 }
 
-func (s *rootAPIsHandler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
-	ctx, ok := s.contextMapper.Get(req)
-	if !ok {
-		responsewriters.InternalError(resp, req, errors.New("no context found for request"))
-		return
-	}
-
+func (s *rootAPIsHandler) Groups(ctx context.Context, req *http.Request) ([]metav1.APIGroup, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
+
+	return s.groupsLocked(ctx, req), nil
+}
+
+// groupsLocked returns the APIGroupList discovery information for this handler.
+// The caller must hold the lock before invoking this method to avoid data races.
+func (s *rootAPIsHandler) groupsLocked(ctx context.Context, req *http.Request) []metav1.APIGroup {
+	clientIP := utilnet.GetClientIP(req)
+	serverCIDR := s.addresses.ServerAddressByClientCIDRs(clientIP)
 
 	orderedGroups := []metav1.APIGroup{}
 	for _, groupName := range s.apiGroupNames {
 		orderedGroups = append(orderedGroups, s.apiGroups[groupName])
 	}
 
-	clientIP := utilnet.GetClientIP(req)
-	serverCIDR := s.addresses.ServerAddressByClientCIDRs(clientIP)
 	groups := make([]metav1.APIGroup, len(orderedGroups))
 	for i := range orderedGroups {
 		groups[i] = orderedGroups[i]
 		groups[i].ServerAddressByClientCIDRs = serverCIDR
 	}
 
-	responsewriters.WriteObjectNegotiated(ctx, s.serializer, schema.GroupVersion{}, resp, req, http.StatusOK, &metav1.APIGroupList{Groups: groups})
+	return groups
+}
+
+func (s *rootAPIsHandler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	groupList := metav1.APIGroupList{Groups: s.groupsLocked(req.Context(), req)}
+
+	responsewriters.WriteObjectNegotiated(s.serializer, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, resp, req, http.StatusOK, &groupList, false)
 }
 
 func (s *rootAPIsHandler) restfulHandle(req *restful.Request, resp *restful.Response) {

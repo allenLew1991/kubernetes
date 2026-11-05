@@ -17,50 +17,94 @@ limitations under the License.
 package fuzzer
 
 import (
-	fuzz "github.com/google/gofuzz"
+	"math"
 
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/kubernetes/pkg/apis/batch"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/randfill"
 )
-
-func newBool(val bool) *bool {
-	p := new(bool)
-	*p = val
-	return p
-}
 
 // Funcs returns the fuzzer functions for the batch api group.
 var Funcs = func(codecs runtimeserializer.CodecFactory) []interface{} {
 	return []interface{}{
-		func(j *batch.JobSpec, c fuzz.Continue) {
-			c.FuzzNoCustom(j) // fuzz self without calling this function again
-			completions := int32(c.Rand.Int31())
-			parallelism := int32(c.Rand.Int31())
-			backoffLimit := int32(c.Rand.Int31())
+		func(j *batch.Job, c randfill.Continue) {
+			c.FillNoCustom(j) // fuzz self without calling this function again
+
+			// match defaulting
+			if len(j.Labels) == 0 {
+				j.Labels = j.Spec.Template.Labels
+			}
+		},
+		func(j *batch.JobSpec, c randfill.Continue) {
+			c.FillNoCustom(j) // fuzz self without calling this function again
+			completions := c.Int31()
+			parallelism := c.Int31()
+			backoffLimit := c.Int31()
 			j.Completions = &completions
 			j.Parallelism = &parallelism
 			j.BackoffLimit = &backoffLimit
-			if c.Rand.Int31()%2 == 0 {
-				j.ManualSelector = newBool(true)
-			} else {
-				j.ManualSelector = nil
+			j.ManualSelector = ptr.To(c.Bool())
+			mode := batch.NonIndexedCompletion
+			if c.Bool() {
+				mode = batch.IndexedCompletion
+				j.BackoffLimitPerIndex = ptr.To[int32](c.Int31())
+				j.MaxFailedIndexes = ptr.To[int32](c.Int31())
+			}
+			if c.Bool() {
+				j.BackoffLimit = ptr.To[int32](math.MaxInt32)
+			}
+			j.CompletionMode = &mode
+			// We're fuzzing the internal JobSpec type, not the v1 type, so we don't
+			// need to fuzz the nil value.
+			j.Suspend = ptr.To(c.Bool())
+			podReplacementPolicy := batch.TerminatingOrFailed
+			if c.Bool() {
+				podReplacementPolicy = batch.Failed
+			}
+			j.PodReplacementPolicy = &podReplacementPolicy
+			if c.Bool() {
+				c.Fill(j.ManagedBy)
+			}
+			// spec.scheduling has structural invariants the random filler can't know
+			// about: a policy is a union (one of basic or gang), and a gang
+			// minCount must be a positive integer.
+			if j.Scheduling != nil && j.Scheduling.SchedulingPolicy != nil {
+				if c.Bool() {
+					j.Scheduling.SchedulingPolicy = &schedulingv1.WorkloadPodGroupSchedulingPolicy{
+						Basic: &schedulingv1.WorkloadPodGroupBasicSchedulingPolicy{},
+					}
+				} else {
+					minCount := max(c.Int31(), 1)
+					j.Scheduling.SchedulingPolicy = &schedulingv1.WorkloadPodGroupSchedulingPolicy{
+						Gang: &schedulingv1.WorkloadPodGroupGangSchedulingPolicy{MinCount: &minCount},
+					}
+				}
 			}
 		},
-		func(sj *batch.CronJobSpec, c fuzz.Continue) {
-			c.FuzzNoCustom(sj)
-			suspend := c.RandBool()
+		func(sj *batch.CronJobSpec, c randfill.Continue) {
+			c.FillNoCustom(sj)
+			suspend := c.Bool()
 			sj.Suspend = &suspend
-			sds := int64(c.RandUint64())
+			sds := int64(c.Uint64())
 			sj.StartingDeadlineSeconds = &sds
-			sj.Schedule = c.RandString()
-			successfulJobsHistoryLimit := int32(c.Rand.Int31())
+			sj.Schedule = c.String(0)
+			successfulJobsHistoryLimit := c.Int31()
 			sj.SuccessfulJobsHistoryLimit = &successfulJobsHistoryLimit
-			failedJobsHistoryLimit := int32(c.Rand.Int31())
+			failedJobsHistoryLimit := c.Int31()
 			sj.FailedJobsHistoryLimit = &failedJobsHistoryLimit
 		},
-		func(cp *batch.ConcurrencyPolicy, c fuzz.Continue) {
+		func(cp *batch.ConcurrencyPolicy, c randfill.Continue) {
 			policies := []batch.ConcurrencyPolicy{batch.AllowConcurrent, batch.ForbidConcurrent, batch.ReplaceConcurrent}
 			*cp = policies[c.Rand.Intn(len(policies))]
+		},
+		func(p *batch.PodFailurePolicyOnPodConditionsPattern, c randfill.Continue) {
+			c.FillNoCustom(p)
+			if p.Status == "" {
+				p.Status = api.ConditionTrue
+			}
 		},
 	}
 }

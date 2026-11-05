@@ -1,24 +1,11 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
-- thockin
-- lavalamp
-- smarterclayton
-- wojtek-t
-- deads2k
-- brendandburns
-- derekwaynecarr
-- caesarxuchao
-- mikedanese
-- liggitt
-- nikhiljindal
-- gmarek
-- erictune
-- pmorie
-- eparis
-- timothysc
-- dims
-- hongchaodeng
-- a-robinson
-- ddysher
-- mqliang
-- sdminonne
-- enj
+  - thockin
+  - wojtek-t
+  - deads2k
+  - derekwaynecarr
+  - caesarxuchao
+  - liggitt
+  - dims
+  - enj

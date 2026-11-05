@@ -17,22 +17,23 @@ limitations under the License.
 package v1beta1_test
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	_ "k8s.io/kubernetes/pkg/apis/extensions/install"
 	. "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
+	"k8s.io/utils/ptr"
 )
 
 func TestSetDefaultDaemonSetSpec(t *testing.T) {
@@ -44,7 +45,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 			RestartPolicy:                 v1.RestartPolicyAlways,
 			SecurityContext:               &v1.PodSecurityContext{},
 			TerminationGracePeriodSeconds: &period,
-			SchedulerName:                 api.DefaultSchedulerName,
+			SchedulerName:                 v1.DefaultSchedulerName,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: defaultLabels,
@@ -56,7 +57,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 			RestartPolicy:                 v1.RestartPolicyAlways,
 			SecurityContext:               &v1.PodSecurityContext{},
 			TerminationGracePeriodSeconds: &period,
-			SchedulerName:                 api.DefaultSchedulerName,
+			SchedulerName:                 v1.DefaultSchedulerName,
 		},
 	}
 	tests := []struct {
@@ -81,7 +82,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 					UpdateStrategy: extensionsv1beta1.DaemonSetUpdateStrategy{
 						Type: extensionsv1beta1.OnDeleteDaemonSetStrategyType,
 					},
-					RevisionHistoryLimit: newInt32(10),
+					RevisionHistoryLimit: ptr.To[int32](10),
 				},
 			},
 		},
@@ -94,7 +95,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 				},
 				Spec: extensionsv1beta1.DaemonSetSpec{
 					Template:             defaultTemplate,
-					RevisionHistoryLimit: newInt32(1),
+					RevisionHistoryLimit: ptr.To[int32](1),
 				},
 			},
 			expected: &extensionsv1beta1.DaemonSet{
@@ -111,7 +112,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 					UpdateStrategy: extensionsv1beta1.DaemonSetUpdateStrategy{
 						Type: extensionsv1beta1.OnDeleteDaemonSetStrategyType,
 					},
-					RevisionHistoryLimit: newInt32(1),
+					RevisionHistoryLimit: ptr.To[int32](1),
 				},
 			},
 		},
@@ -123,7 +124,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 					UpdateStrategy: extensionsv1beta1.DaemonSetUpdateStrategy{
 						Type: extensionsv1beta1.OnDeleteDaemonSetStrategyType,
 					},
-					RevisionHistoryLimit: newInt32(10),
+					RevisionHistoryLimit: ptr.To[int32](10),
 				},
 			},
 		},
@@ -137,7 +138,7 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 					UpdateStrategy: extensionsv1beta1.DaemonSetUpdateStrategy{
 						Type: extensionsv1beta1.OnDeleteDaemonSetStrategyType,
 					},
-					RevisionHistoryLimit: newInt32(10),
+					RevisionHistoryLimit: ptr.To[int32](10),
 				},
 			},
 		},
@@ -159,8 +160,8 @@ func TestSetDefaultDaemonSetSpec(t *testing.T) {
 }
 
 func TestSetDefaultDeployment(t *testing.T) {
-	defaultIntOrString := intstr.FromInt(1)
-	differentIntOrString := intstr.FromInt(5)
+	defaultIntOrString := intstr.FromInt32(1)
+	differentIntOrString := intstr.FromInt32(5)
 	period := int64(v1.DefaultTerminationGracePeriodSeconds)
 	defaultTemplate := v1.PodTemplateSpec{
 		Spec: v1.PodSpec{
@@ -168,7 +169,7 @@ func TestSetDefaultDeployment(t *testing.T) {
 			RestartPolicy:                 v1.RestartPolicyAlways,
 			SecurityContext:               &v1.PodSecurityContext{},
 			TerminationGracePeriodSeconds: &period,
-			SchedulerName:                 api.DefaultSchedulerName,
+			SchedulerName:                 v1.DefaultSchedulerName,
 		},
 	}
 	tests := []struct {
@@ -179,7 +180,7 @@ func TestSetDefaultDeployment(t *testing.T) {
 			original: &extensionsv1beta1.Deployment{},
 			expected: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(1),
+					Replicas: ptr.To[int32](1),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type: extensionsv1beta1.RollingUpdateDeploymentStrategyType,
 						RollingUpdate: &extensionsv1beta1.RollingUpdateDeployment{
@@ -187,14 +188,16 @@ func TestSetDefaultDeployment(t *testing.T) {
 							MaxUnavailable: &defaultIntOrString,
 						},
 					},
-					Template: defaultTemplate,
+					Template:                defaultTemplate,
+					ProgressDeadlineSeconds: ptr.To[int32](math.MaxInt32),
+					RevisionHistoryLimit:    ptr.To[int32](math.MaxInt32),
 				},
 			},
 		},
 		{
 			original: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
+					Replicas: ptr.To[int32](5),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						RollingUpdate: &extensionsv1beta1.RollingUpdateDeployment{
 							MaxSurge: &differentIntOrString,
@@ -204,7 +207,7 @@ func TestSetDefaultDeployment(t *testing.T) {
 			},
 			expected: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
+					Replicas: ptr.To[int32](5),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type: extensionsv1beta1.RollingUpdateDeploymentStrategyType,
 						RollingUpdate: &extensionsv1beta1.RollingUpdateDeployment{
@@ -212,14 +215,16 @@ func TestSetDefaultDeployment(t *testing.T) {
 							MaxUnavailable: &defaultIntOrString,
 						},
 					},
-					Template: defaultTemplate,
+					Template:                defaultTemplate,
+					ProgressDeadlineSeconds: ptr.To[int32](math.MaxInt32),
+					RevisionHistoryLimit:    ptr.To[int32](math.MaxInt32),
 				},
 			},
 		},
 		{
 			original: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(3),
+					Replicas: ptr.To[int32](3),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type:          extensionsv1beta1.RollingUpdateDeploymentStrategyType,
 						RollingUpdate: nil,
@@ -228,7 +233,7 @@ func TestSetDefaultDeployment(t *testing.T) {
 			},
 			expected: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(3),
+					Replicas: ptr.To[int32](3),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type: extensionsv1beta1.RollingUpdateDeploymentStrategyType,
 						RollingUpdate: &extensionsv1beta1.RollingUpdateDeployment{
@@ -236,14 +241,16 @@ func TestSetDefaultDeployment(t *testing.T) {
 							MaxUnavailable: &defaultIntOrString,
 						},
 					},
-					Template: defaultTemplate,
+					Template:                defaultTemplate,
+					ProgressDeadlineSeconds: ptr.To[int32](math.MaxInt32),
+					RevisionHistoryLimit:    ptr.To[int32](math.MaxInt32),
 				},
 			},
 		},
 		{
 			original: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
+					Replicas: ptr.To[int32](5),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
 					},
@@ -251,32 +258,35 @@ func TestSetDefaultDeployment(t *testing.T) {
 			},
 			expected: &extensionsv1beta1.Deployment{
 				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
-					Strategy: extensionsv1beta1.DeploymentStrategy{
-						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
-					},
-					Template: defaultTemplate,
-				},
-			},
-		},
-		{
-			original: &extensionsv1beta1.Deployment{
-				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
-					Strategy: extensionsv1beta1.DeploymentStrategy{
-						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
-					},
-					ProgressDeadlineSeconds: newInt32(30),
-				},
-			},
-			expected: &extensionsv1beta1.Deployment{
-				Spec: extensionsv1beta1.DeploymentSpec{
-					Replicas: newInt32(5),
+					Replicas: ptr.To[int32](5),
 					Strategy: extensionsv1beta1.DeploymentStrategy{
 						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
 					},
 					Template:                defaultTemplate,
-					ProgressDeadlineSeconds: newInt32(30),
+					ProgressDeadlineSeconds: ptr.To[int32](math.MaxInt32),
+					RevisionHistoryLimit:    ptr.To[int32](math.MaxInt32),
+				},
+			},
+		},
+		{
+			original: &extensionsv1beta1.Deployment{
+				Spec: extensionsv1beta1.DeploymentSpec{
+					Replicas: ptr.To[int32](5),
+					Strategy: extensionsv1beta1.DeploymentStrategy{
+						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
+					},
+					ProgressDeadlineSeconds: ptr.To[int32](30),
+				},
+			},
+			expected: &extensionsv1beta1.Deployment{
+				Spec: extensionsv1beta1.DeploymentSpec{
+					Replicas: ptr.To[int32](5),
+					Strategy: extensionsv1beta1.DeploymentStrategy{
+						Type: extensionsv1beta1.RecreateDeploymentStrategyType,
+					},
+					Template:                defaultTemplate,
+					ProgressDeadlineSeconds: ptr.To[int32](30),
+					RevisionHistoryLimit:    ptr.To[int32](math.MaxInt32),
 				},
 			},
 		},
@@ -432,7 +442,7 @@ func TestSetDefaultReplicaSetReplicas(t *testing.T) {
 		{
 			rs: extensionsv1beta1.ReplicaSet{
 				Spec: extensionsv1beta1.ReplicaSetSpec{
-					Replicas: newInt32(0),
+					Replicas: ptr.To[int32](0),
 					Template: v1.PodTemplateSpec{
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: map[string]string{
@@ -447,7 +457,7 @@ func TestSetDefaultReplicaSetReplicas(t *testing.T) {
 		{
 			rs: extensionsv1beta1.ReplicaSet{
 				Spec: extensionsv1beta1.ReplicaSetSpec{
-					Replicas: newInt32(3),
+					Replicas: ptr.To[int32](3),
 					Template: v1.PodTemplateSpec{
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: map[string]string{
@@ -490,7 +500,7 @@ func TestDefaultRequestIsNotSetForReplicaSet(t *testing.T) {
 	}
 	rs := &extensionsv1beta1.ReplicaSet{
 		Spec: extensionsv1beta1.ReplicaSetSpec{
-			Replicas: newInt32(3),
+			Replicas: ptr.To[int32](3),
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -507,15 +517,6 @@ func TestDefaultRequestIsNotSetForReplicaSet(t *testing.T) {
 	requestValue := defaultRequest[v1.ResourceCPU]
 	if requestValue.String() != "0" {
 		t.Errorf("Expected 0 request value, got: %s", requestValue.String())
-	}
-}
-
-func TestDefaultAllowPrivilegeEscalationForPodSecurityPolicy(t *testing.T) {
-	psp := &extensionsv1beta1.PodSecurityPolicy{}
-	output := roundTrip(t, runtime.Object(psp))
-	psp2 := output.(*extensionsv1beta1.PodSecurityPolicy)
-	if psp2.Spec.AllowPrivilegeEscalation == nil || *psp2.Spec.AllowPrivilegeEscalation != true {
-		t.Errorf("Expected default to true, got: %#v", psp2.Spec.AllowPrivilegeEscalation)
 	}
 }
 
@@ -741,10 +742,4 @@ func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 		return nil
 	}
 	return obj3
-}
-
-func newInt32(val int32) *int32 {
-	p := new(int32)
-	*p = val
-	return p
 }

@@ -17,6 +17,9 @@ limitations under the License.
 package rest
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -27,14 +30,22 @@ import (
 	"k8s.io/apiserver/pkg/registry/rest"
 )
 
+type CounterMetric interface {
+	Inc()
+}
+
 // LocationStreamer is a resource that streams the contents of a particular
-// location URL
+// location URL.
 type LocationStreamer struct {
 	Location        *url.URL
 	Transport       http.RoundTripper
 	ContentType     string
 	Flush           bool
 	ResponseChecker HttpResponseChecker
+	RedirectChecker func(req *http.Request, via []*http.Request) error
+	// TLSVerificationErrorCounter is an optional value that will Inc every time a TLS error is encountered.  This can
+	// be wired a single prometheus counter instance to get counts overall.
+	TLSVerificationErrorCounter CounterMetric
 }
 
 // a LocationStreamer must implement a rest.ResourceStreamer
@@ -49,7 +60,7 @@ func (obj *LocationStreamer) DeepCopyObject() runtime.Object {
 
 // InputStream returns a stream with the contents of the URL location. If no location is provided,
 // a null stream is returned.
-func (s *LocationStreamer) InputStream(apiVersion, acceptHeader string) (stream io.ReadCloser, flush bool, contentType string, err error) {
+func (s *LocationStreamer) InputStream(ctx context.Context, apiVersion, acceptHeader string) (stream io.ReadCloser, flush bool, contentType string, err error) {
 	if s.Location == nil {
 		// If no location was provided, return a null stream
 		return nil, false, "", nil
@@ -58,9 +69,25 @@ func (s *LocationStreamer) InputStream(apiVersion, acceptHeader string) (stream 
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	client := &http.Client{Transport: transport}
-	resp, err := client.Get(s.Location.String())
+
+	client := &http.Client{
+		Transport:     transport,
+		CheckRedirect: s.RedirectChecker,
+	}
+	req, err := http.NewRequest("GET", s.Location.String(), nil)
 	if err != nil {
+		return nil, false, "", fmt.Errorf("failed to construct request for %s, got %v", s.Location.String(), err)
+	}
+	// Pass the parent context down to the request to ensure that the resources
+	// will be release properly.
+	req = req.WithContext(ctx)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// TODO prefer segregate TLS errors more reliably, but we do want to increment a count
+		if strings.Contains(err.Error(), "x509:") && s.TLSVerificationErrorCounter != nil {
+			s.TLSVerificationErrorCounter.Inc()
+		}
 		return nil, false, "", err
 	}
 
@@ -80,4 +107,9 @@ func (s *LocationStreamer) InputStream(apiVersion, acceptHeader string) (stream 
 	flush = s.Flush
 	stream = resp.Body
 	return
+}
+
+// PreventRedirects is a redirect checker that prevents the client from following a redirect.
+func PreventRedirects(_ *http.Request, _ []*http.Request) error {
+	return errors.New("redirects forbidden")
 }

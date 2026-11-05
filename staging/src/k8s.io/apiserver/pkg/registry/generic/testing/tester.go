@@ -17,7 +17,9 @@ limitations under the License.
 package tester
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -26,10 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/registry/rest/resttest"
-	etcdstorage "k8s.io/apiserver/pkg/storage/etcd"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 )
 
@@ -39,11 +43,92 @@ type Tester struct {
 }
 type UpdateFunc func(runtime.Object) runtime.Object
 
-func New(t *testing.T, storage *genericregistry.Store) *Tester {
+// New creates a new Tester for the given storage.
+// RequestInfo is set automatically during testing when the storage has
+// at least one external version registered in it's scheme and a create
+// or update strategy that supports runtime.ObjectTyper, VersionsForGroupKind
+// and NewFunc.
+func New(t *testing.T, storage *genericregistry.Store, subresources ...string) *Tester {
+	tester := resttest.New(t, storage)
+	if info := priorityRequestInfo(storage); info != nil {
+		if len(subresources) > 0 {
+			info.Subresource = strings.Join(subresources, "/")
+		}
+		tester.SetRequestInfo(info)
+	}
 	return &Tester{
-		tester:  resttest.New(t, storage),
+		tester:  tester,
 		storage: storage,
 	}
+}
+
+type priorityRequestInfoScheme interface {
+	runtime.ObjectTyper
+
+	// VersionsForGroupKind returns external versions in priority order.
+	// See Scheme.VersionsForGroupKind.
+	VersionsForGroupKind(schema.GroupKind) []schema.GroupVersion
+}
+
+// priorityRequestInfo returns the highest-priority external API version, or
+// nil if no external versions could be found.
+// The store's CreateStrategy is expected to implement runtime.ObjectTyper,
+// VersionsForGroupKind() and provide a NewFunc implementation. If not,
+// nil is returned.
+func priorityRequestInfo(store *genericregistry.Store) *genericapirequest.RequestInfo {
+	if store == nil || store.NewFunc == nil {
+		return nil
+	}
+	scheme, ok := store.CreateStrategy.(priorityRequestInfoScheme)
+	if !ok {
+		scheme, ok = store.UpdateStrategy.(priorityRequestInfoScheme)
+		if !ok {
+			return nil
+		}
+	}
+	gvks, _, err := scheme.ObjectKinds(store.NewFunc())
+	if err != nil || len(gvks) == 0 {
+		return nil
+	}
+	gvs := scheme.VersionsForGroupKind(gvks[0].GroupKind())
+	if len(gvs) == 0 {
+		return nil
+	}
+	gr := store.DefaultQualifiedResource
+	return &genericapirequest.RequestInfo{
+		APIGroup:   gr.Group,
+		APIVersion: gvs[0].Version,
+		Resource:   gr.Resource,
+	}
+}
+
+// NewClusterScopeContext returns a context for testing cluster-scoped requests
+// against the given store.
+// RequestInfo is set in the context when the storage has at least one external version
+// registered in it's scheme and a create or update strategy
+// that supports runtime.ObjectTyper, VersionsForGroupKind and NewFunc.
+func NewClusterScopeContext(store *genericregistry.Store, subresources ...string) context.Context {
+	return newContext(store, "", subresources)
+}
+
+// NewNamespaceScopeContext returns a context for testing namespace-scoped
+// requests against the given store.
+// RequestInfo is set in the context when the storage has at least one external version
+// registered in it's scheme and a create or update strategy
+// that supports runtime.ObjectTyper, VersionsForGroupKind and NewFunc.
+func NewNamespaceScopeContext(store *genericregistry.Store, namespace string, subresources ...string) context.Context {
+	return newContext(store, namespace, subresources)
+}
+
+func newContext(store *genericregistry.Store, namespace string, subresources []string) context.Context {
+	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	if info := priorityRequestInfo(store); info != nil {
+		if len(subresources) > 0 {
+			info.Subresource = strings.Join(subresources, "/")
+		}
+		ctx = genericapirequest.WithRequestInfo(ctx, info)
+	}
+	return ctx
 }
 
 func (t *Tester) TestNamespace() string {
@@ -53,6 +138,10 @@ func (t *Tester) TestNamespace() string {
 func (t *Tester) ClusterScope() *Tester {
 	t.tester = t.tester.ClusterScope()
 	return t
+}
+
+func (t *Tester) SetUserInfo(userInfo user.Info) {
+	t.tester.SetUserInfo(userInfo)
 }
 
 func (t *Tester) Namer(namer func(int) string) *Tester {
@@ -72,6 +161,11 @@ func (t *Tester) GeneratesName() *Tester {
 
 func (t *Tester) ReturnDeletedObject() *Tester {
 	t.tester = t.tester.ReturnDeletedObject()
+	return t
+}
+
+func (t *Tester) SetRequestInfo(requestInfo *genericapirequest.RequestInfo) *Tester {
+	t.tester.SetRequestInfo(requestInfo)
 	return t
 }
 
@@ -136,13 +230,13 @@ func (t *Tester) TestWatch(valid runtime.Object, labelsPass, labelsFail []labels
 		fieldsPass,
 		fieldsFail,
 		// TODO: This should be filtered, the registry should not be aware of this level of detail
-		[]string{etcdstorage.EtcdCreate, etcdstorage.EtcdDelete},
+		[]string{"create", "delete"},
 	)
 }
 
 // Helper functions
 
-func (t *Tester) getObject(ctx genericapirequest.Context, obj runtime.Object) (runtime.Object, error) {
+func (t *Tester) getObject(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, err
@@ -155,7 +249,7 @@ func (t *Tester) getObject(ctx genericapirequest.Context, obj runtime.Object) (r
 	return result, nil
 }
 
-func (t *Tester) createObject(ctx genericapirequest.Context, obj runtime.Object) error {
+func (t *Tester) createObject(ctx context.Context, obj runtime.Object) error {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return err
@@ -164,16 +258,16 @@ func (t *Tester) createObject(ctx genericapirequest.Context, obj runtime.Object)
 	if err != nil {
 		return err
 	}
-	return t.storage.Storage.Create(ctx, key, obj, nil, 0)
+	return t.storage.Storage.Create(ctx, key, obj, nil, 0, false)
 }
 
 func (t *Tester) setObjectsForList(objects []runtime.Object) []runtime.Object {
 	key := t.storage.KeyRootFunc(t.tester.TestContext())
-	if _, err := t.storage.DeleteCollection(t.tester.TestContext(), nil, nil); err != nil {
+	if _, err := t.storage.DeleteCollection(t.tester.TestContext(), rest.ValidateAllObjectFunc, nil, nil); err != nil {
 		t.tester.Errorf("unable to clear collection: %v", err)
 		return nil
 	}
-	if err := storagetesting.CreateObjList(key, t.storage.Storage, objects); err != nil {
+	if err := storagetesting.CreateObjList(key, t.storage.Storage.Storage, objects); err != nil {
 		t.tester.Errorf("unexpected error: %v", err)
 		return nil
 	}
@@ -185,15 +279,15 @@ func (t *Tester) emitObject(obj runtime.Object, action string) error {
 	var err error
 
 	switch action {
-	case etcdstorage.EtcdCreate:
+	case "create":
 		err = t.createObject(ctx, obj)
-	case etcdstorage.EtcdDelete:
+	case "delete":
 		var accessor metav1.Object
 		accessor, err = meta.Accessor(obj)
 		if err != nil {
 			return err
 		}
-		_, _, err = t.storage.Delete(ctx, accessor.GetName(), nil)
+		_, _, err = t.storage.Delete(ctx, accessor.GetName(), rest.ValidateAllObjectFunc, nil)
 	default:
 		err = fmt.Errorf("unexpected action: %v", action)
 	}

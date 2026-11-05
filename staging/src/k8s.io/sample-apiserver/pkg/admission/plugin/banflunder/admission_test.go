@@ -17,19 +17,21 @@ limitations under the License.
 package banflunder_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/sample-apiserver/pkg/admission/plugin/banflunder"
 	"k8s.io/sample-apiserver/pkg/admission/wardleinitializer"
-	"k8s.io/sample-apiserver/pkg/apis/wardle"
-	"k8s.io/sample-apiserver/pkg/client/clientset/internalversion/fake"
-	informers "k8s.io/sample-apiserver/pkg/client/informers/internalversion"
+	wardle "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
+	"k8s.io/sample-apiserver/pkg/generated/clientset/versioned/fake"
+	informers "k8s.io/sample-apiserver/pkg/generated/informers/externalversions"
 )
 
 // TestBanfluderAdmissionPlugin tests various test cases against
@@ -56,7 +58,7 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 					Namespace: "",
 				},
 			},
-			admissionInputKind:     wardle.Kind("Flunder").WithVersion("version"),
+			admissionInputKind:     wardle.SchemeGroupVersion.WithKind("Flunder").GroupKind().WithVersion("version"),
 			admissionInputResource: wardle.Resource("flunders").WithVersion("version"),
 			admissionMustFail:      true,
 		},
@@ -74,7 +76,7 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 					Namespace: "",
 				},
 			},
-			admissionInputKind:     wardle.Kind("Flunder").WithVersion("version"),
+			admissionInputKind:     wardle.SchemeGroupVersion.WithKind("Flunder").GroupKind().WithVersion("version"),
 			admissionInputResource: wardle.Resource("flunders").WithVersion("version"),
 			admissionMustFail:      false,
 		},
@@ -93,7 +95,7 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 					Namespace: "",
 				},
 			},
-			admissionInputKind:     wardle.Kind("NotFlunder").WithVersion("version"),
+			admissionInputKind:     wardle.SchemeGroupVersion.WithKind("NotFlunder").GroupKind().WithVersion("version"),
 			admissionInputResource: wardle.Resource("notflunders").WithVersion("version"),
 			admissionMustFail:      false,
 		},
@@ -113,10 +115,7 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 				t.Fatalf("scenario %d: failed to create banflunder admission plugin due to = %v", index, err)
 			}
 
-			targetInitializer, err := wardleinitializer.New(informersFactory)
-			if err != nil {
-				t.Fatalf("scenario %d: failed to crate wardle plugin initializer due to = %v", index, err)
-			}
+			targetInitializer := wardleinitializer.New(informersFactory)
 			targetInitializer.Initialize(target)
 
 			err = admission.ValidateInitialization(target)
@@ -126,11 +125,12 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 
 			stop := make(chan struct{})
 			defer close(stop)
-			informersFactory.Start(stop)
-			informersFactory.WaitForCacheSync(stop)
+			ctx := wait.ContextForChannel(stop)
+			informersFactory.StartWithContext(ctx)
+			informersFactory.WaitForCacheSyncWithContext(ctx)
 
 			// act
-			err = target.Admit(admission.NewAttributesRecord(
+			err = target.Admit(context.TODO(), admission.NewAttributesRecord(
 				&scenario.admissionInput,
 				nil,
 				scenario.admissionInputKind,
@@ -139,7 +139,10 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 				scenario.admissionInputResource,
 				"",
 				admission.Create,
+				&metav1.CreateOptions{},
+				false,
 				nil),
+				nil,
 			)
 
 			// validate

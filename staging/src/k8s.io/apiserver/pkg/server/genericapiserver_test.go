@@ -17,10 +17,10 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,31 +30,38 @@ import (
 	"testing"
 	"time"
 
-	// "github.com/go-openapi/spec"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/apimachinery"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
-	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
-	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/warning"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	restclient "k8s.io/client-go/rest"
-	openapi "k8s.io/kube-openapi/pkg/common"
+	basecompatibility "k8s.io/component-base/compatibility"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2/ktesting"
+	kubeopenapi "k8s.io/kube-openapi/pkg/common"
+	"k8s.io/kube-openapi/pkg/validation/spec"
+	netutils "k8s.io/utils/net"
 )
 
 const (
@@ -78,21 +85,57 @@ func init() {
 		&metav1.APIGroup{},
 		&metav1.APIResourceList{},
 	)
-	example.AddToScheme(scheme)
-	examplev1.AddToScheme(scheme)
+	utilruntime.Must(example.AddToScheme(scheme))
+	utilruntime.Must(examplev1.AddToScheme(scheme))
 }
 
-func testGetOpenAPIDefinitions(ref openapi.ReferenceCallback) map[string]openapi.OpenAPIDefinition {
-	return map[string]openapi.OpenAPIDefinition{}
+func buildTestOpenAPIDefinition() kubeopenapi.OpenAPIDefinition {
+	return kubeopenapi.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "Description",
+				Properties:  map[string]spec.Schema{},
+			},
+			VendorExtensible: spec.VendorExtensible{
+				Extensions: spec.Extensions{
+					"x-kubernetes-group-version-kind": []interface{}{
+						map[string]interface{}{
+							"group":   "",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+						map[string]interface{}{
+							"group":   "batch",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+						map[string]interface{}{
+							"group":   "extensions",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func testGetOpenAPIDefinitions(_ kubeopenapi.ReferenceCallback) map[string]kubeopenapi.OpenAPIDefinition {
+	return map[string]kubeopenapi.OpenAPIDefinition{
+		"io.k8s.apimachinery.pkg.apis.meta.v1.Status":          {},
+		"io.k8s.apimachinery.pkg.apis.meta.v1.APIVersions":     {},
+		"io.k8s.apimachinery.pkg.apis.meta.v1.APIGroupList":    {},
+		"io.k8s.apimachinery.pkg.apis.meta.v1.APIGroup":        buildTestOpenAPIDefinition(),
+		"io.k8s.apimachinery.pkg.apis.meta.v1.APIResourceList": {},
+	}
 }
 
 // setUp is a convience function for setting up for (most) tests.
-func setUp(t *testing.T) (*etcdtesting.EtcdTestServer, Config, *assert.Assertions) {
-	etcdServer, _ := etcdtesting.NewUnsecuredEtcd3TestClientServer(t)
-
+func setUp(t *testing.T) (Config, *assert.Assertions) {
 	config := NewConfig(codecs)
-	config.PublicAddress = net.ParseIP("192.168.10.4")
-	config.RequestContextMapper = apirequest.NewRequestContextMapper()
+	config.ExternalAddress = "192.168.10.4:443"
+	config.PublicAddress = netutils.ParseIPSloppy("192.168.10.4")
 	config.LegacyAPIGroupPrefixes = sets.NewString("/api")
 	config.LoopbackClientConfig = &restclient.Config{}
 
@@ -100,58 +143,45 @@ func setUp(t *testing.T) (*etcdtesting.EtcdTestServer, Config, *assert.Assertion
 	if clientset == nil {
 		t.Fatal("unable to create fake client set")
 	}
-
-	// TODO restore this test, but right now, eliminate our cycle
-	// config.OpenAPIConfig = DefaultOpenAPIConfig(testGetOpenAPIDefinitions, runtime.NewScheme())
-	// config.OpenAPIConfig.Info = &spec.Info{
-	// 	InfoProps: spec.InfoProps{
-	// 		Title:   "Kubernetes",
-	// 		Version: "unversioned",
-	// 	},
-	// }
-	config.SwaggerConfig = DefaultSwaggerConfig()
+	config.EffectiveVersion = basecompatibility.NewEffectiveVersionFromString("", "", "")
+	config.OpenAPIConfig = DefaultOpenAPIConfig(testGetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(runtime.NewScheme()))
+	config.OpenAPIConfig.Info.Version = "unversioned"
+	config.OpenAPIV3Config = DefaultOpenAPIV3Config(testGetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(runtime.NewScheme()))
+	config.OpenAPIV3Config.Info.Version = "unversioned"
 	sharedInformers := informers.NewSharedInformerFactory(clientset, config.LoopbackClientConfig.Timeout)
 	config.Complete(sharedInformers)
 
-	return etcdServer, *config, assert.New(t)
+	return *config, assert.New(t)
 }
 
-func newMaster(t *testing.T) (*GenericAPIServer, *etcdtesting.EtcdTestServer, Config, *assert.Assertions) {
-	etcdserver, config, assert := setUp(t)
+func newMaster(t *testing.T) (*GenericAPIServer, Config, *assert.Assertions) {
+	config, assert := setUp(t)
 
-	s, err := config.Complete(nil).New("test", EmptyDelegate)
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the server: %v", err)
 	}
-	return s, etcdserver, config, assert
+	return s, config, assert
 }
 
 // TestNew verifies that the New function returns a GenericAPIServer
 // using the configuration properly.
 func TestNew(t *testing.T) {
-	s, etcdserver, config, assert := newMaster(t)
-	defer etcdserver.Terminate(t)
+	s, config, assert := newMaster(t)
 
 	// Verify many of the variables match their config counterparts
 	assert.Equal(s.legacyAPIGroupPrefixes, config.LegacyAPIGroupPrefixes)
 	assert.Equal(s.admissionControl, config.AdmissionControl)
-	assert.Equal(s.RequestContextMapper(), config.RequestContextMapper)
-
-	// these values get defaulted
-	assert.Equal(net.JoinHostPort(config.PublicAddress.String(), "443"), s.ExternalAddress)
-	assert.NotNil(s.swaggerConfig)
-	assert.Equal("http://"+s.ExternalAddress, s.swaggerConfig.WebServicesUrl)
 }
 
 // Verifies that AddGroupVersions works as expected.
 func TestInstallAPIGroups(t *testing.T) {
-	etcdserver, config, assert := setUp(t)
-	defer etcdserver.Terminate(t)
+	config, assert := setUp(t)
 
 	config.LegacyAPIGroupPrefixes = sets.NewString("/apiPrefix")
 	config.DiscoveryAddresses = discovery.DefaultAddresses{DefaultAddress: "ExternalAddress"}
 
-	s, err := config.Complete(nil).New("test", EmptyDelegate)
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the server: %v", err)
 	}
@@ -165,26 +195,8 @@ func TestInstallAPIGroups(t *testing.T) {
 		scheme.AddKnownTypes(v1GroupVersion, &metav1.Status{})
 		metav1.AddToGroupVersion(scheme, v1GroupVersion)
 
-		interfacesFor := func(version schema.GroupVersion) (*meta.VersionInterfaces, error) {
-			return &meta.VersionInterfaces{
-				ObjectConvertor:  scheme,
-				MetadataAccessor: meta.NewAccessor(),
-			}, nil
-		}
-
-		mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{gv}, interfacesFor)
-		for kind := range scheme.KnownTypes(gv) {
-			mapper.Add(gv.WithKind(kind), meta.RESTScopeNamespace)
-		}
-		groupMeta := apimachinery.GroupMeta{
-			GroupVersion:  gv,
-			GroupVersions: []schema.GroupVersion{gv},
-			RESTMapper:    mapper,
-			InterfacesFor: interfacesFor,
-		}
-
 		return APIGroupInfo{
-			GroupMeta: groupMeta,
+			PrioritizedVersions: []schema.GroupVersion{gv},
 			VersionedResourcesStorageMap: map[string]map[string]rest.Storage{
 				gv.Version: {
 					"getter":  &testGetterStorage{Version: gv.Version},
@@ -212,7 +224,7 @@ func TestInstallAPIGroups(t *testing.T) {
 	for _, api := range apis[1:] {
 		err = s.InstallAPIGroup(&api)
 		assert.NoError(err)
-		groupPaths = append(groupPaths, APIGroupPrefix+"/"+api.GroupMeta.GroupVersion.Group) // /apis/<group>
+		groupPaths = append(groupPaths, APIGroupPrefix+"/"+api.PrioritizedVersions[0].Group) // /apis/<group>
 	}
 
 	server := httptest.NewServer(s.Handler)
@@ -228,7 +240,7 @@ func TestInstallAPIGroups(t *testing.T) {
 			continue
 		}
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Errorf("[%d] unexpected error reading body at path %q: %v", i, path, err)
 			continue
@@ -253,26 +265,26 @@ func TestInstallAPIGroups(t *testing.T) {
 				continue
 			}
 
-			if got, expected := group.Name, info.GroupMeta.GroupVersion.Group; got != expected {
+			if got, expected := group.Name, info.PrioritizedVersions[0].Group; got != expected {
 				t.Errorf("[%d] unexpected group name at path %q: got=%q expected=%q", i, path, got, expected)
 				continue
 			}
 
-			if got, expected := group.PreferredVersion.Version, info.GroupMeta.GroupVersion.Version; got != expected {
+			if got, expected := group.PreferredVersion.Version, info.PrioritizedVersions[0].Version; got != expected {
 				t.Errorf("[%d] unexpected group version at path %q: got=%q expected=%q", i, path, got, expected)
 				continue
 			}
 		}
 
 		// should serve APIResourceList at group path + /<group-version>
-		path = path + "/" + info.GroupMeta.GroupVersion.Version
+		path = path + "/" + info.PrioritizedVersions[0].Version
 		resp, err = http.Get(server.URL + path)
 		if err != nil {
 			t.Errorf("[%d] unexpected error getting path %q path: %v", i, path, err)
 			continue
 		}
 
-		body, err = ioutil.ReadAll(resp.Body)
+		body, err = io.ReadAll(resp.Body)
 		if err != nil {
 			t.Errorf("[%d] unexpected error reading body at path %q: %v", i, path, err)
 			continue
@@ -287,7 +299,7 @@ func TestInstallAPIGroups(t *testing.T) {
 			continue
 		}
 
-		if got, expected := resources.GroupVersion, info.GroupMeta.GroupVersion.String(); got != expected {
+		if got, expected := resources.GroupVersion, info.PrioritizedVersions[0].String(); got != expected {
 			t.Errorf("[%d] unexpected groupVersion at path %q: got=%q expected=%q", i, path, got, expected)
 			continue
 		}
@@ -312,36 +324,126 @@ func TestInstallAPIGroups(t *testing.T) {
 }
 
 func TestPrepareRun(t *testing.T) {
-	s, etcdserver, config, assert := newMaster(t)
-	defer etcdserver.Terminate(t)
+	_, ctx := ktesting.NewTestContext(t)
+	s, config, assert := newMaster(t)
 
-	assert.NotNil(config.SwaggerConfig)
+	assert.NotNil(config.OpenAPIConfig)
 
 	server := httptest.NewServer(s.Handler.Director)
 	defer server.Close()
-	done := make(chan struct{})
 
 	s.PrepareRun()
-	s.RunPostStartHooks(done)
+	s.RunPostStartHooks(ctx)
 
-	// swagger is installed in PrepareRun
-	resp, err := http.Get(server.URL + "/swaggerapi/")
+	// openapi is installed in PrepareRun
+	resp, err := http.Get(server.URL + "/openapi/v2")
 	assert.NoError(err)
 	assert.Equal(http.StatusOK, resp.StatusCode)
 
-	// healthz checks are installed in PrepareRun
-	resp, err = http.Get(server.URL + "/healthz")
-	assert.NoError(err)
-	assert.Equal(http.StatusOK, resp.StatusCode)
+	// wait for health (max-in-flight-filter is initialized asynchronously, can take a few milliseconds to initialize)
+	assert.NoError(wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+		// healthz checks are installed in PrepareRun
+		resp, err = http.Get(server.URL + "/healthz")
+		assert.NoError(err)
+		data, _ := io.ReadAll(resp.Body)
+		if http.StatusOK != resp.StatusCode {
+			t.Logf("got %d", resp.StatusCode)
+			t.Log(string(data))
+			return false, nil
+		}
+		return true, nil
+	}))
 	resp, err = http.Get(server.URL + "/healthz/ping")
 	assert.NoError(err)
 	assert.Equal(http.StatusOK, resp.StatusCode)
 }
 
+// TestNewAppliesMaxPooledEncodeBufferSize verifies that building a server
+// configures the process-wide encode buffer pool bound when the
+// AllocatorPoolBufferCap gate is enabled, and leaves it unbounded when
+// the gate is disabled.
+func TestNewAppliesMaxPooledEncodeBufferSize(t *testing.T) {
+	t.Cleanup(func() { runtime.SetMaxPooledBufferCapacity(0) })
+	for _, tc := range []struct {
+		name        string
+		gateEnabled bool
+		want        int
+	}{
+		{name: "gate enabled", gateEnabled: true, want: DefaultMaxPooledEncodeBufferSize},
+		{name: "gate disabled", gateEnabled: false, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AllocatorPoolBufferCap, tc.gateEnabled)
+			runtime.SetMaxPooledBufferCapacity(-1)
+			config, _ := setUp(t)
+			if _, err := config.Complete(nil).New("test", NewEmptyDelegate()); err != nil {
+				t.Fatal(err)
+			}
+			if got := runtime.MaxPooledBufferCapacity(); got != tc.want {
+				t.Fatalf("got pool bound %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateOpenAPISpec(t *testing.T) {
+	for _, lazyBuild := range []bool{false, true} {
+		t.Run(fmt.Sprintf("OpenAPIV2LazyBuild=%v", lazyBuild), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.OpenAPIV2LazyBuild, lazyBuild)
+			testUpdateOpenAPISpec(t, lazyBuild)
+		})
+	}
+}
+
+func testUpdateOpenAPISpec(t *testing.T, lazyBuild bool) {
+	_, ctx := ktesting.NewTestContext(t)
+	s, _, assert := newMaster(t)
+	s.PrepareRun()
+	s.RunPostStartHooks(ctx)
+
+	server := httptest.NewServer(s.Handler.Director)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/openapi/v2")
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(err)
+	resp.Body.Close()
+
+	// verify the static spec in record is what we currently serve, whether it
+	// was built at startup or by the request above.
+	assert.NotNil(s.OpenAPIVersionedService)
+	require.NotNil(t, s.StaticOpenAPISpec)
+	staticSpec, _, err := s.StaticOpenAPISpec.Get()
+	require.NoError(t, err)
+	oldSpec, err := json.Marshal(staticSpec)
+	require.NoError(t, err)
+	assert.Equal(oldSpec, body)
+
+	// verify we are able to update the served spec using the exposed service
+	newSpec := []byte(`{"swagger":"2.0","info":{"title":"Test Updated Generic API Server Swagger","version":"v0.1.0"},"paths":null}`)
+	swagger := new(spec.Swagger)
+	err = json.Unmarshal(newSpec, swagger)
+	assert.NoError(err)
+
+	err = s.OpenAPIVersionedService.UpdateSpec(swagger)
+	assert.NoError(err)
+
+	resp, err = http.Get(server.URL + "/openapi/v2")
+	assert.NoError(err)
+	defer resp.Body.Close()
+	assert.Equal(http.StatusOK, resp.StatusCode)
+
+	body, err = io.ReadAll(resp.Body)
+	assert.NoError(err)
+	assert.Equal(newSpec, body)
+}
+
 // TestCustomHandlerChain verifies the handler chain with custom handler chain builder functions.
 func TestCustomHandlerChain(t *testing.T) {
-	etcdserver, config, _ := setUp(t)
-	defer etcdserver.Terminate(t)
+	config, _ := setUp(t)
 
 	var protected, called bool
 
@@ -355,7 +457,7 @@ func TestCustomHandlerChain(t *testing.T) {
 		called = true
 	})
 
-	s, err := config.Complete(nil).New("test", EmptyDelegate)
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the server: %v", err)
 	}
@@ -394,23 +496,22 @@ func TestCustomHandlerChain(t *testing.T) {
 
 // TestNotRestRoutesHaveAuth checks that special non-routes are behind authz/authn.
 func TestNotRestRoutesHaveAuth(t *testing.T) {
-	etcdserver, config, _ := setUp(t)
-	defer etcdserver.Terminate(t)
+	config, _ := setUp(t)
 
 	authz := mockAuthorizer{}
 
 	config.LegacyAPIGroupPrefixes = sets.NewString("/apiPrefix")
-	config.Authorizer = &authz
+	config.Authorization.Authorizer = &authz
 
-	config.EnableSwaggerUI = true
 	config.EnableIndex = true
 	config.EnableProfiling = true
-	config.SwaggerConfig = DefaultSwaggerConfig()
 
 	kubeVersion := fakeVersion()
-	config.Version = &kubeVersion
+	binaryVersion := utilversion.MustParse(kubeVersion.String())
+	effectiveVersion := basecompatibility.NewEffectiveVersion(binaryVersion, false, binaryVersion, binaryVersion.SubtractMinor(1))
+	config.EffectiveVersion = effectiveVersion
 
-	s, err := config.Complete(nil).New("test", EmptyDelegate)
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the server: %v", err)
 	}
@@ -419,8 +520,8 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 		route string
 	}{
 		{"/"},
-		{"/swagger-ui/"},
 		{"/debug/pprof/"},
+		{"/debug/flags/"},
 		{"/version"},
 	} {
 		resp := httptest.NewRecorder()
@@ -437,41 +538,64 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 	}
 }
 
+func TestMuxAndDiscoveryCompleteSignals(t *testing.T) {
+	// setup
+	cfg, assert := setUp(t)
+
+	// scenario 1: single server with some signals
+	root, err := cfg.Complete(nil).New("rootServer", NewEmptyDelegate())
+	assert.NoError(err)
+	if len(root.MuxAndDiscoveryCompleteSignals()) != 0 {
+		assert.Error(fmt.Errorf("unexpected signals %v registered in the root server", root.MuxAndDiscoveryCompleteSignals()))
+	}
+	root.RegisterMuxAndDiscoveryCompleteSignal("rootTestSignal", make(chan struct{}))
+	if len(root.MuxAndDiscoveryCompleteSignals()) != 1 {
+		assert.Error(fmt.Errorf("unexpected signals %v registered in the root server", root.MuxAndDiscoveryCompleteSignals()))
+	}
+
+	// scenario 2: multiple servers with some signals
+	delegate, err := cfg.Complete(nil).New("delegateServer", NewEmptyDelegate())
+	assert.NoError(err)
+	delegate.RegisterMuxAndDiscoveryCompleteSignal("delegateTestSignal", make(chan struct{}))
+	if len(delegate.MuxAndDiscoveryCompleteSignals()) != 1 {
+		assert.Error(fmt.Errorf("unexpected signals %v registered in the delegate server", delegate.MuxAndDiscoveryCompleteSignals()))
+	}
+	newRoot, err := cfg.Complete(nil).New("newRootServer", delegate)
+	assert.NoError(err)
+	if len(newRoot.MuxAndDiscoveryCompleteSignals()) != 1 {
+		assert.Error(fmt.Errorf("unexpected signals %v registered in the newRoot server", newRoot.MuxAndDiscoveryCompleteSignals()))
+	}
+	newRoot.RegisterMuxAndDiscoveryCompleteSignal("newRootTestSignal", make(chan struct{}))
+	if len(newRoot.MuxAndDiscoveryCompleteSignals()) != 2 {
+		assert.Error(fmt.Errorf("unexpected signals %v registered in the newRoot server", newRoot.MuxAndDiscoveryCompleteSignals()))
+	}
+}
+
 type mockAuthorizer struct {
 	lastURI string
 }
 
-func (authz *mockAuthorizer) Authorize(a authorizer.Attributes) (authorized authorizer.Decision, reason string, err error) {
+func (authz *mockAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorized authorizer.Decision, reason string, err error) {
 	authz.lastURI = a.GetPath()
 	return authorizer.DecisionAllow, "", nil
 }
 
-type mockAuthenticator struct {
-	lastURI string
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (authz *mockAuthorizer) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(authz.Authorize(ctx, a))
 }
 
-func (authn *mockAuthenticator) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
-	authn.lastURI = req.RequestURI
-	return &user.DefaultInfo{
-		Name: "foo",
-	}, true, nil
-}
-
-func decodeResponse(resp *http.Response, obj interface{}) error {
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(data, obj); err != nil {
-		return err
-	}
-	return nil
+// EvaluateConditions is not supported by this authorizer.
+func (*mockAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
 }
 
 type testGetterStorage struct {
 	Version string
+}
+
+func (p *testGetterStorage) NamespaceScoped() bool {
+	return true
 }
 
 func (p *testGetterStorage) New() runtime.Object {
@@ -483,12 +607,23 @@ func (p *testGetterStorage) New() runtime.Object {
 	}
 }
 
-func (p *testGetterStorage) Get(ctx apirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+func (p *testGetterStorage) Destroy() {
+}
+
+func (p *testGetterStorage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return nil, nil
+}
+
+func (p *testGetterStorage) GetSingularName() string {
+	return "getter"
 }
 
 type testNoVerbsStorage struct {
 	Version string
+}
+
+func (p *testNoVerbsStorage) NamespaceScoped() bool {
+	return true
 }
 
 func (p *testNoVerbsStorage) New() runtime.Object {
@@ -500,11 +635,18 @@ func (p *testNoVerbsStorage) New() runtime.Object {
 	}
 }
 
+func (p *testNoVerbsStorage) Destroy() {
+}
+
+func (p *testNoVerbsStorage) GetSingularName() string {
+	return "noverb"
+}
+
 func fakeVersion() version.Info {
 	return version.Info{
 		Major:        "42",
 		Minor:        "42",
-		GitVersion:   "42",
+		GitVersion:   "42.42",
 		GitCommit:    "34973274ccef6ab4dfaaf86599792fa9c3fe4689",
 		GitTreeState: "Dirty",
 		BuildDate:    time.Now().String(),
@@ -516,33 +658,35 @@ func fakeVersion() version.Info {
 
 // TestGracefulShutdown verifies server shutdown after request handler finish.
 func TestGracefulShutdown(t *testing.T) {
-	etcdserver, config, _ := setUp(t)
-	defer etcdserver.Terminate(t)
+	config, _ := setUp(t)
 
 	var graceShutdown bool
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
 	config.BuildHandlerChainFunc = func(apiHandler http.Handler, c *Config) http.Handler {
-		handler := genericfilters.WithWaitGroup(apiHandler, c.RequestContextMapper, c.LongRunningFunc, c.HandlerChainWaitGroup)
-		handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver, c.RequestContextMapper)
-		handler = apirequest.WithRequestContext(handler, c.RequestContextMapper)
+		handler := genericfilters.WithWaitGroup(apiHandler, c.LongRunningFunc, c.NonLongRunningRequestWaitGroup)
+		handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 		return handler
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
+	if err != nil {
+		t.Fatalf("Error in bringing up the server: %v", err)
+	}
+
+	twoSecondHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		wg.Done()
 		time.Sleep(2 * time.Second)
 		w.WriteHeader(http.StatusOK)
 		graceShutdown = true
 	})
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
-	s, err := config.Complete(nil).New("test", EmptyDelegate)
-	if err != nil {
-		t.Fatalf("Error in bringing up the server: %v", err)
-	}
-
-	s.Handler.NonGoRestfulMux.Handle("/test", handler)
+	s.Handler.NonGoRestfulMux.Handle("/test", twoSecondHandler)
+	s.Handler.NonGoRestfulMux.Handle("/200", okHandler)
 
 	insecureServer := &http.Server{
 		Addr:    "0.0.0.0:0",
@@ -557,9 +701,9 @@ func TestGracefulShutdown(t *testing.T) {
 
 	// get port
 	serverPort := ln.Addr().(*net.TCPAddr).Port
-	err = RunServer(insecureServer, ln, 10*time.Second, stopCh)
+	stoppedCh, _, err := RunServer(insecureServer, ln, 10*time.Second, stopCh)
 	if err != nil {
-		t.Errorf("RunServer err: %v", err)
+		t.Fatalf("RunServer err: %v", err)
 	}
 
 	graceCh := make(chan struct{})
@@ -578,8 +722,15 @@ func TestGracefulShutdown(t *testing.T) {
 	// close stopCh after request sent to server to guarantee request handler is running.
 	wg.Wait()
 	close(stopCh)
+
+	time.Sleep(500 * time.Millisecond)
+	if _, err := http.Get("http://127.0.0.1:" + strconv.Itoa(serverPort) + "/200"); err == nil {
+		t.Errorf("Unexpected http success after stopCh was closed")
+	}
+
 	// wait for wait group handler finish
-	s.HandlerChainWaitGroup.Wait()
+	s.NonLongRunningRequestWaitGroup.Wait()
+	<-stoppedCh
 
 	// check server all handlers finished.
 	if !graceShutdown {
@@ -592,4 +743,94 @@ func TestGracefulShutdown(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Errorf("Timed out waiting for response.")
 	}
+}
+
+func TestWarningWithRequestTimeout(t *testing.T) {
+	type result struct {
+		err        interface{}
+		stackTrace string
+	}
+	clientDoneCh, resultCh := make(chan struct{}), make(chan result, 1)
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// this will catch recoverable panic like 'Header called after Handler finished'.
+		// go runtime crashes the program if it detects a program-ending
+		// panic like 'concurrent map iteration and map write', so this
+		// panic can not be caught.
+		defer func() {
+			result := result{}
+			result.err = recover()
+			if result.err != nil {
+				// Same as stdlib http server code. Manually allocate stack
+				// trace buffer size to prevent excessively large logs
+				const size = 64 << 10
+				buf := make([]byte, size)
+				buf = buf[:goruntime.Stack(buf, false)]
+				result.stackTrace = string(buf)
+			}
+			resultCh <- result
+		}()
+
+		// add warnings while we're waiting for the request to timeout to catch read/write races
+	loop:
+		for {
+			select {
+			case <-r.Context().Done():
+				break loop
+			default:
+				warning.AddWarning(r.Context(), "a", "1")
+			}
+		}
+		// the request has just timed out, write to catch read/write races
+		warning.AddWarning(r.Context(), "agent", "text")
+
+		// give time for the timeout response to be written, then try to
+		// write a response header to catch the "Header after Handler finished" panic
+		<-clientDoneCh
+
+		warning.AddWarning(r.Context(), "agent", "text")
+	})
+	handler := newGenericAPIServerHandlerChain(t, "/test", testHandler)
+
+	server := httptest.NewUnstartedServer(handler)
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	request, err := http.NewRequest("GET", server.URL+"/test?timeout=100ms", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	client := server.Client()
+	response, err := client.Do(request)
+	close(clientDoneCh)
+	if err != nil {
+		t.Errorf("expected server to return an HTTP response: %v", err)
+	}
+	if want := http.StatusGatewayTimeout; response == nil || response.StatusCode != want {
+		t.Errorf("expected server to return %d, but got: %v", want, response)
+	}
+
+	var resultGot result
+	select {
+	case resultGot = <-resultCh:
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Errorf("the handler never returned a result")
+	}
+	if resultGot.err != nil {
+		t.Errorf("Expected no panic, but got: %v", resultGot.err)
+		t.Errorf("Stack Trace: %s", resultGot.stackTrace)
+	}
+}
+
+// builds a handler chain with the given user handler as used by GenericAPIServer.
+func newGenericAPIServerHandlerChain(t *testing.T, path string, handler http.Handler) http.Handler {
+	config, _ := setUp(t)
+	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
+	if err != nil {
+		t.Fatalf("Error in bringing up the server: %v", err)
+	}
+
+	s.Handler.NonGoRestfulMux.Handle(path, handler)
+	return s.Handler
 }

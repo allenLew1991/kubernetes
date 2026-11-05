@@ -17,9 +17,17 @@ limitations under the License.
 package testing
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	kubetypes "k8s.io/apimachinery/pkg/types"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
@@ -31,22 +39,24 @@ type FakeRuntimeHelper struct {
 	HostName        string
 	HostDomain      string
 	PodContainerDir string
+	RuntimeHandlers map[string]kubecontainer.RuntimeHandler
 	Err             error
+	PodStats        map[kubetypes.UID]*statsapi.PodStats
 }
 
-func (f *FakeRuntimeHelper) GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string) (*kubecontainer.RunContainerOptions, error) {
+func (f *FakeRuntimeHelper) GenerateRunContainerOptions(_ context.Context, pod *v1.Pod, container *v1.Container, podIP string, podIPs []string, imageVolumes kubecontainer.ImageVolumes) (*kubecontainer.RunContainerOptions, func(), error) {
 	var opts kubecontainer.RunContainerOptions
 	if len(container.TerminationMessagePath) != 0 {
 		opts.PodContainerDir = f.PodContainerDir
 	}
-	return &opts, nil
+	return &opts, nil, nil
 }
 
 func (f *FakeRuntimeHelper) GetPodCgroupParent(pod *v1.Pod) string {
 	return ""
 }
 
-func (f *FakeRuntimeHelper) GetPodDNS(pod *v1.Pod) (*runtimeapi.DNSConfig, error) {
+func (f *FakeRuntimeHelper) GetPodDNS(_ context.Context, pod *v1.Pod) (*runtimeapi.DNSConfig, error) {
 	return &runtimeapi.DNSConfig{
 		Servers:  f.DNSServers,
 		Searches: f.DNSSearches,
@@ -54,7 +64,7 @@ func (f *FakeRuntimeHelper) GetPodDNS(pod *v1.Pod) (*runtimeapi.DNSConfig, error
 }
 
 // This is not used by docker runtime.
-func (f *FakeRuntimeHelper) GeneratePodHostNameAndDomain(pod *v1.Pod) (string, string, error) {
+func (f *FakeRuntimeHelper) GeneratePodHostNameAndDomain(logger klog.Logger, _ *v1.Pod) (string, string, error) {
 	return f.HostName, f.HostDomain, f.Err
 }
 
@@ -63,5 +73,73 @@ func (f *FakeRuntimeHelper) GetPodDir(podUID kubetypes.UID) string {
 }
 
 func (f *FakeRuntimeHelper) GetExtraSupplementalGroupsForPod(pod *v1.Pod) []int64 {
+	return nil
+}
+
+func (f *FakeRuntimeHelper) GetOrCreateUserNamespaceMappings(logger klog.Logger, pod *v1.Pod, runtimeHandler string) (*runtimeapi.UserNamespace, error) {
+	featureEnabled := utilfeature.DefaultFeatureGate.Enabled(features.UserNamespacesSupport)
+	if pod == nil || pod.Spec.HostUsers == nil {
+		return nil, nil
+	}
+	// pod.Spec.HostUsers is set to true/false
+	if !featureEnabled {
+		return nil, fmt.Errorf("the feature gate %q is disabled: can't set spec.HostUsers", features.UserNamespacesSupport)
+	}
+	if *pod.Spec.HostUsers {
+		return nil, nil
+	}
+
+	// From here onwards, hostUsers=false and the feature gate is enabled.
+
+	// if the pod requested a user namespace and the runtime doesn't support user namespaces then return an error.
+	if h, ok := f.RuntimeHandlers[runtimeHandler]; !ok {
+		return nil, fmt.Errorf("RuntimeClass handler %q not found", runtimeHandler)
+	} else if !h.SupportsUserNamespaces {
+		return nil, fmt.Errorf("RuntimeClass handler %q does not support user namespaces", runtimeHandler)
+	}
+
+	ids := &runtimeapi.IDMapping{
+		HostId:      65536,
+		ContainerId: 0,
+		Length:      65536,
+	}
+
+	return &runtimeapi.UserNamespace{
+		Mode: runtimeapi.NamespaceMode_POD,
+		Uids: []*runtimeapi.IDMapping{ids},
+		Gids: []*runtimeapi.IDMapping{ids},
+	}, nil
+}
+
+func (f *FakeRuntimeHelper) PrepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
+	return nil
+}
+
+func (f *FakeRuntimeHelper) UnprepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
+	return nil
+}
+
+func (f *FakeRuntimeHelper) RequestPodReinspect(_ kubetypes.UID) {
+	// Not implemented.
+}
+
+func (f *FakeRuntimeHelper) RequestPodRelist(_ kubetypes.UID) {
+	// Not implemented.
+}
+
+func (f *FakeRuntimeHelper) PodCPUAndMemoryStats(_ context.Context, pod *v1.Pod, _ *kubecontainer.PodStatus) (*statsapi.PodStats, error) {
+	if stats, ok := f.PodStats[pod.UID]; ok {
+		return stats, nil
+	}
+	return nil, fmt.Errorf("stats for pod %q not found", pod.UID)
+}
+
+func (f *FakeRuntimeHelper) OnPodSandboxReady(_ context.Context, _ *v1.Pod) error {
+	// Not implemented
+	return nil
+}
+
+// ResizeEphemeralVolume is not implemented
+func (f *FakeRuntimeHelper) ResizeEphemeralVolume(pod *v1.Pod, volumeName string, newSize *resource.Quantity) error {
 	return nil
 }

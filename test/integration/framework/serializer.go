@@ -21,14 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/versioning"
 )
 
-// NewSingleContentTypeSerializer wraps a serializer in a NegotiatedSerializer that handles one content type
-func NewSingleContentTypeSerializer(scheme *runtime.Scheme, info runtime.SerializerInfo) runtime.StorageSerializer {
-	return &wrappedSerializer{
-		scheme: scheme,
-		info:   info,
-	}
-}
-
 type wrappedSerializer struct {
 	scheme *runtime.Scheme
 	info   runtime.SerializerInfo
@@ -45,9 +37,9 @@ func (s *wrappedSerializer) UniversalDeserializer() runtime.Decoder {
 }
 
 func (s *wrappedSerializer) EncoderForVersion(encoder runtime.Encoder, gv runtime.GroupVersioner) runtime.Encoder {
-	return versioning.NewCodec(encoder, nil, s.scheme, s.scheme, s.scheme, s.scheme, gv, nil)
+	return versioning.NewCodec(encoder, nil, s.scheme, s.scheme, s.scheme, s.scheme, gv, nil, s.scheme.Name())
 }
 
 func (s *wrappedSerializer) DecoderToVersion(decoder runtime.Decoder, gv runtime.GroupVersioner) runtime.Decoder {
-	return versioning.NewCodec(nil, decoder, s.scheme, s.scheme, s.scheme, s.scheme, nil, gv)
+	return versioning.NewCodec(nil, decoder, s.scheme, s.scheme, s.scheme, s.scheme, nil, gv, s.scheme.Name())
 }

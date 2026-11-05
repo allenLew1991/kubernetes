@@ -17,26 +17,27 @@ limitations under the License.
 package proxy
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/streaming/pkg/httpstream"
 
-	"github.com/golang/glog"
 	"github.com/mxk/go-flowrate/flowrate"
+
+	"k8s.io/klog/v2"
 )
 
 // UpgradeRequestRoundTripper provides an additional method to decorate a request
@@ -59,6 +60,8 @@ type UpgradeAwareHandler struct {
 	// Location is the location of the upstream proxy. It is used as the location to Dial on the upstream server
 	// for upgrade requests unless UseRequestLocationOnUpgrade is true.
 	Location *url.URL
+	// AppendLocationPath determines if the original path of the Location should be appended to the upstream proxy request path
+	AppendLocationPath bool
 	// Transport provides an optional round tripper to use to proxy. If nil, the default proxy transport is used
 	Transport http.RoundTripper
 	// UpgradeTransport, if specified, will be used as the backend transport when upgrade requests are provided.
@@ -66,17 +69,22 @@ type UpgradeAwareHandler struct {
 	UpgradeTransport UpgradeRequestRoundTripper
 	// WrapTransport indicates whether the provided Transport should be wrapped with default proxy transport behavior (URL rewriting, X-Forwarded-* header setting)
 	WrapTransport bool
-	// InterceptRedirects determines whether the proxy should sniff backend responses for redirects,
-	// following them as necessary.
-	InterceptRedirects bool
 	// UseRequestLocation will use the incoming request URL when talking to the backend server.
 	UseRequestLocation bool
+	// UseLocationHost overrides the HTTP host header in requests to the backend server to use the Host from Location.
+	// This will override the req.Host field of a request, while UseRequestLocation will override the req.URL field
+	// of a request. The req.URL.Host specifies the server to connect to, while the req.Host field
+	// specifies the Host header value to send in the HTTP request. If this is false, the incoming req.Host header will
+	// just be forwarded to the backend server.
+	UseLocationHost bool
 	// FlushInterval controls how often the standard HTTP proxy will flush content from the upstream.
 	FlushInterval time.Duration
 	// MaxBytesPerSec controls the maximum rate for an upstream connection. No rate is imposed if the value is zero.
 	MaxBytesPerSec int64
 	// Responder is passed errors that occur while setting up proxying.
 	Responder ErrorResponder
+	// Reject to forward redirect response
+	RejectForwardingRedirects bool
 }
 
 const defaultFlushInterval = 200 * time.Millisecond
@@ -140,7 +148,7 @@ func (onewayRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{
 		Status:     "200 OK",
 		StatusCode: http.StatusOK,
-		Body:       ioutil.NopCloser(&bytes.Buffer{}),
+		Body:       io.NopCloser(&bytes.Buffer{}),
 		Request:    req,
 	}, nil
 }
@@ -181,6 +189,26 @@ func NewUpgradeAwareHandler(location *url.URL, transport http.RoundTripper, wrap
 	}
 }
 
+func proxyRedirectsforRootPath(path string, w http.ResponseWriter, req *http.Request) bool {
+	redirect := false
+	method := req.Method
+
+	// From pkg/genericapiserver/endpoints/handlers/proxy.go#ServeHTTP:
+	// Redirect requests with an empty path to a location that ends with a '/'
+	// This is essentially a hack for https://issue.k8s.io/4958.
+	// Note: Keep this code after tryUpgrade to not break that flow.
+	if len(path) == 0 && (method == http.MethodGet || method == http.MethodHead) {
+		var queryPart string
+		if len(req.URL.RawQuery) > 0 {
+			queryPart = "?" + req.URL.RawQuery
+		}
+		w.Header().Set("Location", req.URL.Path+"/"+queryPart)
+		w.WriteHeader(http.StatusMovedPermanently)
+		redirect = true
+	}
+	return redirect
+}
+
 // ServeHTTP handles the proxy request
 func (h *UpgradeAwareHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if h.tryUpgrade(w, req) {
@@ -200,17 +228,8 @@ func (h *UpgradeAwareHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 		loc.Path += "/"
 	}
 
-	// From pkg/genericapiserver/endpoints/handlers/proxy.go#ServeHTTP:
-	// Redirect requests with an empty path to a location that ends with a '/'
-	// This is essentially a hack for http://issue.k8s.io/4958.
-	// Note: Keep this code after tryUpgrade to not break that flow.
-	if len(loc.Path) == 0 {
-		var queryPart string
-		if len(req.URL.RawQuery) > 0 {
-			queryPart = "?" + req.URL.RawQuery
-		}
-		w.Header().Set("Location", req.URL.Path+"/"+queryPart)
-		w.WriteHeader(http.StatusMovedPermanently)
+	proxyRedirect := proxyRedirectsforRootPath(loc.Path, w, req)
+	if proxyRedirect {
 		return
 	}
 
@@ -218,23 +237,79 @@ func (h *UpgradeAwareHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 		h.Transport = h.defaultProxyTransport(req.URL, h.Transport)
 	}
 
-	// WithContext creates a shallow clone of the request with the new context.
-	newReq := req.WithContext(context.Background())
+	// WithContext creates a shallow clone of the request with the same context.
+	newReq := req.WithContext(req.Context())
 	newReq.Header = utilnet.CloneHeader(req.Header)
 	if !h.UseRequestLocation {
 		newReq.URL = &loc
 	}
+	if h.UseLocationHost {
+		// exchanging req.Host with the backend location is necessary for backends that act on the HTTP host header (e.g. API gateways),
+		// because req.Host has preference over req.URL.Host in filling this header field
+		newReq.Host = h.Location.Host
+	}
 
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: h.Location.Scheme, Host: h.Location.Host})
+	// create the target location to use for the reverse proxy
+	reverseProxyLocation := &url.URL{Scheme: h.Location.Scheme, Host: h.Location.Host}
+	if h.AppendLocationPath {
+		reverseProxyLocation.Path = h.Location.Path
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(reverseProxyLocation)
 	proxy.Transport = h.Transport
 	proxy.FlushInterval = h.FlushInterval
+	proxy.ErrorLog = log.New(noSuppressPanicError{}, "", log.LstdFlags)
+	if h.RejectForwardingRedirects {
+		oldModifyResponse := proxy.ModifyResponse
+		proxy.ModifyResponse = func(response *http.Response) error {
+			code := response.StatusCode
+			if code >= 300 && code <= 399 && len(response.Header.Get("Location")) > 0 {
+				// close the original response
+				response.Body.Close()
+				msg := "the backend attempted to redirect this request, which is not permitted"
+				// replace the response
+				*response = http.Response{
+					StatusCode:    http.StatusBadGateway,
+					Status:        fmt.Sprintf("%d %s", response.StatusCode, http.StatusText(response.StatusCode)),
+					Body:          io.NopCloser(strings.NewReader(msg)),
+					ContentLength: int64(len(msg)),
+				}
+			} else {
+				if oldModifyResponse != nil {
+					if err := oldModifyResponse(response); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+	}
+	if h.Responder != nil {
+		// if an optional error interceptor/responder was provided wire it
+		// the custom responder might be used for providing a unified error reporting
+		// or supporting retry mechanisms by not sending non-fatal errors to the clients
+		proxy.ErrorHandler = h.Responder.Error
+	}
 	proxy.ServeHTTP(w, newReq)
+}
+
+type noSuppressPanicError struct{}
+
+func (noSuppressPanicError) Write(p []byte) (n int, err error) {
+	// skip "suppressing panic for copyResponse error in test; copy error" error message
+	// that ends up in CI tests on each kube-apiserver termination as noise and
+	// everybody thinks this is fatal.
+	if strings.Contains(string(p), "suppressing panic") {
+		return len(p), nil
+	}
+	return os.Stderr.Write(p)
 }
 
 // tryUpgrade returns true if the request was handled.
 func (h *UpgradeAwareHandler) tryUpgrade(w http.ResponseWriter, req *http.Request) bool {
+	logger := klog.FromContext(req.Context())
 	if !httpstream.IsUpgradeRequest(req) {
-		glog.V(6).Infof("Request was not an upgrade")
+		logger.V(6).Info("Request was not an upgrade")
 		return false
 	}
 
@@ -249,54 +324,97 @@ func (h *UpgradeAwareHandler) tryUpgrade(w http.ResponseWriter, req *http.Reques
 		location = *req.URL
 		location.Scheme = h.Location.Scheme
 		location.Host = h.Location.Host
+		if h.AppendLocationPath {
+			location.Path = singleJoiningSlash(h.Location.Path, location.Path)
+		}
 	}
 
 	clone := utilnet.CloneRequest(req)
 	// Only append X-Forwarded-For in the upgrade path, since httputil.NewSingleHostReverseProxy
 	// handles this in the non-upgrade path.
 	utilnet.AppendForwardedForHeader(clone)
-	if h.InterceptRedirects {
-		glog.V(6).Infof("Connecting to backend proxy (intercepting redirects) %s\n  Headers: %v", &location, clone.Header)
-		backendConn, rawResponse, err = utilnet.ConnectWithRedirects(req.Method, &location, clone.Header, req.Body, utilnet.DialerFunc(h.DialForUpgrade))
-	} else {
-		glog.V(6).Infof("Connecting to backend proxy (direct dial) %s\n  Headers: %v", &location, clone.Header)
-		clone.URL = &location
-		backendConn, err = h.DialForUpgrade(clone)
+	logger.V(6).Info("Connecting to backend proxy (direct dial)", "location", &location, "headers", clone.Header)
+	if h.UseLocationHost {
+		clone.Host = h.Location.Host
 	}
+	clone.URL = &location
+	logger.V(6).Info("UpgradeAwareProxy: dialing for SPDY upgrade with headers", "headers", clone.Header)
+	backendConn, err = h.DialForUpgrade(clone)
 	if err != nil {
-		glog.V(6).Infof("Proxy connection error: %v", err)
+		logger.V(6).Info("Proxy connection error", "err", err)
 		h.Responder.Error(w, req, err)
 		return true
 	}
 	defer backendConn.Close()
 
+	// determine the http response code from the backend by reading from rawResponse+backendConn
+	backendHTTPResponse, headerBytes, err := getResponse(io.MultiReader(bytes.NewReader(rawResponse), backendConn))
+	if err != nil {
+		logger.V(6).Info("Proxy connection error", "err", err)
+		h.Responder.Error(w, req, err)
+		return true
+	}
+	if len(headerBytes) > len(rawResponse) {
+		// we read beyond the bytes stored in rawResponse, update rawResponse to the full set of bytes read from the backend
+		rawResponse = headerBytes
+	}
+
+	// If the backend did not upgrade the request, return an error to the client. If the response was
+	// an error, the error is forwarded directly after the connection is hijacked. Otherwise, just
+	// return a generic error here.
+	if backendHTTPResponse.StatusCode != http.StatusSwitchingProtocols && backendHTTPResponse.StatusCode < 400 {
+		err := fmt.Errorf("invalid upgrade response: status code %d", backendHTTPResponse.StatusCode)
+		logger.Error(err, "Proxy upgrade error")
+		h.Responder.Error(w, req, err)
+		return true
+	}
+
 	// Once the connection is hijacked, the ErrorResponder will no longer work, so
 	// hijacking should be the last step in the upgrade.
 	requestHijacker, ok := w.(http.Hijacker)
 	if !ok {
-		glog.V(6).Infof("Unable to hijack response writer: %T", w)
+		logger.Error(nil, "Unable to hijack response writer", "type", fmt.Sprintf("%T", w))
 		h.Responder.Error(w, req, fmt.Errorf("request connection cannot be hijacked: %T", w))
 		return true
 	}
 	requestHijackedConn, _, err := requestHijacker.Hijack()
 	if err != nil {
-		glog.V(6).Infof("Unable to hijack response: %v", err)
+		logger.Error(err, "Unable to hijack response")
 		h.Responder.Error(w, req, fmt.Errorf("error hijacking connection: %v", err))
 		return true
 	}
 	defer requestHijackedConn.Close()
 
+	if backendHTTPResponse.StatusCode != http.StatusSwitchingProtocols {
+		// If the backend did not upgrade the request, echo the response from the backend to the client and return, closing the connection.
+		logger.V(6).Info("Proxy upgrade error", "statusCode", backendHTTPResponse.StatusCode)
+		// set read/write deadlines
+		deadline := time.Now().Add(10 * time.Second)
+		backendConn.SetReadDeadline(deadline)
+		requestHijackedConn.SetWriteDeadline(deadline)
+		// write the response to the client
+		err := backendHTTPResponse.Write(requestHijackedConn)
+		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			logger.Error(err, "Error proxying data from backend to client")
+		}
+		// Indicate we handled the request
+		return true
+	}
+
 	// Forward raw response bytes back to client.
 	if len(rawResponse) > 0 {
-		glog.V(6).Infof("Writing %d bytes to hijacked connection", len(rawResponse))
+		logger.V(6).Info("Writing to hijacked connection", "length", len(rawResponse))
 		if _, err = requestHijackedConn.Write(rawResponse); err != nil {
-			utilruntime.HandleError(fmt.Errorf("Error proxying response from backend to client: %v", err))
+			utilruntime.HandleErrorWithLogger(logger, err, "Error proxying response from backend to client")
 		}
 	}
 
-	// Proxy the connection.
-	wg := &sync.WaitGroup{}
-	wg.Add(2)
+	// Proxy the connection. This is bidirectional, so we need a goroutine
+	// to copy in each direction. Once one side of the connection exits, we
+	// exit the function which performs cleanup and in the process closes
+	// the other half of the connection in the defer.
+	writerComplete := make(chan struct{})
+	readerComplete := make(chan struct{})
 
 	go func() {
 		var writer io.WriteCloser
@@ -307,9 +425,9 @@ func (h *UpgradeAwareHandler) tryUpgrade(w http.ResponseWriter, req *http.Reques
 		}
 		_, err := io.Copy(writer, requestHijackedConn)
 		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			glog.Errorf("Error proxying data from client to backend: %v", err)
+			logger.Error(err, "Error proxying data from client to backend")
 		}
-		wg.Done()
+		close(writerComplete)
 	}()
 
 	go func() {
@@ -321,17 +439,34 @@ func (h *UpgradeAwareHandler) tryUpgrade(w http.ResponseWriter, req *http.Reques
 		}
 		_, err := io.Copy(requestHijackedConn, reader)
 		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			glog.Errorf("Error proxying data from backend to client: %v", err)
+			logger.Error(err, "Error proxying data from backend to client")
 		}
-		wg.Done()
+		close(readerComplete)
 	}()
 
-	wg.Wait()
+	// Wait for one half the connection to exit. Once it does the defer will
+	// clean up the other half of the connection.
+	select {
+	case <-writerComplete:
+	case <-readerComplete:
+	}
+	logger.V(6).Info("Disconnecting from backend proxy", "location", &location, "headers", clone.Header)
+
 	return true
 }
 
-func (h *UpgradeAwareHandler) Dial(req *http.Request) (net.Conn, error) {
-	return dial(req, h.Transport)
+// FIXME: Taken from net/http/httputil/reverseproxy.go as singleJoiningSlash is not exported to be re-used.
+// See-also: https://github.com/golang/go/issues/44290
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
 
 func (h *UpgradeAwareHandler) DialForUpgrade(req *http.Request) (net.Conn, error) {
@@ -345,9 +480,22 @@ func (h *UpgradeAwareHandler) DialForUpgrade(req *http.Request) (net.Conn, error
 	return dial(updatedReq, h.UpgradeTransport)
 }
 
+// getResponseCode reads a http response from the given reader, returns the response,
+// the bytes read from the reader, and any error encountered
+func getResponse(r io.Reader) (*http.Response, []byte, error) {
+	rawResponse := bytes.NewBuffer(make([]byte, 0, 256))
+	// Save the bytes read while reading the response headers into the rawResponse buffer
+	resp, err := http.ReadResponse(bufio.NewReader(io.TeeReader(r, rawResponse)), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	// return the http response and the raw bytes consumed from the reader in the process
+	return resp, rawResponse.Bytes(), nil
+}
+
 // dial dials the backend at req.URL and writes req to it.
 func dial(req *http.Request, transport http.RoundTripper) (net.Conn, error) {
-	conn, err := DialURL(req.URL, transport)
+	conn, err := DialURL(req.Context(), req.URL, transport)
 	if err != nil {
 		return nil, fmt.Errorf("error dialing backend: %v", err)
 	}
@@ -359,8 +507,6 @@ func dial(req *http.Request, transport http.RoundTripper) (net.Conn, error) {
 
 	return conn, err
 }
-
-var _ utilnet.Dialer = &UpgradeAwareHandler{}
 
 func (h *UpgradeAwareHandler) defaultProxyTransport(url *url.URL, internalTransport http.RoundTripper) http.RoundTripper {
 	scheme := url.Scheme

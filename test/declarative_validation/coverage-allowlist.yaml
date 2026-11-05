@@ -1,0 +1,23 @@
+# Suppressions for declarative-validation coverage.
+#
+# Every field is required, empty is rejected at load time so an entry can never silently overexclude.
+#   - apiVersion matches by literal equality (in the "<group>/<version>" form, or just "<version>" for core or wildcard equality with "*/*")
+#   - path matches by literal equality or wildcard with "*" or glob prefix with "*..."
+#   - kind/errorType/origin match literally or wildcard with "*" or glob prefix with "*..."
+#
+# Example:
+#   - apiVersion: autoscaling/v1   # one specific rule
+#     kind: Scale
+#     path: spec.replicas
+#     errorType: FieldValueInvalid
+#     origin: minimum
+#     reason: tested separately
+#
+# Run hack/update-codegen.sh after editing.
+
+- apiVersion: extensions/v1beta1
+  kind: '*'
+  path: '*'
+  errorType: '*'
+  origin: '*'
+  reason: Not served by kube-apiserver.

@@ -18,6 +18,8 @@ package fieldpath
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -26,12 +28,26 @@ import (
 
 // FormatMap formats map[string]string to a string.
 func FormatMap(m map[string]string) (fmtStr string) {
-	for key, value := range m {
-		fmtStr += fmt.Sprintf("%v=%q\n", key, value)
+	// output with keys in sorted order to provide stable output
+	keys := make([]string, 0, len(m))
+	var grow int
+	for k, v := range m {
+		keys = append(keys, k)
+		// why add 4: (for =, \n, " and ")
+		grow += len(k) + len(v) + 4
 	}
-	fmtStr = strings.TrimSuffix(fmtStr, "\n")
-
-	return
+	sort.Strings(keys)
+	// allocate space to avoid expansion
+	dst := make([]byte, 0, grow)
+	for _, key := range keys {
+		if len(dst) > 0 {
+			dst = append(dst, '\n')
+		}
+		dst = append(dst, key...)
+		dst = append(dst, '=')
+		dst = strconv.AppendQuote(dst, m[key])
+	}
+	return string(dst)
 }
 
 // ExtractFieldPathAsString extracts the field from the given object
@@ -40,7 +56,7 @@ func FormatMap(m map[string]string) (fmtStr string) {
 func ExtractFieldPathAsString(obj interface{}, fieldPath string) (string, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	if path, subscript, ok := SplitMaybeSubscriptedPath(fieldPath); ok {
@@ -78,15 +94,16 @@ func ExtractFieldPathAsString(obj interface{}, fieldPath string) (string, error)
 
 // SplitMaybeSubscriptedPath checks whether the specified fieldPath is
 // subscripted, and
-//  - if yes, this function splits the fieldPath into path and subscript, and
-//    returns (path, subscript, true).
-//  - if no, this function returns (fieldPath, "", false).
+//   - if yes, this function splits the fieldPath into path and subscript, and
+//     returns (path, subscript, true).
+//   - if no, this function returns (fieldPath, "", false).
 //
 // Example inputs and outputs:
-//  - "metadata.annotations['myKey']" --> ("metadata.annotations", "myKey", true)
-//  - "metadata.annotations['a[b]c']" --> ("metadata.annotations", "a[b]c", true)
-//  - "metadata.labels['']"           --> ("metadata.labels", "", true)
-//  - "metadata.labels"               --> ("metadata.labels", "", false)
+//
+//	"metadata.annotations['myKey']" --> ("metadata.annotations", "myKey", true)
+//	"metadata.annotations['a[b]c']" --> ("metadata.annotations", "a[b]c", true)
+//	"metadata.labels['']"           --> ("metadata.labels", "", true)
+//	"metadata.labels"               --> ("metadata.labels", "", false)
 func SplitMaybeSubscriptedPath(fieldPath string) (string, string, bool) {
 	if !strings.HasSuffix(fieldPath, "']") {
 		return fieldPath, "", false

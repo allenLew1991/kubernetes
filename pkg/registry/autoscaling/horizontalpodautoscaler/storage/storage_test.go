@@ -19,9 +19,12 @@ package storage
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	api "k8s.io/kubernetes/pkg/apis/core"
+
 	// Ensure that autoscaling/v1 package is initialized.
 	_ "k8s.io/api/autoscaling/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -29,11 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	"k8s.io/apiserver/pkg/registry/rest"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 )
 
-func newStorage(t *testing.T) (*REST, *StatusREST, *etcdtesting.EtcdTestServer) {
+func newStorage(t *testing.T) (*REST, *StatusREST, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, autoscaling.GroupName)
 	restOptions := generic.RESTOptions{
 		StorageConfig:           etcdStorage,
@@ -41,7 +45,10 @@ func newStorage(t *testing.T) (*REST, *StatusREST, *etcdtesting.EtcdTestServer) 
 		DeleteCollectionWorkers: 1,
 		ResourcePrefix:          "horizontalpodautoscalers",
 	}
-	horizontalPodAutoscalerStorage, statusStorage := NewREST(restOptions)
+	horizontalPodAutoscalerStorage, statusStorage, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return horizontalPodAutoscalerStorage, statusStorage, server
 }
 
@@ -63,7 +70,10 @@ func validNewHorizontalPodAutoscaler(name string) *autoscaling.HorizontalPodAuto
 					Type: autoscaling.ResourceMetricSourceType,
 					Resource: &autoscaling.ResourceMetricSource{
 						Name: api.ResourceCPU,
-						TargetAverageUtilization: &cpu,
+						Target: autoscaling.MetricTarget{
+							Type:               autoscaling.UtilizationMetricType,
+							AverageUtilization: &cpu,
+						},
 					},
 				},
 			},
@@ -166,4 +176,42 @@ func TestCategories(t *testing.T) {
 	registrytest.AssertCategories(t, storage, expected)
 }
 
-// TODO TestUpdateStatus
+func TestUpdateStatus(t *testing.T) {
+	storage, statusStorage, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+	statusCtx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault, "status")
+	key, _ := storage.KeyFunc(ctx, "foo")
+	autoscalerStart := validNewHorizontalPodAutoscaler("foo")
+	err := storage.Storage.Create(ctx, key, autoscalerStart, nil, 0, false)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	autoscalerIn := &autoscaling.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Status: autoscaling.HorizontalPodAutoscalerStatus{
+			Conditions: []autoscaling.HorizontalPodAutoscalerCondition{
+				{Status: "True"},
+			},
+		},
+	}
+
+	_, _, err = statusStorage.Update(statusCtx, autoscalerIn.Name, rest.DefaultUpdatedObjectInfo(autoscalerIn), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	obj, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	autoscalerOut := obj.(*autoscaling.HorizontalPodAutoscaler)
+	// only compare the meaningful update b/c we can't compare due to metadata
+	if !apiequality.Semantic.DeepEqual(autoscalerIn.Status, autoscalerOut.Status) {
+		t.Errorf("unexpected object: %s", cmp.Diff(autoscalerIn, autoscalerOut))
+	}
+}

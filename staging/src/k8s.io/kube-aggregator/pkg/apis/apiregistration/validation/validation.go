@@ -17,22 +17,28 @@ limitations under the License.
 package validation
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/api/validation"
-	"k8s.io/apimachinery/pkg/api/validation/path"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 
 	"k8s.io/kube-aggregator/pkg/apis/apiregistration"
 )
 
-func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList {
+// ValidateAPIService validates that the APIService is correctly defined.
+func ValidateAPIService(ctx context.Context, apiService *apiregistration.APIService) field.ErrorList {
 	requiredName := apiService.Spec.Version + "." + apiService.Spec.Group
 
-	allErrs := validation.ValidateObjectMeta(&apiService.ObjectMeta, false,
+	allErrs := validation.ValidateObjectMetaDeclaratively(ctx, operation.Create, &apiService.ObjectMeta, nil, false,
 		func(name string, prefix bool) []string {
-			if minimalFailures := path.IsValidPathSegmentName(name); len(minimalFailures) > 0 {
+			if minimalFailures := content.IsPathSegmentName(name); len(minimalFailures) > 0 {
 				return minimalFailures
 			}
 			// the name *must* be version.group
@@ -42,7 +48,8 @@ func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList 
 
 			return []string{}
 		},
-		field.NewPath("metadata"))
+		field.NewPath("metadata"),
+		utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta))
 
 	// in this case we allow empty group
 	if len(apiService.Spec.Group) == 0 && apiService.Spec.Version != "v1" {
@@ -81,6 +88,9 @@ func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList 
 	if len(apiService.Spec.Service.Name) == 0 {
 		allErrs = append(allErrs, field.Required(field.NewPath("spec", "service", "name"), ""))
 	}
+	if errs := utilvalidation.IsValidPortNum(int(apiService.Spec.Service.Port)); errs != nil {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "service", "port"), apiService.Spec.Service.Port, "port is not valid: "+strings.Join(errs, ", ")))
+	}
 	if apiService.Spec.InsecureSkipTLSVerify && len(apiService.Spec.CABundle) > 0 {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "insecureSkipTLSVerify"), apiService.Spec.InsecureSkipTLSVerify, "may not be true if caBundle is present"))
 	}
@@ -88,13 +98,15 @@ func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList 
 	return allErrs
 }
 
-func ValidateAPIServiceUpdate(newAPIService *apiregistration.APIService, oldAPIService *apiregistration.APIService) field.ErrorList {
-	allErrs := validation.ValidateObjectMetaUpdate(&newAPIService.ObjectMeta, &oldAPIService.ObjectMeta, field.NewPath("metadata"))
-	allErrs = append(allErrs, ValidateAPIService(newAPIService)...)
+// ValidateAPIServiceUpdate validates an update of APIService.
+func ValidateAPIServiceUpdate(ctx context.Context, newAPIService *apiregistration.APIService, oldAPIService *apiregistration.APIService) field.ErrorList {
+	allErrs := validation.ValidateObjectMetaDeclaratively(ctx, operation.Update, &newAPIService.ObjectMeta, &oldAPIService.ObjectMeta, false, nil, field.NewPath("metadata"), utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta))
+	allErrs = append(allErrs, ValidateAPIService(ctx, newAPIService)...)
 
 	return allErrs
 }
 
+// ValidateAPIServiceStatus validates that the APIService status is one of 'True', 'False' or 'Unknown'.
 func ValidateAPIServiceStatus(status *apiregistration.APIServiceStatus, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
@@ -110,8 +122,9 @@ func ValidateAPIServiceStatus(status *apiregistration.APIServiceStatus, fldPath 
 	return allErrs
 }
 
-func ValidateAPIServiceStatusUpdate(newAPIService *apiregistration.APIService, oldAPIService *apiregistration.APIService) field.ErrorList {
-	allErrs := validation.ValidateObjectMetaUpdate(&newAPIService.ObjectMeta, &oldAPIService.ObjectMeta, field.NewPath("metadata"))
+// ValidateAPIServiceStatusUpdate validates an update of the status field of APIService.
+func ValidateAPIServiceStatusUpdate(ctx context.Context, newAPIService *apiregistration.APIService, oldAPIService *apiregistration.APIService) field.ErrorList {
+	allErrs := validation.ValidateObjectMetaDeclaratively(ctx, operation.Update, &newAPIService.ObjectMeta, &oldAPIService.ObjectMeta, false, nil, field.NewPath("metadata"), utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta))
 	allErrs = append(allErrs, ValidateAPIServiceStatus(&newAPIService.Status, field.NewPath("status"))...)
 	return allErrs
 }

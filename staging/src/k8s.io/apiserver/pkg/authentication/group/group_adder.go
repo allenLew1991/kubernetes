@@ -36,15 +36,22 @@ func NewGroupAdder(auth authenticator.Request, groups []string) authenticator.Re
 	return &GroupAdder{auth, groups}
 }
 
-func (g *GroupAdder) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
-	u, ok, err := g.Authenticator.AuthenticateRequest(req)
+func (g *GroupAdder) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
+	r, ok, err := g.Authenticator.AuthenticateRequest(req)
 	if err != nil || !ok {
 		return nil, ok, err
 	}
-	return &user.DefaultInfo{
-		Name:   u.GetName(),
-		UID:    u.GetUID(),
-		Groups: append(u.GetGroups(), g.Groups...),
-		Extra:  u.GetExtra(),
-	}, true, nil
+
+	newGroups := make([]string, 0, len(r.User.GetGroups())+len(g.Groups))
+	newGroups = append(newGroups, r.User.GetGroups()...)
+	newGroups = append(newGroups, g.Groups...)
+
+	ret := *r // shallow copy
+	ret.User = &user.DefaultInfo{
+		Name:   r.User.GetName(),
+		UID:    r.User.GetUID(),
+		Groups: newGroups,
+		Extra:  r.User.GetExtra(),
+	}
+	return &ret, true, nil
 }

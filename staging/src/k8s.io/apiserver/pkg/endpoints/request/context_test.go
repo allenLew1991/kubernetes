@@ -14,21 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package request_test
+package request
 
 import (
+	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/authentication/user"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
 
 // TestNamespaceContext validates that a namespace can be get/set on a context object
 func TestNamespaceContext(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
-	result, ok := genericapirequest.NamespaceFrom(ctx)
+	ctx := NewDefaultContext()
+	result, ok := NamespaceFrom(ctx)
 	if !ok {
 		t.Fatalf("Error getting namespace")
 	}
@@ -36,21 +36,21 @@ func TestNamespaceContext(t *testing.T) {
 		t.Fatalf("Expected: %s, Actual: %s", metav1.NamespaceDefault, result)
 	}
 
-	ctx = genericapirequest.NewContext()
-	result, ok = genericapirequest.NamespaceFrom(ctx)
+	ctx = NewContext()
+	_, ok = NamespaceFrom(ctx)
 	if ok {
 		t.Fatalf("Should not be ok because there is no namespace on the context")
 	}
 }
 
-//TestUserContext validates that a userinfo can be get/set on a context object
+// TestUserContext validates that a userinfo can be get/set on a context object
 func TestUserContext(t *testing.T) {
-	ctx := genericapirequest.NewContext()
-	_, ok := genericapirequest.UserFrom(ctx)
+	ctx := NewContext()
+	_, ok := UserFrom(ctx)
 	if ok {
 		t.Fatalf("Should not be ok because there is no user.Info on the context")
 	}
-	ctx = genericapirequest.WithUser(
+	ctx = WithUser(
 		ctx,
 		&user.DefaultInfo{
 			Name:   "bob",
@@ -60,7 +60,7 @@ func TestUserContext(t *testing.T) {
 		},
 	)
 
-	result, ok := genericapirequest.UserFrom(ctx)
+	result, ok := UserFrom(ctx)
 	if !ok {
 		t.Fatalf("Error getting user info")
 	}
@@ -91,44 +91,76 @@ func TestUserContext(t *testing.T) {
 	} else if actualExtra[expectedExtraKey][0] != expectedExtraValue {
 		t.Fatalf("Get user extra map value error, Expected: %s, Actual: %s", expectedExtraValue, actualExtra[expectedExtraKey])
 	}
-
 }
 
-//TestUIDContext validates that a UID can be get/set on a context object
-func TestUIDContext(t *testing.T) {
-	ctx := genericapirequest.NewContext()
-	_, ok := genericapirequest.UIDFrom(ctx)
-	if ok {
-		t.Fatalf("Should not be ok because there is no UID on the context")
-	}
-	ctx = genericapirequest.WithUID(
-		ctx,
-		types.UID("testUID"),
-	)
-	_, ok = genericapirequest.UIDFrom(ctx)
-	if !ok {
-		t.Fatalf("Error getting UID")
-	}
+// mockAuthorizer is a minimal authorizer used as an identity in context tests.
+type mockAuthorizer struct{ name string }
+
+func (m *mockAuthorizer) Authorize(_ context.Context, _ authorizer.Attributes) (authorizer.Decision, string, error) {
+	return authorizer.DecisionNoOpinion, "", nil
+}
+func (m *mockAuthorizer) ConditionsAwareAuthorize(_ context.Context, _ authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionNoOpinion("", nil)
+}
+func (m *mockAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "not implemented", authorizer.ErrorConditionEvaluationNotSupported
 }
 
-//TestUserAgentContext validates that a useragent can be get/set on a context object
-func TestUserAgentContext(t *testing.T) {
-	ctx := genericapirequest.NewContext()
-	_, ok := genericapirequest.UserAgentFrom(ctx)
-	if ok {
-		t.Fatalf("Should not be ok because there is no UserAgent on the context")
-	}
+func TestConditionallyAuthorizedDecisionContext(t *testing.T) {
+	t.Run("empty context returns false", func(t *testing.T) {
+		ctx := NewContext()
+		authz, dec, ok := ConditionallyAuthorizedDecisionFrom(ctx)
+		if authz != nil {
+			t.Fatal("expected authz=nil for empty context")
+		}
+		if dec.String() != "Deny" {
+			t.Fatal("expected zero valued Deny decision for empty context")
+		}
+		if ok {
+			t.Fatal("expected ok=false for empty context")
+		}
 
-	ctx = genericapirequest.WithUserAgent(
-		ctx,
-		"TestUserAgent",
-	)
-	result, ok := genericapirequest.UserAgentFrom(ctx)
-	if !ok {
-		t.Fatalf("Error getting UserAgent")
-	}
-	expectedResult := "TestUserAgent"
-	if result != expectedResult {
-		t.Fatalf("Get user agent error, Expected: %s, Actual: %s", expectedResult, result)
-	}
+	})
+
+	t.Run("decision round-trips", func(t *testing.T) {
+		ctx := NewContext()
+		authz := &mockAuthorizer{name: "authz1"}
+		decision := authorizer.ConditionsAwareDecisionAllow("test-reason", nil)
+
+		ctx, err := WithConditionallyAuthorizedDecision(ctx, authz, decision)
+		if err != nil {
+			t.Fatalf("unexpected error storing a decision: %v", err)
+		}
+
+		gotAuthz, gotDec, ok := ConditionallyAuthorizedDecisionFrom(ctx)
+		if !ok {
+			t.Fatal("expected ok=true after storing a decision")
+		}
+
+		if gotAuthz != authz {
+			t.Error("authorizer pointer mismatch")
+		}
+		if gotDec.String() != `Allow(reason="test-reason")` {
+			t.Error("expected Allow decision")
+		}
+
+		// a second decision must not override the first one
+		otherAuthz := &mockAuthorizer{name: "authz2"}
+		ctx, err = WithConditionallyAuthorizedDecision(ctx, otherAuthz, authorizer.ConditionsAwareDecisionDeny("deny-reason", nil))
+		if err == nil {
+			t.Fatal("expected an error when a decision is already set")
+		}
+
+		gotAuthz, gotDec, ok = ConditionallyAuthorizedDecisionFrom(ctx)
+		if !ok {
+			t.Fatal("expected ok=true after storing a decision")
+		}
+
+		if gotAuthz != authz {
+			t.Error("expected the first authorizer to be kept")
+		}
+		if gotDec.String() != `Allow(reason="test-reason")` {
+			t.Error("expected the first, Allow, decision to be kept")
+		}
+	})
 }

@@ -17,91 +17,110 @@ limitations under the License.
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"sync"
 	"time"
 
-	apps "k8s.io/api/apps/v1beta1"
-	"k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apps "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	appsinformers "k8s.io/client-go/informers/apps/v1beta1"
+	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
-	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	unversionedapps "k8s.io/client-go/kubernetes/typed/apps/v1"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	unversionedextensions "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
-	appslisters "k8s.io/client-go/listers/apps/v1beta1"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	extensionslisters "k8s.io/client-go/listers/extensions/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/integer"
+	consistencyutil "k8s.io/client-go/util/consistency"
+	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/workqueue"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
+	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/controller/daemon/metrics"
 	"k8s.io/kubernetes/pkg/controller/daemon/util"
 	"k8s.io/kubernetes/pkg/features"
-	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
-	"k8s.io/kubernetes/pkg/scheduler/schedulercache"
-	"k8s.io/kubernetes/pkg/util/metrics"
-
-	"github.com/golang/glog"
 )
 
 const (
-	// The value of 250 is chosen b/c values that are too high can cause registry DoS issues
+	// BurstReplicas is a rate limiter for booting pods on a lot of pods.
+	// The value of 250 is chosen b/c values that are too high can cause registry DoS issues.
 	BurstReplicas = 250
 
-	// If sending a status update to API server fails, we retry a finite number of times.
+	// StatusUpdateRetries limits the number of retries if sending a status update to API server fails.
 	StatusUpdateRetries = 1
 
-	// Reasons for DaemonSet events
+	// BackoffGCInterval is the time that has to pass before next iteration of backoff GC is run
+	BackoffGCInterval = 1 * time.Minute
+)
+
+// Reasons for DaemonSet events
+const (
 	// SelectingAllReason is added to an event when a DaemonSet selects all Pods.
 	SelectingAllReason = "SelectingAll"
 	// FailedPlacementReason is added to an event when a DaemonSet can't schedule a Pod to a specified node.
 	FailedPlacementReason = "FailedPlacement"
 	// FailedDaemonPodReason is added to an event when the status of a Pod of a DaemonSet is 'Failed'.
 	FailedDaemonPodReason = "FailedDaemonPod"
+	// SucceededDaemonPodReason is added to an event when the status of a Pod of a DaemonSet is 'Succeeded'.
+	SucceededDaemonPodReason = "SucceededDaemonPod"
+)
+
+var (
+	daemonsetGroupResource = schema.GroupResource{
+		Group:    "apps",
+		Resource: "daemonsets",
+	}
+	podGroupResource = schema.GroupResource{
+		Group:    "",
+		Resource: "pods",
+	}
 )
 
 // controllerKind contains the schema.GroupVersionKind for this controller type.
-var controllerKind = extensions.SchemeGroupVersion.WithKind("DaemonSet")
+var controllerKind = apps.SchemeGroupVersion.WithKind("DaemonSet")
 
 // DaemonSetsController is responsible for synchronizing DaemonSet objects stored
 // in the system with actual running pods.
 type DaemonSetsController struct {
-	kubeClient    clientset.Interface
-	eventRecorder record.EventRecorder
-	podControl    controller.PodControlInterface
-	crControl     controller.ControllerRevisionControlInterface
+	kubeClient clientset.Interface
+
+	eventBroadcaster record.EventBroadcaster
+	eventRecorder    record.EventRecorder
+
+	podControl controller.PodControlInterface
+	crControl  controller.ControllerRevisionControlInterface
 
 	// An dsc is temporarily suspended after creating/deleting these many replicas.
 	// It resumes normal action after observing the watch events for them.
 	burstReplicas int
 
 	// To allow injection of syncDaemonSet for testing.
-	syncHandler func(dsKey string) error
+	syncHandler func(ctx context.Context, dsKey string) error
 	// used for unit testing
-	enqueueDaemonSet            func(ds *extensions.DaemonSet)
-	enqueueDaemonSetRateLimited func(ds *extensions.DaemonSet)
+	enqueueDaemonSet func(ds *apps.DaemonSet)
 	// A TTLCache of pod creates/deletes each ds expects to see
 	expectations controller.ControllerExpectationsInterface
 	// dsLister can list/get daemonsets from the shared informer's store
-	dsLister extensionslisters.DaemonSetLister
+	dsLister appslisters.DaemonSetLister
 	// dsStoreSynced returns true if the daemonset store has been synced at least once.
 	// Added as a member to the struct to allow injection for testing.
 	dsStoreSynced cache.InformerSynced
@@ -112,6 +131,8 @@ type DaemonSetsController struct {
 	historyStoreSynced cache.InformerSynced
 	// podLister get list/get pods from the shared informers's store
 	podLister corelisters.PodLister
+	// podIndexer allows looking up pods by node name or by ControllerRef UID
+	podIndexer cache.Indexer
 	// podStoreSynced returns true if the pod store has been synced at least once.
 	// Added as a member to the struct to allow injection for testing.
 	podStoreSynced cache.InformerSynced
@@ -122,141 +143,269 @@ type DaemonSetsController struct {
 	nodeStoreSynced cache.InformerSynced
 
 	// DaemonSet keys that need to be synced.
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	// The DaemonSet that has suspended pods on nodes; the key is node name, the value
-	// is DaemonSet set that want to run pods but can't schedule in latest syncup cycle.
-	suspendedDaemonPodsMutex sync.Mutex
-	suspendedDaemonPods      map[string]sets.String
+	// nodeUpdateQueue is a workqueue that processes node updates to ensure DaemonSets
+	// are properly reconciled when node properties change
+	nodeUpdateQueue workqueue.TypedRateLimitingInterface[string]
+
+	failedPodsBackoff *flowcontrol.Backoff
+
+	consistencyStore consistencyutil.ConsistencyStore
 }
 
-func NewDaemonSetsController(daemonSetInformer extensionsinformers.DaemonSetInformer, historyInformer appsinformers.ControllerRevisionInformer, podInformer coreinformers.PodInformer, nodeInformer coreinformers.NodeInformer, kubeClient clientset.Interface) (*DaemonSetsController, error) {
-	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
-	// TODO: remove the wrapper when every clients have moved to use the clientset.
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.CoreV1().RESTClient()).Events("")})
-
-	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
-		if err := metrics.RegisterMetricAndTrackRateLimiterUsage("daemon_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter()); err != nil {
-			return nil, err
+// NewDaemonSetsController creates a new DaemonSetsController
+func NewDaemonSetsController(
+	ctx context.Context,
+	daemonSetInformer appsinformers.DaemonSetInformer,
+	historyInformer appsinformers.ControllerRevisionInformer,
+	podInformer coreinformers.PodInformer,
+	nodeInformer coreinformers.NodeInformer,
+	kubeClient clientset.Interface,
+	failedPodsBackoff *flowcontrol.Backoff,
+) (*DaemonSetsController, error) {
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	logger := klog.FromContext(ctx)
+	var consistencyStore consistencyutil.ConsistencyStore
+	var podWriteCallback func(pod *v1.Pod, ds *metav1.OwnerReference)
+	if utilfeature.DefaultFeatureGate.Enabled(features.StaleControllerConsistencyDaemonSet) {
+		consistencyStore = consistencyutil.NewConsistencyStore(map[schema.GroupResource]consistencyutil.LastSyncRVGetter{
+			podGroupResource:       podInformer.Informer().GetStore(),
+			daemonsetGroupResource: daemonSetInformer.Informer().GetStore(),
+		})
+		podWriteCallback = func(pod *v1.Pod, ds *metav1.OwnerReference) {
+			if ds == nil {
+				return
+			}
+			consistencyStore.WroteAt(
+				types.NamespacedName{
+					Namespace: pod.Namespace,
+					Name:      ds.Name,
+				},
+				ds.UID,
+				podGroupResource,
+				pod.ResourceVersion,
+			)
 		}
+	} else {
+		consistencyStore = consistencyutil.NewNoopConsistencyStore()
 	}
+
 	dsc := &DaemonSetsController{
-		kubeClient:    kubeClient,
-		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "daemonset-controller"}),
+		kubeClient:       kubeClient,
+		eventBroadcaster: eventBroadcaster,
+		eventRecorder:    eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "daemonset-controller"}),
 		podControl: controller.RealPodControl{
 			KubeClient: kubeClient,
 			Recorder:   eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "daemonset-controller"}),
+			OnWrite:    podWriteCallback,
 		},
+
 		crControl: controller.RealControllerRevisionControl{
 			KubeClient: kubeClient,
 		},
-		burstReplicas:       BurstReplicas,
-		expectations:        controller.NewControllerExpectations(),
-		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "daemonset"),
-		suspendedDaemonPods: map[string]sets.String{},
+		burstReplicas: BurstReplicas,
+		expectations:  controller.NewControllerExpectations(),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "daemonset",
+			},
+		),
+		nodeUpdateQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "daemonset-node-updates",
+			},
+		),
+		consistencyStore: consistencyStore,
 	}
 
-	daemonSetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = daemonSetInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ds := obj.(*extensions.DaemonSet)
-			glog.V(4).Infof("Adding daemon set %s", ds.Name)
-			dsc.enqueueDaemonSet(ds)
+			dsc.addDaemonset(logger, obj)
 		},
-		UpdateFunc: func(old, cur interface{}) {
-			oldDS := old.(*extensions.DaemonSet)
-			curDS := cur.(*extensions.DaemonSet)
-			glog.V(4).Infof("Updating daemon set %s", oldDS.Name)
-			dsc.enqueueDaemonSet(curDS)
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dsc.updateDaemonset(logger, oldObj, newObj)
 		},
-		DeleteFunc: dsc.deleteDaemonset,
-	})
+		DeleteFunc: func(obj interface{}) {
+			dsc.deleteDaemonset(logger, obj)
+		},
+	}, cache.HandlerOptions{Logger: &logger})
 	dsc.dsLister = daemonSetInformer.Lister()
 	dsc.dsStoreSynced = daemonSetInformer.Informer().HasSynced
 
-	historyInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    dsc.addHistory,
-		UpdateFunc: dsc.updateHistory,
-		DeleteFunc: dsc.deleteHistory,
-	})
+	_, _ = historyInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			dsc.addHistory(logger, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dsc.updateHistory(logger, oldObj, newObj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			dsc.deleteHistory(logger, obj)
+		},
+	}, cache.HandlerOptions{Logger: &logger})
 	dsc.historyLister = historyInformer.Lister()
 	dsc.historyStoreSynced = historyInformer.Informer().HasSynced
 
 	// Watch for creation/deletion of pods. The reason we watch is that we don't want a daemon set to create/delete
 	// more pods until all the effects (expectations) of a daemon set's create/delete have been observed.
-	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    dsc.addPod,
-		UpdateFunc: dsc.updatePod,
-		DeleteFunc: dsc.deletePod,
-	})
+
+	_, _ = podInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			dsc.addPod(logger, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dsc.updatePod(logger, oldObj, newObj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			dsc.deletePod(logger, obj)
+		},
+	}, cache.HandlerOptions{Logger: &logger})
 	dsc.podLister = podInformer.Lister()
 	dsc.podStoreSynced = podInformer.Informer().HasSynced
+	controller.AddPodNodeNameIndexer(podInformer.Informer())
+	controller.AddPodControllerIndexer(podInformer.Informer())
+	dsc.podIndexer = podInformer.Informer().GetIndexer()
 
-	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    dsc.addNode,
-		UpdateFunc: dsc.updateNode,
+	_, _ = nodeInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			dsc.addNode(logger, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dsc.updateNode(logger, oldObj, newObj)
+		},
 	},
+		cache.HandlerOptions{Logger: &logger},
 	)
 	dsc.nodeStoreSynced = nodeInformer.Informer().HasSynced
 	dsc.nodeLister = nodeInformer.Lister()
 
 	dsc.syncHandler = dsc.syncDaemonSet
 	dsc.enqueueDaemonSet = dsc.enqueue
-	dsc.enqueueDaemonSetRateLimited = dsc.enqueueRateLimited
+
+	dsc.failedPodsBackoff = failedPodsBackoff
+
+	metrics.Register()
 	return dsc, nil
 }
 
-func (dsc *DaemonSetsController) deleteDaemonset(obj interface{}) {
-	ds, ok := obj.(*extensions.DaemonSet)
-	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("Couldn't get object from tombstone %#v", obj))
-			return
-		}
-		ds, ok = tombstone.Obj.(*extensions.DaemonSet)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("Tombstone contained object that is not a DaemonSet %#v", obj))
-			return
-		}
-	}
-	glog.V(4).Infof("Deleting daemon set %s", ds.Name)
+func (dsc *DaemonSetsController) addDaemonset(logger klog.Logger, obj interface{}) {
+	ds := obj.(*apps.DaemonSet)
+	logger.V(4).Info("Adding daemon set", "daemonset", klog.KObj(ds))
 	dsc.enqueueDaemonSet(ds)
 }
 
+func (dsc *DaemonSetsController) updateDaemonset(logger klog.Logger, cur, old interface{}) {
+	oldDS := old.(*apps.DaemonSet)
+	curDS := cur.(*apps.DaemonSet)
+
+	// TODO: make a KEP and fix informers to always call the delete event handler on re-create
+	if curDS.UID != oldDS.UID {
+		key, err := controller.KeyFunc(oldDS)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", oldDS, err))
+			return
+		}
+		dsc.deleteDaemonset(logger, cache.DeletedFinalStateUnknown{
+			Key: key,
+			Obj: oldDS,
+		})
+	}
+
+	logger.V(4).Info("Updating daemon set", "daemonset", klog.KObj(oldDS))
+	dsc.enqueueDaemonSet(curDS)
+}
+
+func (dsc *DaemonSetsController) deleteDaemonset(logger klog.Logger, obj interface{}) {
+	ds, ok := obj.(*apps.DaemonSet)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
+		ds, ok = tombstone.Obj.(*apps.DaemonSet)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a DaemonSet %#v", obj))
+			return
+		}
+	}
+	logger.V(4).Info("Deleting daemon set", "daemonset", klog.KObj(ds))
+
+	key, err := controller.KeyFunc(ds)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", ds, err))
+		return
+	}
+	dsc.consistencyStore.Clear(
+		types.NamespacedName{
+			Name:      ds.Name,
+			Namespace: ds.Namespace,
+		},
+		ds.UID,
+	)
+
+	// Delete expectations for the DaemonSet so if we create a new one with the same name it starts clean
+	dsc.expectations.DeleteExpectations(logger, key)
+
+	dsc.queue.Add(key)
+}
+
 // Run begins watching and syncing daemon sets.
-func (dsc *DaemonSetsController) Run(workers int, stopCh <-chan struct{}) {
-	defer utilruntime.HandleCrash()
-	defer dsc.queue.ShutDown()
+func (dsc *DaemonSetsController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrashWithContext(ctx)
 
-	glog.Infof("Starting daemon sets controller")
-	defer glog.Infof("Shutting down daemon sets controller")
+	dsc.eventBroadcaster.StartStructuredLogging(3)
+	dsc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: dsc.kubeClient.CoreV1().Events("")})
+	defer dsc.eventBroadcaster.Shutdown()
 
-	if !controller.WaitForCacheSync("daemon sets", stopCh, dsc.podStoreSynced, dsc.nodeStoreSynced, dsc.historyStoreSynced, dsc.dsStoreSynced) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting daemon sets controller")
+
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down daemon sets controller")
+		dsc.queue.ShutDown()
+		dsc.nodeUpdateQueue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, dsc.podStoreSynced, dsc.nodeStoreSynced, dsc.historyStoreSynced, dsc.dsStoreSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.Until(dsc.runWorker, time.Second, stopCh)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, dsc.runWorker, time.Second)
+		})
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, dsc.runNodeUpdateWorker, time.Second)
+		})
 	}
-
-	<-stopCh
+	wg.Go(func() {
+		wait.Until(dsc.failedPodsBackoff.GC, BackoffGCInterval, ctx.Done())
+	})
+	<-ctx.Done()
 }
 
-func (dsc *DaemonSetsController) runWorker() {
-	for dsc.processNextWorkItem() {
+func (dsc *DaemonSetsController) runWorker(ctx context.Context) {
+	for dsc.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
-func (dsc *DaemonSetsController) processNextWorkItem() bool {
+func (dsc *DaemonSetsController) processNextWorkItem(ctx context.Context) bool {
 	dsKey, quit := dsc.queue.Get()
 	if quit {
 		return false
 	}
 	defer dsc.queue.Done(dsKey)
 
-	err := dsc.syncHandler(dsKey.(string))
+	err := dsc.syncHandler(ctx, dsKey)
 	if err == nil {
 		dsc.queue.Forget(dsKey)
 		return true
@@ -268,7 +417,7 @@ func (dsc *DaemonSetsController) processNextWorkItem() bool {
 	return true
 }
 
-func (dsc *DaemonSetsController) enqueue(ds *extensions.DaemonSet) {
+func (dsc *DaemonSetsController) enqueue(ds *apps.DaemonSet) {
 	key, err := controller.KeyFunc(ds)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", ds, err))
@@ -277,16 +426,6 @@ func (dsc *DaemonSetsController) enqueue(ds *extensions.DaemonSet) {
 
 	// TODO: Handle overlapping controllers better. See comment in ReplicationManager.
 	dsc.queue.Add(key)
-}
-
-func (dsc *DaemonSetsController) enqueueRateLimited(ds *extensions.DaemonSet) {
-	key, err := controller.KeyFunc(ds)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", ds, err))
-		return
-	}
-
-	dsc.queue.AddRateLimited(key)
 }
 
 func (dsc *DaemonSetsController) enqueueDaemonSetAfter(obj interface{}, after time.Duration) {
@@ -301,7 +440,7 @@ func (dsc *DaemonSetsController) enqueueDaemonSetAfter(obj interface{}, after ti
 }
 
 // getDaemonSetsForPod returns a list of DaemonSets that potentially match the pod.
-func (dsc *DaemonSetsController) getDaemonSetsForPod(pod *v1.Pod) []*extensions.DaemonSet {
+func (dsc *DaemonSetsController) getDaemonSetsForPod(pod *v1.Pod) []*apps.DaemonSet {
 	sets, err := dsc.dsLister.GetPodDaemonSets(pod)
 	if err != nil {
 		return nil
@@ -316,7 +455,7 @@ func (dsc *DaemonSetsController) getDaemonSetsForPod(pod *v1.Pod) []*extensions.
 
 // getDaemonSetsForHistory returns a list of DaemonSets that potentially
 // match a ControllerRevision.
-func (dsc *DaemonSetsController) getDaemonSetsForHistory(history *apps.ControllerRevision) []*extensions.DaemonSet {
+func (dsc *DaemonSetsController) getDaemonSetsForHistory(logger klog.Logger, history *apps.ControllerRevision) []*apps.DaemonSet {
 	daemonSets, err := dsc.dsLister.GetHistoryDaemonSets(history)
 	if err != nil || len(daemonSets) == 0 {
 		return nil
@@ -324,20 +463,20 @@ func (dsc *DaemonSetsController) getDaemonSetsForHistory(history *apps.Controlle
 	if len(daemonSets) > 1 {
 		// ControllerRef will ensure we don't do anything crazy, but more than one
 		// item in this list nevertheless constitutes user error.
-		glog.V(4).Infof("User error! more than one DaemonSets is selecting ControllerRevision %s/%s with labels: %#v",
-			history.Namespace, history.Name, history.Labels)
+		logger.V(4).Info("Found more than one DaemonSet selecting the ControllerRevision. This is potentially a user error",
+			"controllerRevision", klog.KObj(history), "labels", history.Labels)
 	}
 	return daemonSets
 }
 
 // addHistory enqueues the DaemonSet that manages a ControllerRevision when the ControllerRevision is created
 // or when the controller manager is restarted.
-func (dsc *DaemonSetsController) addHistory(obj interface{}) {
+func (dsc *DaemonSetsController) addHistory(logger klog.Logger, obj interface{}) {
 	history := obj.(*apps.ControllerRevision)
 	if history.DeletionTimestamp != nil {
 		// On a restart of the controller manager, it's possible for an object to
 		// show up in a state that is already pending deletion.
-		dsc.deleteHistory(history)
+		dsc.deleteHistory(logger, history)
 		return
 	}
 
@@ -347,17 +486,17 @@ func (dsc *DaemonSetsController) addHistory(obj interface{}) {
 		if ds == nil {
 			return
 		}
-		glog.V(4).Infof("ControllerRevision %s added.", history.Name)
+		logger.V(4).Info("Observed a ControllerRevision", "controllerRevision", klog.KObj(history))
 		return
 	}
 
 	// Otherwise, it's an orphan. Get a list of all matching DaemonSets and sync
 	// them to see if anyone wants to adopt it.
-	daemonSets := dsc.getDaemonSetsForHistory(history)
+	daemonSets := dsc.getDaemonSetsForHistory(logger, history)
 	if len(daemonSets) == 0 {
 		return
 	}
-	glog.V(4).Infof("Orphan ControllerRevision %s added.", history.Name)
+	logger.V(4).Info("Orphan ControllerRevision added", "controllerRevision", klog.KObj(history))
 	for _, ds := range daemonSets {
 		dsc.enqueueDaemonSet(ds)
 	}
@@ -366,7 +505,7 @@ func (dsc *DaemonSetsController) addHistory(obj interface{}) {
 // updateHistory figures out what DaemonSet(s) manage a ControllerRevision when the ControllerRevision
 // is updated and wake them up. If anything of the ControllerRevision has changed, we need to  awaken
 // both the old and new DaemonSets.
-func (dsc *DaemonSetsController) updateHistory(old, cur interface{}) {
+func (dsc *DaemonSetsController) updateHistory(logger klog.Logger, old, cur interface{}) {
 	curHistory := cur.(*apps.ControllerRevision)
 	oldHistory := old.(*apps.ControllerRevision)
 	if curHistory.ResourceVersion == oldHistory.ResourceVersion {
@@ -390,7 +529,7 @@ func (dsc *DaemonSetsController) updateHistory(old, cur interface{}) {
 		if ds == nil {
 			return
 		}
-		glog.V(4).Infof("ControllerRevision %s updated.", curHistory.Name)
+		logger.V(4).Info("Observed an update to a ControllerRevision", "controllerRevision", klog.KObj(curHistory))
 		dsc.enqueueDaemonSet(ds)
 		return
 	}
@@ -399,11 +538,11 @@ func (dsc *DaemonSetsController) updateHistory(old, cur interface{}) {
 	// to see if anyone wants to adopt it now.
 	labelChanged := !reflect.DeepEqual(curHistory.Labels, oldHistory.Labels)
 	if labelChanged || controllerRefChanged {
-		daemonSets := dsc.getDaemonSetsForHistory(curHistory)
+		daemonSets := dsc.getDaemonSetsForHistory(logger, curHistory)
 		if len(daemonSets) == 0 {
 			return
 		}
-		glog.V(4).Infof("Orphan ControllerRevision %s updated.", curHistory.Name)
+		logger.V(4).Info("Orphan ControllerRevision updated", "controllerRevision", klog.KObj(curHistory))
 		for _, ds := range daemonSets {
 			dsc.enqueueDaemonSet(ds)
 		}
@@ -413,7 +552,7 @@ func (dsc *DaemonSetsController) updateHistory(old, cur interface{}) {
 // deleteHistory enqueues the DaemonSet that manages a ControllerRevision when
 // the ControllerRevision is deleted. obj could be an *app.ControllerRevision, or
 // a DeletionFinalStateUnknown marker item.
-func (dsc *DaemonSetsController) deleteHistory(obj interface{}) {
+func (dsc *DaemonSetsController) deleteHistory(logger klog.Logger, obj interface{}) {
 	history, ok := obj.(*apps.ControllerRevision)
 
 	// When a delete is dropped, the relist will notice a ControllerRevision in the store not
@@ -442,17 +581,17 @@ func (dsc *DaemonSetsController) deleteHistory(obj interface{}) {
 	if ds == nil {
 		return
 	}
-	glog.V(4).Infof("ControllerRevision %s deleted.", history.Name)
+	logger.V(4).Info("ControllerRevision deleted", "controllerRevision", klog.KObj(history))
 	dsc.enqueueDaemonSet(ds)
 }
 
-func (dsc *DaemonSetsController) addPod(obj interface{}) {
+func (dsc *DaemonSetsController) addPod(logger klog.Logger, obj interface{}) {
 	pod := obj.(*v1.Pod)
 
 	if pod.DeletionTimestamp != nil {
 		// on a restart of the controller manager, it's possible a new pod shows up in a state that
 		// is already pending deletion. Prevent the pod from being a creation observation.
-		dsc.deletePod(pod)
+		dsc.deletePod(logger, pod)
 		return
 	}
 
@@ -466,8 +605,8 @@ func (dsc *DaemonSetsController) addPod(obj interface{}) {
 		if err != nil {
 			return
 		}
-		glog.V(4).Infof("Pod %s added.", pod.Name)
-		dsc.expectations.CreationObserved(dsKey)
+		logger.V(4).Info("Pod added", "pod", klog.KObj(pod))
+		dsc.expectations.CreationObserved(logger, dsKey)
 		dsc.enqueueDaemonSet(ds)
 		return
 	}
@@ -480,7 +619,7 @@ func (dsc *DaemonSetsController) addPod(obj interface{}) {
 	if len(dss) == 0 {
 		return
 	}
-	glog.V(4).Infof("Orphan Pod %s added.", pod.Name)
+	logger.V(4).Info("Orphan Pod added", "pod", klog.KObj(pod))
 	for _, ds := range dss {
 		dsc.enqueueDaemonSet(ds)
 	}
@@ -489,12 +628,21 @@ func (dsc *DaemonSetsController) addPod(obj interface{}) {
 // When a pod is updated, figure out what sets manage it and wake them
 // up. If the labels of the pod have changed we need to awaken both the old
 // and new set. old and cur must be *v1.Pod types.
-func (dsc *DaemonSetsController) updatePod(old, cur interface{}) {
+func (dsc *DaemonSetsController) updatePod(logger klog.Logger, old, cur interface{}) {
 	curPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
 	if curPod.ResourceVersion == oldPod.ResourceVersion {
 		// Periodic resync will send update events for all known pods.
 		// Two different versions of the same pod will always have different RVs.
+		return
+	}
+
+	if curPod.DeletionTimestamp != nil {
+		// when a pod is deleted gracefully its deletion timestamp is first modified to reflect a grace period,
+		// and after such time has passed, the kubelet actually deletes it from the store. We receive an update
+		// for modification of the deletion timestamp and expect an ds to create more replicas asap, not wait
+		// until the kubelet actually deletes the pod.
+		dsc.deletePod(logger, curPod)
 		return
 	}
 
@@ -514,7 +662,7 @@ func (dsc *DaemonSetsController) updatePod(old, cur interface{}) {
 		if ds == nil {
 			return
 		}
-		glog.V(4).Infof("Pod %s updated.", curPod.Name)
+		logger.V(4).Info("Pod updated", "pod", klog.KObj(curPod))
 		dsc.enqueueDaemonSet(ds)
 		changedToReady := !podutil.IsPodReady(oldPod) && podutil.IsPodReady(curPod)
 		// See https://github.com/kubernetes/kubernetes/pull/38076 for more details
@@ -532,7 +680,7 @@ func (dsc *DaemonSetsController) updatePod(old, cur interface{}) {
 	if len(dss) == 0 {
 		return
 	}
-	glog.V(4).Infof("Orphan Pod %s updated.", curPod.Name)
+	logger.V(4).Info("Orphan Pod updated", "pod", klog.KObj(curPod))
 	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
 	if labelChanged || controllerRefChanged {
 		for _, ds := range dss {
@@ -541,68 +689,7 @@ func (dsc *DaemonSetsController) updatePod(old, cur interface{}) {
 	}
 }
 
-// listSuspendedDaemonPods lists the Daemon pods that 'want to run, but should not schedule'
-// for the node.
-func (dsc *DaemonSetsController) listSuspendedDaemonPods(node string) (dss []string) {
-	dsc.suspendedDaemonPodsMutex.Lock()
-	defer dsc.suspendedDaemonPodsMutex.Unlock()
-
-	if _, found := dsc.suspendedDaemonPods[node]; !found {
-		return nil
-	}
-
-	for k := range dsc.suspendedDaemonPods[node] {
-		dss = append(dss, k)
-	}
-	return
-}
-
-// requeueSuspendedDaemonPods enqueues all DaemonSets which has pods that 'want to run,
-// but should not schedule' for the node; so DaemonSetController will sync up them again.
-func (dsc *DaemonSetsController) requeueSuspendedDaemonPods(node string) {
-	dss := dsc.listSuspendedDaemonPods(node)
-	for _, dsKey := range dss {
-		if ns, name, err := cache.SplitMetaNamespaceKey(dsKey); err != nil {
-			glog.Errorf("Failed to get DaemonSet's namespace and name from %s: %v", dsKey, err)
-			continue
-		} else if ds, err := dsc.dsLister.DaemonSets(ns).Get(name); err != nil {
-			glog.Errorf("Failed to get DaemonSet %s/%s: %v", ns, name, err)
-			continue
-		} else {
-			dsc.enqueueDaemonSetRateLimited(ds)
-		}
-	}
-}
-
-// addSuspendedDaemonPods adds DaemonSet which has pods that 'want to run,
-// but should not schedule' for the node to the suspended queue.
-func (dsc *DaemonSetsController) addSuspendedDaemonPods(node, ds string) {
-	dsc.suspendedDaemonPodsMutex.Lock()
-	defer dsc.suspendedDaemonPodsMutex.Unlock()
-
-	if _, found := dsc.suspendedDaemonPods[node]; !found {
-		dsc.suspendedDaemonPods[node] = sets.NewString()
-	}
-	dsc.suspendedDaemonPods[node].Insert(ds)
-}
-
-// removeSuspendedDaemonPods removes DaemonSet which has pods that 'want to run,
-// but should not schedule' for the node from suspended queue.
-func (dsc *DaemonSetsController) removeSuspendedDaemonPods(node, ds string) {
-	dsc.suspendedDaemonPodsMutex.Lock()
-	defer dsc.suspendedDaemonPodsMutex.Unlock()
-
-	if _, found := dsc.suspendedDaemonPods[node]; !found {
-		return
-	}
-	dsc.suspendedDaemonPods[node].Delete(ds)
-
-	if len(dsc.suspendedDaemonPods[node]) == 0 {
-		delete(dsc.suspendedDaemonPods, node)
-	}
-}
-
-func (dsc *DaemonSetsController) deletePod(obj interface{}) {
+func (dsc *DaemonSetsController) deletePod(logger klog.Logger, obj interface{}) {
 	pod, ok := obj.(*v1.Pod)
 	// When a delete is dropped, the relist will notice a pod in the store not
 	// in the list, leading to the insertion of a tombstone object which contains
@@ -625,129 +712,69 @@ func (dsc *DaemonSetsController) deletePod(obj interface{}) {
 	controllerRef := metav1.GetControllerOf(pod)
 	if controllerRef == nil {
 		// No controller should care about orphans being deleted.
-		if len(pod.Spec.NodeName) != 0 {
-			// If scheduled pods were deleted, requeue suspended daemon pods.
-			dsc.requeueSuspendedDaemonPods(pod.Spec.NodeName)
-		}
 		return
 	}
 	ds := dsc.resolveControllerRef(pod.Namespace, controllerRef)
 	if ds == nil {
-		if len(pod.Spec.NodeName) != 0 {
-			// If scheduled pods were deleted, requeue suspended daemon pods.
-			dsc.requeueSuspendedDaemonPods(pod.Spec.NodeName)
-		}
 		return
 	}
 	dsKey, err := controller.KeyFunc(ds)
 	if err != nil {
 		return
 	}
-	glog.V(4).Infof("Pod %s deleted.", pod.Name)
-	dsc.expectations.DeletionObserved(dsKey)
+	logger.V(4).Info("Pod deleted", "pod", klog.KObj(pod))
+	dsc.expectations.DeletionObserved(logger, dsKey)
 	dsc.enqueueDaemonSet(ds)
 }
 
-func (dsc *DaemonSetsController) addNode(obj interface{}) {
-	// TODO: it'd be nice to pass a hint with these enqueues, so that each ds would only examine the added node (unless it has other work to do, too).
-	dsList, err := dsc.dsLister.List(labels.Everything())
-	if err != nil {
-		glog.V(4).Infof("Error enqueueing daemon sets: %v", err)
+func (dsc *DaemonSetsController) addNode(logger klog.Logger, obj interface{}) {
+	node, ok := obj.(*v1.Node)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("couldn't get node from object %#v", obj))
 		return
 	}
-	node := obj.(*v1.Node)
-	for _, ds := range dsList {
-		_, shouldSchedule, _, err := dsc.nodeShouldRunDaemonPod(node, ds)
-		if err != nil {
-			continue
-		}
-		if shouldSchedule {
-			dsc.enqueueDaemonSet(ds)
-		}
-	}
+
+	logger.V(4).Info("Queuing node addition", "node", klog.KObj(node))
+	dsc.nodeUpdateQueue.Add(node.Name)
 }
 
-// nodeInSameCondition returns true if all effective types ("Status" is true) equals;
-// otherwise, returns false.
-func nodeInSameCondition(old []v1.NodeCondition, cur []v1.NodeCondition) bool {
-	if len(old) == 0 && len(cur) == 0 {
-		return true
-	}
-
-	c1map := map[v1.NodeConditionType]v1.ConditionStatus{}
-	for _, c := range old {
-		if c.Status == v1.ConditionTrue {
-			c1map[c.Type] = c.Status
-		}
-	}
-
-	for _, c := range cur {
-		if c.Status != v1.ConditionTrue {
-			continue
-		}
-
-		if _, found := c1map[c.Type]; !found {
-			return false
-		}
-
-		delete(c1map, c.Type)
-	}
-
-	return len(c1map) == 0
+// shouldIgnoreNodeUpdate returns true if Node labels and taints have not changed, otherwise returns false.
+// If other calling functions need to use other properties of Node, shouldIgnoreNodeUpdate needs to be updated.
+func shouldIgnoreNodeUpdate(oldNode, curNode v1.Node) bool {
+	return apiequality.Semantic.DeepEqual(oldNode.Labels, curNode.Labels) &&
+		apiequality.Semantic.DeepEqual(oldNode.Spec.Taints, curNode.Spec.Taints)
 }
 
-func (dsc *DaemonSetsController) updateNode(old, cur interface{}) {
+func (dsc *DaemonSetsController) updateNode(logger klog.Logger, old, cur interface{}) {
 	oldNode := old.(*v1.Node)
 	curNode := cur.(*v1.Node)
 
-	if reflect.DeepEqual(oldNode.Labels, curNode.Labels) &&
-		reflect.DeepEqual(oldNode.Spec.Taints, curNode.Spec.Taints) &&
-		nodeInSameCondition(oldNode.Status.Conditions, curNode.Status.Conditions) {
-		// If node labels, taints and condition didn't change, we can ignore this update.
+	if shouldIgnoreNodeUpdate(*oldNode, *curNode) {
 		return
 	}
 
-	dsList, err := dsc.dsLister.List(labels.Everything())
-	if err != nil {
-		glog.V(4).Infof("Error listing daemon sets: %v", err)
-		return
-	}
-	// TODO: it'd be nice to pass a hint with these enqueues, so that each ds would only examine the added node (unless it has other work to do, too).
-	for _, ds := range dsList {
-		_, oldShouldSchedule, oldShouldContinueRunning, err := dsc.nodeShouldRunDaemonPod(oldNode, ds)
-		if err != nil {
-			continue
-		}
-		_, currentShouldSchedule, currentShouldContinueRunning, err := dsc.nodeShouldRunDaemonPod(curNode, ds)
-		if err != nil {
-			continue
-		}
-		if (oldShouldSchedule != currentShouldSchedule) || (oldShouldContinueRunning != currentShouldContinueRunning) {
-			dsc.enqueueDaemonSet(ds)
-		}
-	}
+	logger.V(4).Info("Queuing node update", "node", klog.KObj(curNode))
+	dsc.nodeUpdateQueue.Add(curNode.Name)
 }
 
 // getDaemonPods returns daemon pods owned by the given ds.
 // This also reconciles ControllerRef by adopting/orphaning.
 // Note that returned Pods are pointers to objects in the cache.
 // If you want to modify one, you need to deep-copy it first.
-func (dsc *DaemonSetsController) getDaemonPods(ds *extensions.DaemonSet) ([]*v1.Pod, error) {
+func (dsc *DaemonSetsController) getDaemonPods(ctx context.Context, ds *apps.DaemonSet) ([]*v1.Pod, error) {
 	selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
 	if err != nil {
 		return nil, err
 	}
-
-	// List all pods to include those that don't match the selector anymore but
-	// have a ControllerRef pointing to this controller.
-	pods, err := dsc.podLister.Pods(ds.Namespace).List(labels.Everything())
+	// List all pods indexed to DS UID and Orphan pods
+	pods, err := controller.FilterPodsByOwner(dsc.podIndexer, &ds.ObjectMeta, "DaemonSet", true)
 	if err != nil {
 		return nil, err
 	}
 	// If any adoptions are attempted, we should first recheck for deletion with
 	// an uncached quorum read sometime after listing Pods (see #42639).
-	dsNotDeleted := controller.RecheckDeletionTimestamp(func() (metav1.Object, error) {
-		fresh, err := dsc.kubeClient.ExtensionsV1beta1().DaemonSets(ds.Namespace).Get(ds.Name, metav1.GetOptions{})
+	dsNotDeleted := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
+		fresh, err := dsc.kubeClient.AppsV1().DaemonSets(ds.Namespace).Get(ctx, ds.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -759,31 +786,45 @@ func (dsc *DaemonSetsController) getDaemonPods(ds *extensions.DaemonSet) ([]*v1.
 
 	// Use ControllerRefManager to adopt/orphan as needed.
 	cm := controller.NewPodControllerRefManager(dsc.podControl, ds, selector, controllerKind, dsNotDeleted)
-	return cm.ClaimPods(pods)
+	return cm.ClaimPods(ctx, pods)
 }
 
-// getNodesToDaemonPods returns a map from nodes to daemon pods (corresponding to ds) running on the nodes.
+// getNodesToDaemonPods returns a map from nodes to daemon pods (corresponding to ds) created for the nodes.
 // This also reconciles ControllerRef by adopting/orphaning.
 // Note that returned Pods are pointers to objects in the cache.
 // If you want to modify one, you need to deep-copy it first.
-func (dsc *DaemonSetsController) getNodesToDaemonPods(ds *extensions.DaemonSet) (map[string][]*v1.Pod, error) {
-	claimedPods, err := dsc.getDaemonPods(ds)
+func (dsc *DaemonSetsController) getNodesToDaemonPods(ctx context.Context, ds *apps.DaemonSet, includeDeletedTerminal bool) (map[string][]*v1.Pod, error) {
+	claimedPods, err := dsc.getDaemonPods(ctx, ds)
 	if err != nil {
 		return nil, err
 	}
 	// Group Pods by Node name.
 	nodeToDaemonPods := make(map[string][]*v1.Pod)
+	logger := klog.FromContext(ctx)
 	for _, pod := range claimedPods {
-		nodeName := pod.Spec.NodeName
+		if !includeDeletedTerminal && podutil.IsPodTerminal(pod) && pod.DeletionTimestamp != nil {
+			// This Pod has a finalizer or is already scheduled for deletion from the
+			// store by the kubelet or the Pod GC. The DS controller doesn't have
+			// anything else to do with it.
+			continue
+		}
+		nodeName, err := util.GetTargetNodeName(pod)
+		if err != nil {
+			logger.V(4).Info("Failed to get target node name of Pod in DaemonSet",
+				"pod", klog.KObj(pod), "daemonset", klog.KObj(ds))
+			continue
+		}
+
 		nodeToDaemonPods[nodeName] = append(nodeToDaemonPods[nodeName], pod)
 	}
+
 	return nodeToDaemonPods, nil
 }
 
 // resolveControllerRef returns the controller referenced by a ControllerRef,
 // or nil if the ControllerRef could not be resolved to a matching controller
 // of the correct Kind.
-func (dsc *DaemonSetsController) resolveControllerRef(namespace string, controllerRef *metav1.OwnerReference) *extensions.DaemonSet {
+func (dsc *DaemonSetsController) resolveControllerRef(namespace string, controllerRef *metav1.OwnerReference) *apps.DaemonSet {
 	// We can't look up by UID, so look up by Name and then verify UID.
 	// Don't even try to look up by Name if it's the wrong Kind.
 	if controllerRef.Kind != controllerKind.Kind {
@@ -801,94 +842,204 @@ func (dsc *DaemonSetsController) resolveControllerRef(namespace string, controll
 	return ds
 }
 
+// podsShouldBeOnNode figures out the DaemonSet pods to be created and deleted on the given node:
+//   - nodesNeedingDaemonPods: the pods need to start on the node
+//   - podsToDelete: the Pods need to be deleted on the node
+//   - err: unexpected error
+func (dsc *DaemonSetsController) podsShouldBeOnNode(
+	logger klog.Logger,
+	node *v1.Node,
+	nodeToDaemonPods map[string][]*v1.Pod,
+	ds *apps.DaemonSet,
+	hash string,
+	tolerations []v1.Toleration,
+	requiredNodeAffinity nodeaffinity.RequiredNodeAffinity,
+) (nodesNeedingDaemonPods, podsToDelete []string) {
+
+	shouldRun, shouldContinueRunning := nodeShouldRunDaemonPod(logger, node, ds, tolerations, requiredNodeAffinity)
+	daemonPods, exists := nodeToDaemonPods[node.Name]
+
+	switch {
+	case shouldRun && !exists:
+		// If daemon pod is supposed to be running on node, but isn't, create daemon pod.
+		nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, node.Name)
+	case shouldContinueRunning:
+		// If a daemon pod failed, delete it
+		// If there's non-daemon pods left on this node, we will create it in the next sync loop
+		var daemonPodsRunning []*v1.Pod
+		for _, pod := range daemonPods {
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+			if pod.Status.Phase == v1.PodFailed {
+				// This is a critical place where DS is often fighting with kubelet that rejects pods.
+				// We need to avoid hot looping and backoff.
+				backoffKey := failedPodsBackoffKey(ds, node.Name)
+
+				now := dsc.failedPodsBackoff.Clock.Now()
+				inBackoff := dsc.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, now)
+				if inBackoff {
+					delay := dsc.failedPodsBackoff.Get(backoffKey)
+					logger.V(4).Info("Deleting failed pod on node has been limited by backoff",
+						"pod", klog.KObj(pod), "node", klog.KObj(node), "currentDelay", delay)
+					dsc.enqueueDaemonSetAfter(ds, delay)
+					continue
+				}
+
+				dsc.failedPodsBackoff.Next(backoffKey, now)
+
+				msg := fmt.Sprintf("Found failed daemon pod %s/%s on node %s, will try to kill it", pod.Namespace, pod.Name, node.Name)
+				logger.V(2).Info("Found failed daemon pod on node, will try to kill it", "pod", klog.KObj(pod), "node", klog.KObj(node))
+				// Emit an event so that it's discoverable to users.
+				dsc.eventRecorder.Eventf(ds, v1.EventTypeWarning, FailedDaemonPodReason, "%s", msg)
+				podsToDelete = append(podsToDelete, pod.Name)
+			} else if pod.Status.Phase == v1.PodSucceeded {
+				msg := fmt.Sprintf("Found succeeded daemon pod %s/%s on node %s, will try to delete it", pod.Namespace, pod.Name, node.Name)
+				logger.V(2).Info("Found succeeded daemon pod on node, will try to delete it", "pod", klog.KObj(pod), "node", klog.KObj(node))
+				// Emit an event so that it's discoverable to users.
+				dsc.eventRecorder.Eventf(ds, v1.EventTypeNormal, SucceededDaemonPodReason, "%s", msg)
+				podsToDelete = append(podsToDelete, pod.Name)
+			} else {
+				daemonPodsRunning = append(daemonPodsRunning, pod)
+			}
+		}
+
+		// When surge is not enabled, if there is more than 1 running pod on a node delete all but the oldest
+		if !util.AllowsSurge(ds) {
+			if len(daemonPodsRunning) <= 1 {
+				// There are no excess pods to be pruned, and no pods to create
+				break
+			}
+
+			sort.Sort(podByCreationTimestampAndPhase(daemonPodsRunning))
+			for i := 1; i < len(daemonPodsRunning); i++ {
+				podsToDelete = append(podsToDelete, daemonPodsRunning[i].Name)
+			}
+			break
+		}
+
+		if len(daemonPodsRunning) <= 1 {
+			// // There are no excess pods to be pruned
+			if len(daemonPodsRunning) == 0 && shouldRun {
+				// We are surging so we need to have at least one non-deleted pod on the node
+				nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, node.Name)
+			}
+			break
+		}
+
+		// When surge is enabled, we allow 2 pods if and only if the oldest pod matching the current hash state
+		// is not ready AND the oldest pod that doesn't match the current hash state is ready. All other pods are
+		// deleted. If neither pod is ready, only the one matching the current hash revision is kept.
+		var oldestNewPod, oldestOldPod *v1.Pod
+		sort.Sort(podByCreationTimestampAndPhase(daemonPodsRunning))
+		for _, pod := range daemonPodsRunning {
+			if pod.Labels[apps.ControllerRevisionHashLabelKey] == hash {
+				if oldestNewPod == nil {
+					oldestNewPod = pod
+					continue
+				}
+			} else {
+				if oldestOldPod == nil {
+					oldestOldPod = pod
+					continue
+				}
+			}
+			podsToDelete = append(podsToDelete, pod.Name)
+		}
+		if oldestNewPod != nil && oldestOldPod != nil {
+			switch {
+			case !podutil.IsPodReady(oldestOldPod):
+				logger.V(5).Info("Pod from daemonset is no longer ready and will be replaced with newer pod", "oldPod", klog.KObj(oldestOldPod), "daemonset", klog.KObj(ds), "newPod", klog.KObj(oldestNewPod))
+				podsToDelete = append(podsToDelete, oldestOldPod.Name)
+			case podutil.IsPodAvailable(oldestNewPod, ds.Spec.MinReadySeconds, metav1.Time{Time: dsc.failedPodsBackoff.Clock.Now()}):
+				logger.V(5).Info("Pod from daemonset is now ready and will replace older pod", "newPod", klog.KObj(oldestNewPod), "daemonset", klog.KObj(ds), "oldPod", klog.KObj(oldestOldPod))
+				podsToDelete = append(podsToDelete, oldestOldPod.Name)
+			}
+		}
+
+	case !shouldContinueRunning && exists:
+		// If daemon pod isn't supposed to run on node, but it is, delete all daemon pods on node.
+		for _, pod := range daemonPods {
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+			podsToDelete = append(podsToDelete, pod.Name)
+		}
+	}
+
+	return nodesNeedingDaemonPods, podsToDelete
+}
+
+func (dsc *DaemonSetsController) updateDaemonSet(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash, key string, old []*apps.ControllerRevision) error {
+	err := dsc.manage(ctx, ds, nodeList, hash)
+	if err != nil {
+		return err
+	}
+
+	// Process rolling updates if we're ready.
+	if dsc.expectations.SatisfiedExpectations(klog.FromContext(ctx), key) {
+		switch ds.Spec.UpdateStrategy.Type {
+		case apps.OnDeleteDaemonSetStrategyType:
+		case apps.RollingUpdateDaemonSetStrategyType:
+			err = dsc.rollingUpdate(ctx, ds, nodeList, hash)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	err = dsc.cleanupHistory(ctx, ds, old)
+	if err != nil {
+		return fmt.Errorf("failed to clean up revisions of DaemonSet: %w", err)
+	}
+
+	return nil
+}
+
 // manage manages the scheduling and running of Pods of ds on nodes.
 // After figuring out which nodes should run a Pod of ds but not yet running one and
 // which nodes should not run a Pod of ds but currently running one, it calls function
 // syncNodes with a list of pods to remove and a list of nodes to run a Pod of ds.
-func (dsc *DaemonSetsController) manage(ds *extensions.DaemonSet, hash string) error {
-	// Find out which nodes are running the daemon pods controlled by ds.
-	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ds)
+func (dsc *DaemonSetsController) manage(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash string) error {
+	// Find out the pods which are created for the nodes by DaemonSet.
+	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds, false)
 	if err != nil {
 		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
 	}
 
 	// For each node, if the node is running the daemon pod but isn't supposed to, kill the daemon
 	// pod. If the node is supposed to run the daemon pod, but isn't, create the daemon pod on the node.
-	nodeList, err := dsc.nodeLister.List(labels.Everything())
-	if err != nil {
-		return fmt.Errorf("couldn't get list of nodes when syncing daemon set %#v: %v", ds, err)
-	}
+	logger := klog.FromContext(ctx)
 	var nodesNeedingDaemonPods, podsToDelete []string
-	var failedPodsObserved int
+	// The daemon pod tolerations and the parsed required node affinity are
+	// the same for every node; build them once instead of once per node.
+	tolerations := daemonPodTolerations(ds)
+	requiredNodeAffinity := nodeaffinity.NewRequiredNodeAffinity(ds.Spec.Template.Spec.NodeSelector, ds.Spec.Template.Spec.Affinity)
 	for _, node := range nodeList {
-		wantToRun, shouldSchedule, shouldContinueRunning, err := dsc.nodeShouldRunDaemonPod(node, ds)
-		if err != nil {
-			continue
-		}
+		nodesNeedingDaemonPodsOnNode, podsToDeleteOnNode := dsc.podsShouldBeOnNode(
+			logger, node, nodeToDaemonPods, ds, hash, tolerations, requiredNodeAffinity)
 
-		daemonPods, exists := nodeToDaemonPods[node.Name]
-		dsKey, _ := cache.MetaNamespaceKeyFunc(ds)
-		dsc.removeSuspendedDaemonPods(node.Name, dsKey)
-
-		switch {
-		case wantToRun && !shouldSchedule:
-			// If daemon pod is supposed to run, but can not be scheduled, add to suspended list.
-			dsc.addSuspendedDaemonPods(node.Name, dsKey)
-		case shouldSchedule && !exists:
-			// If daemon pod is supposed to be running on node, but isn't, create daemon pod.
-			nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, node.Name)
-		case shouldContinueRunning:
-			// If a daemon pod failed, delete it
-			// If there's non-daemon pods left on this node, we will create it in the next sync loop
-			var daemonPodsRunning []*v1.Pod
-			for _, pod := range daemonPods {
-				if pod.DeletionTimestamp != nil {
-					continue
-				}
-				if pod.Status.Phase == v1.PodFailed {
-					msg := fmt.Sprintf("Found failed daemon pod %s/%s on node %s, will try to kill it", pod.Namespace, pod.Name, node.Name)
-					glog.V(2).Infof(msg)
-					// Emit an event so that it's discoverable to users.
-					dsc.eventRecorder.Eventf(ds, v1.EventTypeWarning, FailedDaemonPodReason, msg)
-					podsToDelete = append(podsToDelete, pod.Name)
-					failedPodsObserved++
-				} else {
-					daemonPodsRunning = append(daemonPodsRunning, pod)
-				}
-			}
-			// If daemon pod is supposed to be running on node, but more than 1 daemon pod is running, delete the excess daemon pods.
-			// Sort the daemon pods by creation time, so the oldest is preserved.
-			if len(daemonPodsRunning) > 1 {
-				sort.Sort(podByCreationTimestamp(daemonPodsRunning))
-				for i := 1; i < len(daemonPodsRunning); i++ {
-					podsToDelete = append(podsToDelete, daemonPodsRunning[i].Name)
-				}
-			}
-		case !shouldContinueRunning && exists:
-			// If daemon pod isn't supposed to run on node, but it is, delete all daemon pods on node.
-			for _, pod := range daemonPods {
-				podsToDelete = append(podsToDelete, pod.Name)
-			}
-		}
+		nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, nodesNeedingDaemonPodsOnNode...)
+		podsToDelete = append(podsToDelete, podsToDeleteOnNode...)
 	}
+
+	// Remove unscheduled pods assigned to not existing nodes when daemonset pods are scheduled by scheduler.
+	// If node doesn't exist then pods are never scheduled and can't be deleted by PodGCController.
+	podsToDelete = append(podsToDelete, getUnscheduledPodsWithoutNode(nodeList, nodeToDaemonPods)...)
 
 	// Label new pods using the hash label value of the current history when creating them
-	if err = dsc.syncNodes(ds, podsToDelete, nodesNeedingDaemonPods, hash); err != nil {
+	if err = dsc.syncNodes(ctx, ds, podsToDelete, nodesNeedingDaemonPods, hash); err != nil {
 		return err
-	}
-
-	// Throw an error when the daemon pods fail, to use ratelimiter to prevent kill-recreate hot loop
-	if failedPodsObserved > 0 {
-		return fmt.Errorf("deleted %d failed pods of DaemonSet %s/%s", failedPodsObserved, ds.Namespace, ds.Name)
 	}
 
 	return nil
 }
 
 // syncNodes deletes given pods and creates new daemon set pods on the given nodes
-// returns slice with erros if any
-func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelete, nodesNeedingDaemonPods []string, hash string) error {
+// returns slice with errors if any
+func (dsc *DaemonSetsController) syncNodes(ctx context.Context, ds *apps.DaemonSet, podsToDelete, nodesNeedingDaemonPods []string, hash string) error {
 	// We need to set expectations before creating/deleting pods to avoid race conditions.
+	logger := klog.FromContext(ctx)
 	dsKey, err := controller.KeyFunc(ds)
 	if err != nil {
 		return fmt.Errorf("couldn't get key for object %#v: %v", ds, err)
@@ -904,14 +1055,20 @@ func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelet
 		deleteDiff = dsc.burstReplicas
 	}
 
-	dsc.expectations.SetExpectations(dsKey, createDiff, deleteDiff)
+	dsc.expectations.SetExpectations(logger, dsKey, createDiff, deleteDiff)
 
 	// error channel to communicate back failures.  make the buffer big enough to avoid any blocking
 	errCh := make(chan error, createDiff+deleteDiff)
 
-	glog.V(4).Infof("Nodes needing daemon pods for daemon set %s: %+v, creating %d", ds.Name, nodesNeedingDaemonPods, createDiff)
+	logger.V(4).Info("Nodes needing daemon pods for daemon set, creating", "daemonset", klog.KObj(ds), "needCount", nodesNeedingDaemonPods, "createCount", createDiff)
 	createWait := sync.WaitGroup{}
-	template := util.CreatePodTemplate(ds.Spec.Template, ds.Spec.TemplateGeneration, hash)
+	// If the returned error is not nil we have a parse error.
+	// The controller handles this via the hash.
+	generation, err := util.GetTemplateGeneration(ds)
+	if err != nil {
+		generation = nil
+	}
+	template := util.CreatePodTemplate(ds.Spec.Template, generation, hash)
 	// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
 	// and double with each successful iteration in a kind of "slow start".
 	// This handles attempts to start large numbers of pods that would
@@ -920,27 +1077,34 @@ func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelet
 	// prevented from spamming the API service with the pod create requests
 	// after one of its pods fails.  Conveniently, this also prevents the
 	// event spam that those failures would generate.
-	batchSize := integer.IntMin(createDiff, controller.SlowStartInitialBatchSize)
-	for pos := 0; createDiff > pos; batchSize, pos = integer.IntMin(2*batchSize, createDiff-(pos+batchSize)), pos+batchSize {
+	batchSize := min(createDiff, controller.SlowStartInitialBatchSize)
+	for pos := 0; createDiff > pos; batchSize, pos = min(2*batchSize, createDiff-(pos+batchSize)), pos+batchSize {
 		errorCount := len(errCh)
 		createWait.Add(batchSize)
 		for i := pos; i < pos+batchSize; i++ {
 			go func(ix int) {
 				defer createWait.Done()
-				err := dsc.podControl.CreatePodsOnNode(nodesNeedingDaemonPods[ix], ds.Namespace, &template, ds, metav1.NewControllerRef(ds, controllerKind))
-				if err != nil && errors.IsTimeout(err) {
-					// Pod is created but its initialization has timed out.
-					// If the initialization is successful eventually, the
-					// controller will observe the creation via the informer.
-					// If the initialization fails, or if the pod keeps
-					// uninitialized for a long time, the informer will not
-					// receive any update, and the controller will create a new
-					// pod when the expectation expires.
-					return
+
+				podTemplate := template.DeepCopy()
+				// The pod's NodeAffinity will be updated to make sure the Pod is bound
+				// to the target node by default scheduler. It is safe to do so because there
+				// should be no conflicting node affinity with the target node.
+				podTemplate.Spec.Affinity = util.ReplaceDaemonSetPodNodeNameNodeAffinity(
+					podTemplate.Spec.Affinity, nodesNeedingDaemonPods[ix])
+
+				err := dsc.podControl.CreatePods(ctx, ds.Namespace, podTemplate,
+					ds, metav1.NewControllerRef(ds, controllerKind))
+
+				if err != nil {
+					if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+						// If the namespace is being torn down, we can safely ignore
+						// this error since all subsequent creations will fail.
+						return
+					}
 				}
 				if err != nil {
-					glog.V(2).Infof("Failed creation, decrementing expectations for set %q/%q", ds.Namespace, ds.Name)
-					dsc.expectations.CreationObserved(dsKey)
+					logger.V(2).Info("Failed creation, decrementing expectations for daemon set", "daemonset", klog.KObj(ds))
+					dsc.expectations.CreationObserved(logger, dsKey)
 					errCh <- err
 					utilruntime.HandleError(err)
 				}
@@ -948,29 +1112,32 @@ func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelet
 		}
 		createWait.Wait()
 		// any skipped pods that we never attempted to start shouldn't be expected.
-		skippedPods := createDiff - batchSize
+		skippedPods := createDiff - (batchSize + pos)
 		if errorCount < len(errCh) && skippedPods > 0 {
-			glog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for set %q/%q", skippedPods, ds.Namespace, ds.Name)
-			for i := 0; i < skippedPods; i++ {
-				dsc.expectations.CreationObserved(dsKey)
-			}
+			logger.V(2).Info("Slow-start failure. Skipping creation pods, decrementing expectations for daemon set", "skippedPods", skippedPods, "daemonset", klog.KObj(ds))
+			dsc.expectations.LowerExpectations(logger, dsKey, skippedPods, 0)
 			// The skipped pods will be retried later. The next controller resync will
 			// retry the slow start process.
 			break
 		}
 	}
 
-	glog.V(4).Infof("Pods to delete for daemon set %s: %+v, deleting %d", ds.Name, podsToDelete, deleteDiff)
+	logger.V(4).Info("Pods to delete for daemon set, deleting", "daemonset", klog.KObj(ds), "toDeleteCount", podsToDelete, "deleteCount", deleteDiff)
 	deleteWait := sync.WaitGroup{}
 	deleteWait.Add(deleteDiff)
 	for i := 0; i < deleteDiff; i++ {
 		go func(ix int) {
 			defer deleteWait.Done()
-			if err := dsc.podControl.DeletePod(ds.Namespace, podsToDelete[ix], ds); err != nil {
-				glog.V(2).Infof("Failed deletion, decrementing expectations for set %q/%q", ds.Namespace, ds.Name)
-				dsc.expectations.DeletionObserved(dsKey)
-				errCh <- err
-				utilruntime.HandleError(err)
+			if err := dsc.podControl.DeletePod(ctx, ds.Namespace, podsToDelete[ix], ds); err != nil {
+				// We are cleaning up an expectation that this delete will be observed,
+				// since any failure to delete the pod means that we will never observe
+				// the delete.
+				dsc.expectations.DeletionObserved(logger, dsKey)
+				if !apierrors.IsNotFound(err) {
+					logger.V(2).Info("Failed deletion, decremented expectations for daemon set", "daemonset", klog.KObj(ds))
+					errCh <- err
+					utilruntime.HandleError(err)
+				}
 			}
 		}(i)
 	}
@@ -985,7 +1152,17 @@ func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelet
 	return utilerrors.NewAggregate(errors)
 }
 
-func storeDaemonSetStatus(dsClient unversionedextensions.DaemonSetInterface, ds *extensions.DaemonSet, desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable, numberUnavailable int) error {
+func storeDaemonSetStatus(
+	ctx context.Context,
+	dsClient unversionedapps.DaemonSetInterface,
+	ds *apps.DaemonSet, desiredNumberScheduled,
+	currentNumberScheduled,
+	numberMisscheduled,
+	numberReady,
+	updatedNumberScheduled,
+	numberAvailable,
+	numberUnavailable int,
+	updateObservedGen bool) (*apps.DaemonSet, error) {
 	if int(ds.Status.DesiredNumberScheduled) == desiredNumberScheduled &&
 		int(ds.Status.CurrentNumberScheduled) == currentNumberScheduled &&
 		int(ds.Status.NumberMisscheduled) == numberMisscheduled &&
@@ -994,14 +1171,16 @@ func storeDaemonSetStatus(dsClient unversionedextensions.DaemonSetInterface, ds 
 		int(ds.Status.NumberAvailable) == numberAvailable &&
 		int(ds.Status.NumberUnavailable) == numberUnavailable &&
 		ds.Status.ObservedGeneration >= ds.Generation {
-		return nil
+		return nil, nil
 	}
 
 	toUpdate := ds.DeepCopy()
 
 	var updateErr, getErr error
-	for i := 0; i < StatusUpdateRetries; i++ {
-		toUpdate.Status.ObservedGeneration = ds.Generation
+	for i := 0; ; i++ {
+		if updateObservedGen {
+			toUpdate.Status.ObservedGeneration = ds.Generation
+		}
 		toUpdate.Status.DesiredNumberScheduled = int32(desiredNumberScheduled)
 		toUpdate.Status.CurrentNumberScheduled = int32(currentNumberScheduled)
 		toUpdate.Status.NumberMisscheduled = int32(numberMisscheduled)
@@ -1010,58 +1189,66 @@ func storeDaemonSetStatus(dsClient unversionedextensions.DaemonSetInterface, ds 
 		toUpdate.Status.NumberAvailable = int32(numberAvailable)
 		toUpdate.Status.NumberUnavailable = int32(numberUnavailable)
 
-		if _, updateErr = dsClient.UpdateStatus(toUpdate); updateErr == nil {
-			return nil
+		var result *apps.DaemonSet
+		if result, updateErr = dsClient.UpdateStatus(ctx, toUpdate, metav1.UpdateOptions{}); updateErr == nil {
+			return result, nil
 		}
 
+		// Stop retrying if we exceed statusUpdateRetries - the DaemonSet will be requeued with a rate limit.
+		if i >= StatusUpdateRetries {
+			break
+		}
 		// Update the set with the latest resource version for the next poll
-		if toUpdate, getErr = dsClient.Get(ds.Name, metav1.GetOptions{}); getErr != nil {
+		if toUpdate, getErr = dsClient.Get(ctx, ds.Name, metav1.GetOptions{}); getErr != nil {
 			// If the GET fails we can't trust status.Replicas anymore. This error
 			// is bound to be more interesting than the update failure.
-			return getErr
+			return nil, getErr
 		}
 	}
-	return updateErr
+	return nil, updateErr
 }
 
-func (dsc *DaemonSetsController) updateDaemonSetStatus(ds *extensions.DaemonSet, hash string) error {
-	glog.V(4).Infof("Updating daemon set status")
-	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ds)
+func (dsc *DaemonSetsController) updateDaemonSetStatus(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash string, updateObservedGen bool) error {
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Updating daemon set status")
+	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds, false)
 	if err != nil {
 		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
 	}
 
-	nodeList, err := dsc.nodeLister.List(labels.Everything())
-	if err != nil {
-		return fmt.Errorf("couldn't get list of nodes when updating daemon set %#v: %v", ds, err)
-	}
-
 	var desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable int
+	now := dsc.failedPodsBackoff.Clock.Now()
+	tolerations := daemonPodTolerations(ds)
+	requiredNodeAffinity := nodeaffinity.NewRequiredNodeAffinity(ds.Spec.Template.Spec.NodeSelector, ds.Spec.Template.Spec.Affinity)
 	for _, node := range nodeList {
-		wantToRun, _, _, err := dsc.nodeShouldRunDaemonPod(node, ds)
-		if err != nil {
-			return err
-		}
-
+		shouldRun, _ := nodeShouldRunDaemonPod(logger, node, ds, tolerations, requiredNodeAffinity)
 		scheduled := len(nodeToDaemonPods[node.Name]) > 0
 
-		if wantToRun {
+		if shouldRun {
 			desiredNumberScheduled++
-			if scheduled {
-				currentNumberScheduled++
-				// Sort the daemon pods by creation time, so that the oldest is first.
-				daemonPods, _ := nodeToDaemonPods[node.Name]
-				sort.Sort(podByCreationTimestamp(daemonPods))
-				pod := daemonPods[0]
-				if podutil.IsPodReady(pod) {
-					numberReady++
-					if podutil.IsPodAvailable(pod, ds.Spec.MinReadySeconds, metav1.Now()) {
-						numberAvailable++
-					}
+			if !scheduled {
+				continue
+			}
+
+			currentNumberScheduled++
+			// Sort the daemon pods by creation time, so that the oldest is first.
+			daemonPods, _ := nodeToDaemonPods[node.Name]
+			sort.Sort(podByCreationTimestampAndPhase(daemonPods))
+			pod := daemonPods[0]
+			if podutil.IsPodReady(pod) {
+				numberReady++
+				if podutil.IsPodAvailable(pod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}) {
+					numberAvailable++
 				}
-				if util.IsPodUpdated(ds.Spec.TemplateGeneration, pod, hash) {
-					updatedNumberScheduled++
-				}
+			}
+			// If the returned error is not nil we have a parse error.
+			// The controller handles this via the hash.
+			generation, err := util.GetTemplateGeneration(ds)
+			if err != nil {
+				generation = nil
+			}
+			if util.IsPodUpdated(pod, hash, generation) {
+				updatedNumberScheduled++
 			}
 		} else {
 			if scheduled {
@@ -1071,32 +1258,72 @@ func (dsc *DaemonSetsController) updateDaemonSetStatus(ds *extensions.DaemonSet,
 	}
 	numberUnavailable := desiredNumberScheduled - numberAvailable
 
-	err = storeDaemonSetStatus(dsc.kubeClient.ExtensionsV1beta1().DaemonSets(ds.Namespace), ds, desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable, numberUnavailable)
+	updatedDS, err := storeDaemonSetStatus(ctx, dsc.kubeClient.AppsV1().DaemonSets(ds.Namespace), ds, desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable, numberUnavailable, updateObservedGen)
 	if err != nil {
-		return fmt.Errorf("error storing status for daemon set %#v: %v", ds, err)
+		return fmt.Errorf("error storing status for daemon set %#v: %w", ds, err)
+	}
+	if updatedDS != nil {
+		dsc.consistencyStore.WroteAt(
+			types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace},
+			updatedDS.UID,
+			daemonsetGroupResource,
+			updatedDS.ResourceVersion,
+		)
 	}
 
+	// Resync the DaemonSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	if ds.Spec.MinReadySeconds > 0 && numberReady != numberAvailable {
+		dsc.enqueueDaemonSetAfter(ds, time.Duration(ds.Spec.MinReadySeconds)*time.Second)
+	}
 	return nil
 }
 
-func (dsc *DaemonSetsController) syncDaemonSet(key string) error {
-	startTime := time.Now()
+func (dsc *DaemonSetsController) syncDaemonSet(ctx context.Context, key string) error {
+	logger := klog.FromContext(ctx)
+	startTime := dsc.failedPodsBackoff.Clock.Now()
+
 	defer func() {
-		glog.V(4).Infof("Finished syncing daemon set %q (%v)", key, time.Now().Sub(startTime))
+		logger.V(4).Info("Finished syncing daemon set", "daemonset", key, "time", dsc.failedPodsBackoff.Clock.Now().Sub(startTime))
 	}()
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
 	}
+
+	dsNamespacedName := types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}
+
+	// If our writes have not yet been observed by our informers, we should not
+	// continue since our reads will not be in sync with our previously enacted
+	// state.
+	if err := dsc.consistencyStore.EnsureReady(dsNamespacedName); err != nil {
+		var consistencyErr *consistencyutil.ConsistencyError
+		if errors.As(err, &consistencyErr) {
+			metrics.DaemonsetRequeueSkips.WithLabelValues(
+				consistencyErr.GroupResource.Group,
+				consistencyErr.GroupResource.Resource,
+			).Inc()
+		}
+		return err
+	}
+
 	ds, err := dsc.dsLister.DaemonSets(namespace).Get(name)
-	if errors.IsNotFound(err) {
-		glog.V(3).Infof("daemon set has been deleted %v", key)
-		dsc.expectations.DeleteExpectations(key)
+	if apierrors.IsNotFound(err) {
+		logger.V(3).Info("Daemon set has been deleted", "daemonset", key)
+		dsc.expectations.DeleteExpectations(logger, key)
+		dsc.consistencyStore.Clear(dsNamespacedName, "")
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("unable to retrieve ds %v from store: %v", key, err)
+	}
+
+	nodeList, err := dsc.nodeLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("couldn't get list of nodes when syncing daemon set %#v: %v", ds, err)
 	}
 
 	everything := metav1.LabelSelector{}
@@ -1113,271 +1340,252 @@ func (dsc *DaemonSetsController) syncDaemonSet(key string) error {
 		return fmt.Errorf("couldn't get key for object %#v: %v", ds, err)
 	}
 
+	// If the DaemonSet is being deleted (either by foreground deletion or
+	// orphan deletion), we cannot be sure if the DaemonSet history objects
+	// it owned still exist -- those history objects can either be deleted
+	// or orphaned. Garbage collector doesn't guarantee that it will delete
+	// DaemonSet pods before deleting DaemonSet history objects, because
+	// DaemonSet history doesn't own DaemonSet pods. We cannot reliably
+	// calculate the status of a DaemonSet being deleted. Therefore, return
+	// here without updating status for the DaemonSet being deleted.
+	if ds.DeletionTimestamp != nil {
+		return nil
+	}
+
 	// Construct histories of the DaemonSet, and get the hash of current history
-	cur, old, err := dsc.constructHistory(ds)
+	cur, old, err := dsc.constructHistory(ctx, ds)
 	if err != nil {
 		return fmt.Errorf("failed to construct revisions of DaemonSet: %v", err)
 	}
-	hash := cur.Labels[extensions.DefaultDaemonSetUniqueLabelKey]
+	hash := cur.Labels[apps.DefaultDaemonSetUniqueLabelKey]
 
-	if ds.DeletionTimestamp != nil || !dsc.expectations.SatisfiedExpectations(dsKey) {
-		// Only update status.
-		return dsc.updateDaemonSetStatus(ds, hash)
+	if !dsc.expectations.SatisfiedExpectations(logger, dsKey) {
+		// Only update status. Don't raise observedGeneration since controller didn't process object of that generation.
+		return dsc.updateDaemonSetStatus(ctx, ds, nodeList, hash, false)
 	}
 
-	err = dsc.manage(ds, hash)
-	if err != nil {
+	err = dsc.updateDaemonSet(ctx, ds, nodeList, hash, dsKey, old)
+	statusErr := dsc.updateDaemonSetStatus(ctx, ds, nodeList, hash, true)
+	switch {
+	case err != nil && statusErr != nil:
+		// If there was an error, and we failed to update status,
+		// log it and return the original error.
+		logger.Error(statusErr, "Failed to update status", "daemonSet", klog.KObj(ds))
 		return err
+	case err != nil:
+		return err
+	case statusErr != nil:
+		return statusErr
 	}
 
-	// Process rolling updates if we're ready.
-	if dsc.expectations.SatisfiedExpectations(dsKey) {
-		switch ds.Spec.UpdateStrategy.Type {
-		case extensions.OnDeleteDaemonSetStrategyType:
-		case extensions.RollingUpdateDaemonSetStrategyType:
-			err = dsc.rollingUpdate(ds, hash)
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	err = dsc.cleanupHistory(ds, old)
-	if err != nil {
-		return fmt.Errorf("failed to clean up revisions of DaemonSet: %v", err)
-	}
-
-	return dsc.updateDaemonSetStatus(ds, hash)
+	return nil
 }
 
-func (dsc *DaemonSetsController) simulate(newPod *v1.Pod, node *v1.Node, ds *extensions.DaemonSet) ([]algorithm.PredicateFailureReason, *schedulercache.NodeInfo, error) {
-	// DaemonSet pods shouldn't be deleted by NodeController in case of node problems.
-	// Add infinite toleration for taint notReady:NoExecute here
-	// to survive taint-based eviction enforced by NodeController
-	// when node turns not ready.
-	v1helper.AddOrUpdateTolerationInPod(newPod, &v1.Toleration{
-		Key:      algorithm.TaintNodeNotReady,
-		Operator: v1.TolerationOpExists,
-		Effect:   v1.TaintEffectNoExecute,
-	})
-
-	// DaemonSet pods shouldn't be deleted by NodeController in case of node problems.
-	// Add infinite toleration for taint unreachable:NoExecute here
-	// to survive taint-based eviction enforced by NodeController
-	// when node turns unreachable.
-	v1helper.AddOrUpdateTolerationInPod(newPod, &v1.Toleration{
-		Key:      algorithm.TaintNodeUnreachable,
-		Operator: v1.TolerationOpExists,
-		Effect:   v1.TaintEffectNoExecute,
-	})
-
-	// According to TaintNodesByCondition, all DaemonSet pods should tolerate
-	// MemoryPressure and DisPressure taints, and the critical pods should tolerate
-	// OutOfDisk taint additional.
-	v1helper.AddOrUpdateTolerationInPod(newPod, &v1.Toleration{
-		Key:      algorithm.TaintNodeDiskPressure,
-		Operator: v1.TolerationOpExists,
-		Effect:   v1.TaintEffectNoSchedule,
-	})
-
-	v1helper.AddOrUpdateTolerationInPod(newPod, &v1.Toleration{
-		Key:      algorithm.TaintNodeMemoryPressure,
-		Operator: v1.TolerationOpExists,
-		Effect:   v1.TaintEffectNoSchedule,
-	})
-
-	// TODO(#48843) OutOfDisk taints will be removed in 1.10
-	if utilfeature.DefaultFeatureGate.Enabled(features.ExperimentalCriticalPodAnnotation) &&
-		kubelettypes.IsCriticalPod(newPod) {
-		v1helper.AddOrUpdateTolerationInPod(newPod, &v1.Toleration{
-			Key:      algorithm.TaintNodeOutOfDisk,
-			Operator: v1.TolerationOpExists,
-			Effect:   v1.TaintEffectNoSchedule,
-		})
-	}
-
-	pods := []*v1.Pod{}
-
-	podList, err := dsc.podLister.List(labels.Everything())
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, pod := range podList {
-		if pod.Spec.NodeName != node.Name {
-			continue
-		}
-		if pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
-			continue
-		}
-		// ignore pods that belong to the daemonset when taking into account whether
-		// a daemonset should bind to a node.
-		if metav1.IsControlledBy(pod, ds) {
-			continue
-		}
-		pods = append(pods, pod)
-	}
-
-	nodeInfo := schedulercache.NewNodeInfo(pods...)
-	nodeInfo.SetNode(node)
-
-	_, reasons, err := Predicates(newPod, nodeInfo)
-	return reasons, nodeInfo, err
-}
-
-// nodeShouldRunDaemonPod checks a set of preconditions against a (node,daemonset) and returns a
+// NodeShouldRunDaemonPod checks a set of preconditions against a (node,daemonset) and returns a
 // summary. Returned booleans are:
-// * wantToRun:
-//     Returns true when a user would expect a pod to run on this node and ignores conditions
-//     such as DiskPressure or insufficient resource that would cause a daemonset pod not to schedule.
-//     This is primarily used to populate daemonset status.
-// * shouldSchedule:
-//     Returns true when a daemonset should be scheduled to a node if a daemonset pod is not already
+//   - shouldRun:
+//     Returns true when a daemonset should run on the node if a daemonset pod is not already
 //     running on that node.
-// * shouldContinueRunning:
+//   - shouldContinueRunning:
 //     Returns true when a daemonset should continue running on a node if a daemonset pod is already
 //     running on that node.
-func (dsc *DaemonSetsController) nodeShouldRunDaemonPod(node *v1.Node, ds *extensions.DaemonSet) (wantToRun, shouldSchedule, shouldContinueRunning bool, err error) {
-	newPod := NewPod(ds, node.Name)
+func NodeShouldRunDaemonPod(logger klog.Logger, node *v1.Node, ds *apps.DaemonSet) (bool, bool) {
+	return nodeShouldRunDaemonPod(logger, node, ds, daemonPodTolerations(ds),
+		nodeaffinity.NewRequiredNodeAffinity(ds.Spec.Template.Spec.NodeSelector, ds.Spec.Template.Spec.Affinity))
+}
 
-	// Because these bools require an && of all their required conditions, we start
-	// with all bools set to true and set a bool to false if a condition is not met.
-	// A bool should probably not be set to true after this line.
-	wantToRun, shouldSchedule, shouldContinueRunning = true, true, true
+// daemonPodTolerations returns the tolerations of the pods this DaemonSet
+// creates: the template's tolerations plus the defaults every daemon pod
+// gets. The template is not modified.
+func daemonPodTolerations(ds *apps.DaemonSet) []v1.Toleration {
+	spec := ds.Spec.Template.Spec
+	util.AddOrUpdateDaemonPodTolerations(&spec)
+	return spec.Tolerations
+}
+
+// nodeShouldRunDaemonPod is NodeShouldRunDaemonPod for callers that evaluate
+// many nodes against the same DaemonSet: tolerations and requiredNodeAffinity
+// depend only on ds — daemonPodTolerations(ds) and the parsing result of the
+// pod template's nodeSelector and affinity — so per-node loops build them
+// once instead of once per node. Parsing the required node affinity
+// dominates the cost of this check, and the sync paths run it for every node
+// in the cluster.
+func nodeShouldRunDaemonPod(logger klog.Logger, node *v1.Node, ds *apps.DaemonSet, tolerations []v1.Toleration, requiredNodeAffinity nodeaffinity.RequiredNodeAffinity) (bool, bool) {
 	// If the daemon set specifies a node name, check that it matches with node.Name.
 	if !(ds.Spec.Template.Spec.NodeName == "" || ds.Spec.Template.Spec.NodeName == node.Name) {
-		return false, false, false, nil
+		return false, false
 	}
 
-	reasons, nodeInfo, err := dsc.simulate(newPod, node, ds)
-	if err != nil {
-		glog.Warningf("DaemonSet Predicates failed on node %s for ds '%s/%s' due to unexpected error: %v", node.Name, ds.ObjectMeta.Namespace, ds.ObjectMeta.Name, err)
-		return false, false, false, err
+	taints := node.Spec.Taints
+	fitsNodeAffinity, fitsTaints := predicates(logger, node, taints, tolerations, requiredNodeAffinity)
+	if !fitsNodeAffinity {
+		return false, false
 	}
 
-	var insufficientResourceErr error
-	for _, r := range reasons {
-		glog.V(4).Infof("DaemonSet Predicates failed on node %s for ds '%s/%s' for reason: %v", node.Name, ds.ObjectMeta.Namespace, ds.ObjectMeta.Name, r.GetReason())
-		switch reason := r.(type) {
-		case *predicates.InsufficientResourceError:
-			insufficientResourceErr = reason
-		case *predicates.PredicateFailureError:
-			var emitEvent bool
-			// we try to partition predicates into two partitions here: intentional on the part of the operator and not.
-			switch reason {
-			// intentional
-			case
-				predicates.ErrNodeSelectorNotMatch,
-				predicates.ErrPodNotMatchHostName,
-				predicates.ErrNodeLabelPresenceViolated,
-				// this one is probably intentional since it's a workaround for not having
-				// pod hard anti affinity.
-				predicates.ErrPodNotFitsHostPorts:
-				return false, false, false, nil
-			case predicates.ErrTaintsTolerationsNotMatch:
-				// DaemonSet is expected to respect taints and tolerations
-				fitsNoExecute, _, err := predicates.PodToleratesNodeNoExecuteTaints(newPod, nil, nodeInfo)
-				if err != nil {
-					return false, false, false, err
-				}
-				if !fitsNoExecute {
-					return false, false, false, nil
-				}
-				wantToRun, shouldSchedule = false, false
-			// unintentional
-			case
-				predicates.ErrDiskConflict,
-				predicates.ErrVolumeZoneConflict,
-				predicates.ErrMaxVolumeCountExceeded,
-				predicates.ErrNodeUnderMemoryPressure,
-				predicates.ErrNodeUnderDiskPressure:
-				// wantToRun and shouldContinueRunning are likely true here. They are
-				// absolutely true at the time of writing the comment. See first comment
-				// of this method.
-				shouldSchedule = false
-				emitEvent = true
-			// unexpected
-			case
-				predicates.ErrPodAffinityNotMatch,
-				predicates.ErrServiceAffinityViolated:
-				glog.Warningf("unexpected predicate failure reason: %s", reason.GetReason())
-				return false, false, false, fmt.Errorf("unexpected reason: DaemonSet Predicates should not return reason %s", reason.GetReason())
-			default:
-				glog.V(4).Infof("unknown predicate failure reason: %s", reason.GetReason())
-				wantToRun, shouldSchedule, shouldContinueRunning = false, false, false
-				emitEvent = true
-			}
-			if emitEvent {
-				dsc.eventRecorder.Eventf(ds, v1.EventTypeWarning, FailedPlacementReason, "failed to place pod on %q: %s", node.ObjectMeta.Name, reason.GetReason())
-			}
-		}
+	if !fitsTaints {
+		// Scheduled daemon pods should continue running if they tolerate NoExecute taint.
+		_, hasUntoleratedTaint := v1helper.FindMatchingUntoleratedTaint(logger, taints, tolerations, func(t *v1.Taint) bool {
+			return t.Effect == v1.TaintEffectNoExecute
+		}, utilfeature.DefaultFeatureGate.Enabled(features.TaintTolerationComparisonOperators))
+		return false, !hasUntoleratedTaint
 	}
-	// only emit this event if insufficient resource is the only thing
-	// preventing the daemon pod from scheduling
-	if shouldSchedule && insufficientResourceErr != nil {
-		dsc.eventRecorder.Eventf(ds, v1.EventTypeWarning, FailedPlacementReason, "failed to place pod on %q: %s", node.ObjectMeta.Name, insufficientResourceErr.Error())
-		shouldSchedule = false
-	}
+
+	return true, true
+}
+
+// predicates checks if a DaemonSet's pod can run on a node. tolerations and
+// requiredNodeAffinity must be derived from the DaemonSet's pod template
+// (see NodeShouldRunDaemonPod).
+func predicates(logger klog.Logger, node *v1.Node, taints []v1.Taint, tolerations []v1.Toleration, requiredNodeAffinity nodeaffinity.RequiredNodeAffinity) (fitsNodeAffinity, fitsTaints bool) {
+	// Ignore parsing errors for backwards compatibility.
+	fitsNodeAffinity, _ = requiredNodeAffinity.Match(node)
+	_, hasUntoleratedTaint := v1helper.FindMatchingUntoleratedTaint(logger, taints, tolerations, func(t *v1.Taint) bool {
+		return t.Effect == v1.TaintEffectNoExecute || t.Effect == v1.TaintEffectNoSchedule
+	}, utilfeature.DefaultFeatureGate.Enabled(features.TaintTolerationComparisonOperators))
+	fitsTaints = !hasUntoleratedTaint
 	return
 }
 
-func NewPod(ds *extensions.DaemonSet, nodeName string) *v1.Pod {
+// NewPod creates a new pod
+func NewPod(ds *apps.DaemonSet, nodeName string) *v1.Pod {
 	newPod := &v1.Pod{Spec: ds.Spec.Template.Spec, ObjectMeta: ds.Spec.Template.ObjectMeta}
 	newPod.Namespace = ds.Namespace
 	newPod.Spec.NodeName = nodeName
+
+	// Added default tolerations for DaemonSet pods.
+	util.AddOrUpdateDaemonPodTolerations(&newPod.Spec)
+
 	return newPod
 }
 
-// Predicates checks if a DaemonSet's pod can be scheduled on a node using GeneralPredicates
-// and PodToleratesNodeTaints predicate
-func Predicates(pod *v1.Pod, nodeInfo *schedulercache.NodeInfo) (bool, []algorithm.PredicateFailureReason, error) {
-	var predicateFails []algorithm.PredicateFailureReason
-	critical := utilfeature.DefaultFeatureGate.Enabled(features.ExperimentalCriticalPodAnnotation) && kubelettypes.IsCriticalPod(pod)
+type podByCreationTimestampAndPhase []*v1.Pod
 
-	fit, reasons, err := predicates.PodToleratesNodeTaints(pod, nil, nodeInfo)
-	if err != nil {
-		return false, predicateFails, err
-	}
-	if !fit {
-		predicateFails = append(predicateFails, reasons...)
-	}
-	if critical {
-		// If the pod is marked as critical and support for critical pod annotations is enabled,
-		// check predicates for critical pods only.
-		fit, reasons, err = predicates.EssentialPredicates(pod, nil, nodeInfo)
-	} else {
-		fit, reasons, err = predicates.GeneralPredicates(pod, nil, nodeInfo)
-	}
-	if err != nil {
-		return false, predicateFails, err
-	}
-	if !fit {
-		predicateFails = append(predicateFails, reasons...)
+func (o podByCreationTimestampAndPhase) Len() int      { return len(o) }
+func (o podByCreationTimestampAndPhase) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+
+func (o podByCreationTimestampAndPhase) Less(i, j int) bool {
+	// Scheduled Pod first
+	if len(o[i].Spec.NodeName) != 0 && len(o[j].Spec.NodeName) == 0 {
+		return true
 	}
 
-	return len(predicateFails) == 0, predicateFails, nil
-}
+	if len(o[i].Spec.NodeName) == 0 && len(o[j].Spec.NodeName) != 0 {
+		return false
+	}
 
-// byCreationTimestamp sorts a list by creation timestamp, using their names as a tie breaker.
-type byCreationTimestamp []*extensions.DaemonSet
-
-func (o byCreationTimestamp) Len() int      { return len(o) }
-func (o byCreationTimestamp) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
-
-func (o byCreationTimestamp) Less(i, j int) bool {
 	if o[i].CreationTimestamp.Equal(&o[j].CreationTimestamp) {
 		return o[i].Name < o[j].Name
 	}
 	return o[i].CreationTimestamp.Before(&o[j].CreationTimestamp)
 }
 
-type podByCreationTimestamp []*v1.Pod
+func failedPodsBackoffKey(ds *apps.DaemonSet, nodeName string) string {
+	return fmt.Sprintf("%s/%d/%s", ds.UID, ds.Status.ObservedGeneration, nodeName)
+}
 
-func (o podByCreationTimestamp) Len() int      { return len(o) }
-func (o podByCreationTimestamp) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
-
-func (o podByCreationTimestamp) Less(i, j int) bool {
-	if o[i].CreationTimestamp.Equal(&o[j].CreationTimestamp) {
-		return o[i].Name < o[j].Name
+// getUnscheduledPodsWithoutNode returns list of unscheduled pods assigned to not existing nodes.
+// Returned pods can't be deleted by PodGCController so they should be deleted by DaemonSetController.
+func getUnscheduledPodsWithoutNode(runningNodesList []*v1.Node, nodeToDaemonPods map[string][]*v1.Pod) []string {
+	var results []string
+	isNodeRunning := make(map[string]bool, len(runningNodesList))
+	for _, node := range runningNodesList {
+		isNodeRunning[node.Name] = true
 	}
-	return o[i].CreationTimestamp.Before(&o[j].CreationTimestamp)
+
+	for n, pods := range nodeToDaemonPods {
+		if isNodeRunning[n] {
+			continue
+		}
+		for _, pod := range pods {
+			if len(pod.Spec.NodeName) == 0 {
+				results = append(results, pod.Name)
+			}
+		}
+	}
+
+	return results
+}
+
+// runNodeUpdateWorker is a worker that processes node updates from the nodeUpdateQueue.
+func (dsc *DaemonSetsController) runNodeUpdateWorker(ctx context.Context) {
+	for dsc.processNextNodeUpdate(ctx) {
+	}
+}
+
+func (dsc *DaemonSetsController) processNextNodeUpdate(ctx context.Context) bool {
+	nodeName, quit := dsc.nodeUpdateQueue.Get()
+	if quit {
+		return false
+	}
+	defer dsc.nodeUpdateQueue.Done(nodeName)
+
+	err := dsc.syncNodeUpdate(ctx, nodeName)
+	if err == nil {
+		dsc.nodeUpdateQueue.Forget(nodeName)
+		return true
+	}
+
+	utilruntime.HandleError(fmt.Errorf("%v failed with : %w", nodeName, err))
+	dsc.nodeUpdateQueue.AddRateLimited(nodeName)
+
+	return true
+}
+
+func (dsc *DaemonSetsController) syncNodeUpdate(ctx context.Context, nodeName string) error {
+	logger := klog.FromContext(ctx)
+
+	node, err := dsc.nodeLister.Get(nodeName)
+	if apierrors.IsNotFound(err) {
+		logger.V(3).Info("Node not found, skipping update", "node", nodeName)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("error getting node %s: %w", nodeName, err)
+	}
+
+	dsList, err := dsc.dsLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("error listing daemon sets: %w", err)
+	}
+
+	podsOnNode, err := dsc.podIndexer.ByIndex(controller.PodNodeNameKeyIndex, nodeName)
+	if err != nil {
+		return fmt.Errorf("error getting pods by node name: %w", err)
+	}
+
+	podsByDS := make(map[string][]*v1.Pod)
+	for _, obj := range podsOnNode {
+		pod := obj.(*v1.Pod)
+		controllerRef := metav1.GetControllerOf(pod)
+		if controllerRef == nil || controllerRef.Kind != controllerKind.Kind {
+			continue
+		}
+		dsKey := cache.NewObjectName(pod.Namespace, controllerRef.Name).String()
+		podsByDS[dsKey] = append(podsByDS[dsKey], pod)
+	}
+
+	for _, ds := range dsList {
+		shouldRun, shouldContinueRunning := NodeShouldRunDaemonPod(logger, node, ds)
+
+		dsKey, err := controller.KeyFunc(ds)
+		if err != nil {
+			return fmt.Errorf("error getting key for object %#v: %w", ds, err)
+		}
+		daemonPods := podsByDS[dsKey]
+		scheduled := len(daemonPods) > 0
+
+		// Enqueue DaemonSet for sync in the following scenarios:
+		// 1. (shouldRun && !scheduled): Node now meets scheduling requirements but no pod exists
+		//    - Need to create a new pod on this node
+		// 2. (!shouldContinueRunning && scheduled): Node no longer meets requirements but pod exists
+		//    - Need to delete the existing pod from this node
+		// 3. (scheduled && ds.Status.NumberMisscheduled > 0): DaemonSet pod exists and misscheduled count is nonzero.
+		//    - For example: a pod was scheduled before the node became unready and tainted; after the node becomes ready and taints are removed, the pod may now be valid again.
+		//    - Need to recalculate NumberMisscheduled to ensure the DaemonSet status accurately reflects the current scheduling state.
+		if (shouldRun && !scheduled) || (!shouldContinueRunning && scheduled) || (scheduled && ds.Status.NumberMisscheduled > 0) {
+			dsc.enqueueDaemonSet(ds)
+		}
+	}
+
+	return nil
 }

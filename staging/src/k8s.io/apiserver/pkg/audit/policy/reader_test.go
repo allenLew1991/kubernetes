@@ -17,42 +17,23 @@ limitations under the License.
 package policy
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apiserver/pkg/apis/audit"
+
 	// import to call webhook's init() function to register audit.Policy to schema
 	_ "k8s.io/apiserver/plugin/pkg/audit/webhook"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-const policyDefV1alpha1 = `
-apiVersion: audit.k8s.io/v1alpha1
-kind: Policy
-rules:
-  - level: None
-    nonResourceURLs:
-      - /healthz*
-      - /version
-  - level: RequestResponse
-    users: ["tim"]
-    userGroups: ["testers", "developers"]
-    verbs: ["patch", "delete", "create"]
-    resources:
-      - group: ""
-      - group: "rbac.authorization.k8s.io"
-        resources: ["clusterroles", "clusterrolebindings"]
-    namespaces: ["default", "kube-system"]
-  - level: Metadata
-`
-
-const policyDefV1beta1 = `
-apiVersion: audit.k8s.io/v1beta1
+const policyDefPattern = `
+apiVersion: audit.k8s.io/{version}
 kind: Policy
 rules:
   - level: None
@@ -89,6 +70,18 @@ rules:
   - level: Metadata
 `
 
+const policyWithUnknownField = `
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+- level: None
+  resources:
+  - group: coordination.k8s.io
+    resources:
+    - "leases"
+    verbs: ["watch", "get", "list"] # invalid indentation on verbs
+`
+
 var expectedPolicy = &audit.Policy{
 	Rules: []audit.PolicyRule{{
 		Level:           audit.LevelNone,
@@ -108,8 +101,9 @@ var expectedPolicy = &audit.Policy{
 	}},
 }
 
-func TestParserV1alpha1(t *testing.T) {
-	f, err := writePolicy(t, policyDefV1alpha1)
+func TestParser(t *testing.T) {
+	policyDef := strings.Replace(policyDefPattern, "{version}", "v1", 1)
+	f, err := writePolicy(t, policyDef)
 	require.NoError(t, err)
 	defer os.Remove(f)
 
@@ -118,7 +112,7 @@ func TestParserV1alpha1(t *testing.T) {
 
 	assert.Len(t, policy.Rules, 3) // Sanity check.
 	if !reflect.DeepEqual(policy, expectedPolicy) {
-		t.Errorf("Unexpected policy! Diff:\n%s", diff.ObjectDiff(policy, expectedPolicy))
+		t.Errorf("Unexpected policy! Diff:\n%s", cmp.Diff(policy, expectedPolicy))
 	}
 }
 
@@ -128,21 +122,16 @@ func TestParsePolicyWithNoVersionOrKind(t *testing.T) {
 	defer os.Remove(f)
 
 	_, err = LoadPolicyFromFile(f)
-	assert.Contains(t, err.Error(), "unknown group version field")
+	assert.ErrorContains(t, err, "unknown group version field")
 }
 
-func TestParserV1beta1(t *testing.T) {
-	f, err := writePolicy(t, policyDefV1beta1)
+func TestParsePolicyWithUnknownField(t *testing.T) {
+	f, err := writePolicy(t, policyWithUnknownField)
 	require.NoError(t, err)
 	defer os.Remove(f)
 
-	policy, err := LoadPolicyFromFile(f)
+	_, err = LoadPolicyFromFile(f)
 	require.NoError(t, err)
-
-	assert.Len(t, policy.Rules, 3) // Sanity check.
-	if !reflect.DeepEqual(policy, expectedPolicy) {
-		t.Errorf("Unexpected policy! Diff:\n%s", diff.ObjectDiff(policy, expectedPolicy))
-	}
 }
 
 func TestPolicyCntCheck(t *testing.T) {
@@ -151,7 +140,7 @@ func TestPolicyCntCheck(t *testing.T) {
 	}{
 		{
 			"policyWithNoRule",
-			`apiVersion: audit.k8s.io/v1beta1
+			`apiVersion: audit.k8s.io/v1
 kind: Policy`,
 		},
 		{"emptyPolicyFile", ""},
@@ -168,7 +157,7 @@ kind: Policy`,
 }
 
 func writePolicy(t *testing.T, policy string) (string, error) {
-	f, err := ioutil.TempFile("", "policy.yaml")
+	f, err := os.CreateTemp("", "policy.yaml")
 	require.NoError(t, err)
 
 	_, err = f.WriteString(policy)

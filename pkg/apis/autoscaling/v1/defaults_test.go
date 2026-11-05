@@ -20,13 +20,16 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	_ "k8s.io/kubernetes/pkg/apis/autoscaling/install"
 	. "k8s.io/kubernetes/pkg/apis/autoscaling/v1"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/utils/ptr"
 )
 
 func TestSetDefaultHPA(t *testing.T) {
@@ -43,7 +46,7 @@ func TestSetDefaultHPA(t *testing.T) {
 		{
 			hpa: autoscalingv1.HorizontalPodAutoscaler{
 				Spec: autoscalingv1.HorizontalPodAutoscalerSpec{
-					MinReplicas: newInt32(3),
+					MinReplicas: ptr.To[int32](3),
 				},
 			},
 			expectReplicas: 3,
@@ -66,6 +69,71 @@ func TestSetDefaultHPA(t *testing.T) {
 	}
 }
 
+func TestHorizontalPodAutoscalerAnnotations(t *testing.T) {
+	tests := []struct {
+		hpa  autoscalingv1.HorizontalPodAutoscaler
+		test string
+	}{
+		{
+			hpa: autoscalingv1.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "",
+						autoscaling.MetricSpecsAnnotation:                       "",
+						autoscaling.BehaviorSpecsAnnotation:                     "",
+						autoscaling.MetricStatusesAnnotation:                    "",
+					},
+				},
+			},
+			test: "test empty value for Annotations",
+		},
+		{
+			hpa: autoscalingv1.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "abc",
+						autoscaling.MetricSpecsAnnotation:                       "abc",
+						autoscaling.BehaviorSpecsAnnotation:                     "abc",
+						autoscaling.MetricStatusesAnnotation:                    "abc",
+					},
+				},
+			},
+			test: "test random value for Annotations",
+		},
+		{
+			hpa: autoscalingv1.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "[]",
+						autoscaling.MetricSpecsAnnotation:                       "[]",
+						autoscaling.BehaviorSpecsAnnotation:                     "[]",
+						autoscaling.MetricStatusesAnnotation:                    "[]",
+					},
+				},
+			},
+			test: "test empty array value for Annotations",
+		},
+	}
+
+	for _, test := range tests {
+		hpa := &test.hpa
+		hpaBeforeMuatate := *hpa.DeepCopy()
+		obj := roundTrip(t, runtime.Object(hpa))
+		final_obj, ok := obj.(*autoscalingv1.HorizontalPodAutoscaler)
+		if !ok {
+			t.Fatalf("unexpected object: %v", obj)
+		}
+		if !reflect.DeepEqual(*hpa, hpaBeforeMuatate) {
+			t.Errorf("diff: %v", cmp.Diff(*hpa, hpaBeforeMuatate))
+			t.Errorf("expected: %#v\n actual:   %#v", *hpa, hpaBeforeMuatate)
+		}
+
+		if len(final_obj.ObjectMeta.Annotations) != 0 {
+			t.Fatalf("unexpected annotations: %v", final_obj.ObjectMeta.Annotations)
+		}
+	}
+}
+
 func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 	data, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(SchemeGroupVersion), obj)
 	if err != nil {
@@ -84,10 +152,4 @@ func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 		return nil
 	}
 	return obj3
-}
-
-func newInt32(val int32) *int32 {
-	p := new(int32)
-	*p = val
-	return p
 }

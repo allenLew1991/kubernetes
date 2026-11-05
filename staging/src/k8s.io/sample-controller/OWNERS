@@ -1,9 +1,15 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- sttts
-- munnerz
+  - deads2k
+  - jpbetz
+  - sttts
+  - munnerz
 reviewers:
-- gregory-m
-- kargakis
-- sttts
-- munnerz
-- nikhita
+  - deads2k
+  - sttts
+  - munnerz
+  - nikhita
+  - jefftree
+labels:
+  - sig/api-machinery

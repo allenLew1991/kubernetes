@@ -17,26 +17,35 @@ limitations under the License.
 package authorizer
 
 import (
-	"errors"
+	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	authzconfig "k8s.io/apiserver/pkg/apis/apiserver"
+	"k8s.io/apiserver/pkg/apis/apiserver/load"
+	"k8s.io/apiserver/pkg/apis/apiserver/validation"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
-	"k8s.io/apiserver/pkg/authorization/union"
-	"k8s.io/apiserver/plugin/pkg/authorizer/webhook"
+	authorizationcel "k8s.io/apiserver/pkg/authorization/cel"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	versionedinformers "k8s.io/client-go/informers"
+	certinformersv1 "k8s.io/client-go/informers/certificates/v1"
 	"k8s.io/kubernetes/pkg/auth/authorizer/abac"
 	"k8s.io/kubernetes/pkg/auth/nodeidentifier"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/node"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac/bootstrappolicy"
 )
 
-type AuthorizationConfig struct {
-	AuthorizationModes []string
-
+// Config contains the data on how to authorize a request to the Kube API Server
+type Config struct {
 	// Options for ModeABAC
 
 	// Path to an ABAC policy file.
@@ -44,96 +53,170 @@ type AuthorizationConfig struct {
 
 	// Options for ModeWebhook
 
-	// Kubeconfig file for Webhook authorization plugin.
-	WebhookConfigFile string
-	// TTL for caching of authorized responses from the webhook server.
-	WebhookCacheAuthorizedTTL time.Duration
-	// TTL for caching of unauthorized responses from the webhook server.
-	WebhookCacheUnauthorizedTTL time.Duration
+	// WebhookRetryBackoff specifies the backoff parameters for the authorization webhook retry logic.
+	// This allows us to configure the sleep time at each iteration and the maximum number of retries allowed
+	// before we fail the webhook call in order to limit the fan out that ensues when the system is degraded.
+	WebhookRetryBackoff *wait.Backoff
 
-	InformerFactory informers.SharedInformerFactory
+	VersionedInformerFactory versionedinformers.SharedInformerFactory
+
+	// Optional field, custom dial function used to connect to webhook
+	CustomDial utilnet.DialFunc
+
+	// ReloadFile holds the filename to reload authorization configuration from
+	ReloadFile string
+	// AuthorizationConfiguration stores the configuration for the Authorizer chain
+	// It will deprecate most of the above flags when GA
+	AuthorizationConfiguration *authzconfig.AuthorizationConfiguration
+	// InitialAuthorizationConfigurationData holds the initial authorization configuration data
+	// that was read from the authorization configuration file.
+	InitialAuthorizationConfigurationData string
 }
 
 // New returns the right sort of union of multiple authorizer.Authorizer objects
 // based on the authorizationMode or an error.
-func (config AuthorizationConfig) New() (authorizer.Authorizer, authorizer.RuleResolver, error) {
-	if len(config.AuthorizationModes) == 0 {
-		return nil, nil, errors.New("At least one authorization mode should be passed")
+// stopCh is used to shut down config reload goroutines when the server is shutting down.
+//
+// Note: the cel compiler construction depends on feature gates and the compatibility version to be initialized.
+func (config Config) New(ctx context.Context, serverID string) (authorizer.Authorizer, authorizer.RuleResolver, error) {
+	if len(config.AuthorizationConfiguration.Authorizers) == 0 {
+		return nil, nil, fmt.Errorf("at least one authorization mode must be passed")
 	}
 
-	var (
-		authorizers   []authorizer.Authorizer
-		ruleResolvers []authorizer.RuleResolver
-	)
-	authorizerMap := make(map[string]bool)
+	r := &reloadableAuthorizerResolver{
+		initialConfig:    config,
+		apiServerID:      serverID,
+		lastLoadedConfig: config.AuthorizationConfiguration,
+		lastReadData:     []byte(config.InitialAuthorizationConfigurationData),
+		reloadInterval:   time.Minute,
+		compiler:         authorizationcel.NewDefaultCompiler(),
+	}
 
-	for _, authorizationMode := range config.AuthorizationModes {
-		if authorizerMap[authorizationMode] {
-			return nil, nil, fmt.Errorf("Authorization mode %s specified more than once", authorizationMode)
-		}
-		// Keep cases in sync with constant list above.
-		switch authorizationMode {
-		case modes.ModeNode:
+	seenTypes := sets.New[authzconfig.AuthorizerType]()
+
+	// Build and store authorizers which will persist across reloads
+	for _, configuredAuthorizer := range config.AuthorizationConfiguration.Authorizers {
+		seenTypes.Insert(configuredAuthorizer.Type)
+
+		// Keep cases in sync with constant list in k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes/modes.go.
+		switch configuredAuthorizer.Type {
+		case authzconfig.AuthorizerType(modes.ModeNode):
+			var podCertificateRequestInformer certinformersv1.PodCertificateRequestInformer
+			if utilfeature.DefaultFeatureGate.Enabled(features.PodCertificateRequest) {
+				podCertificateRequestInformer = config.VersionedInformerFactory.Certificates().V1().PodCertificateRequests()
+			}
+			node.RegisterMetrics()
 			graph := node.NewGraph()
 			node.AddGraphEventHandlers(
+				ctx,
 				graph,
-				config.InformerFactory.Core().InternalVersion().Pods(),
-				config.InformerFactory.Core().InternalVersion().PersistentVolumes(),
+				config.VersionedInformerFactory.Core().V1().Nodes(),
+				config.VersionedInformerFactory.Core().V1().Pods(),
+				config.VersionedInformerFactory.Core().V1().PersistentVolumes(),
+				config.VersionedInformerFactory.Storage().V1().VolumeAttachments(),
+				config.VersionedInformerFactory.Resource().V1().ResourceSlices(),
+				podCertificateRequestInformer,
 			)
-			nodeAuthorizer := node.NewAuthorizer(graph, nodeidentifier.NewDefaultNodeIdentifier(), bootstrappolicy.NodeRules())
-			authorizers = append(authorizers, nodeAuthorizer)
+			r.nodeAuthorizer = node.NewAuthorizer(graph, nodeidentifier.NewDefaultNodeIdentifier(), bootstrappolicy.NodeRules())
 
-		case modes.ModeAlwaysAllow:
-			alwaysAllowAuthorizer := authorizerfactory.NewAlwaysAllowAuthorizer()
-			authorizers = append(authorizers, alwaysAllowAuthorizer)
-			ruleResolvers = append(ruleResolvers, alwaysAllowAuthorizer)
-		case modes.ModeAlwaysDeny:
-			alwaysDenyAuthorizer := authorizerfactory.NewAlwaysDenyAuthorizer()
-			authorizers = append(authorizers, alwaysDenyAuthorizer)
-			ruleResolvers = append(ruleResolvers, alwaysDenyAuthorizer)
-		case modes.ModeABAC:
-			if config.PolicyFile == "" {
-				return nil, nil, errors.New("ABAC's authorization policy file not passed")
-			}
-			abacAuthorizer, err := abac.NewFromFile(config.PolicyFile)
+		case authzconfig.AuthorizerType(modes.ModeABAC):
+			var err error
+			r.abacAuthorizer, err = abac.NewFromFile(config.PolicyFile)
 			if err != nil {
 				return nil, nil, err
 			}
-			authorizers = append(authorizers, abacAuthorizer)
-			ruleResolvers = append(ruleResolvers, abacAuthorizer)
-		case modes.ModeWebhook:
-			if config.WebhookConfigFile == "" {
-				return nil, nil, errors.New("Webhook's configuration file not passed")
-			}
-			webhookAuthorizer, err := webhook.New(config.WebhookConfigFile,
-				config.WebhookCacheAuthorizedTTL,
-				config.WebhookCacheUnauthorizedTTL)
-			if err != nil {
-				return nil, nil, err
-			}
-			authorizers = append(authorizers, webhookAuthorizer)
-			ruleResolvers = append(ruleResolvers, webhookAuthorizer)
-		case modes.ModeRBAC:
-			rbacAuthorizer := rbac.New(
-				&rbac.RoleGetter{Lister: config.InformerFactory.Rbac().InternalVersion().Roles().Lister()},
-				&rbac.RoleBindingLister{Lister: config.InformerFactory.Rbac().InternalVersion().RoleBindings().Lister()},
-				&rbac.ClusterRoleGetter{Lister: config.InformerFactory.Rbac().InternalVersion().ClusterRoles().Lister()},
-				&rbac.ClusterRoleBindingLister{Lister: config.InformerFactory.Rbac().InternalVersion().ClusterRoleBindings().Lister()},
+		case authzconfig.AuthorizerType(modes.ModeRBAC):
+			r.rbacAuthorizer = rbac.New(
+				&rbac.RoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().Roles().Lister()},
+				&rbac.RoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().RoleBindings().Lister()},
+				&rbac.ClusterRoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoles().Lister()},
+				&rbac.ClusterRoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoleBindings().Lister()},
 			)
-			authorizers = append(authorizers, rbacAuthorizer)
-			ruleResolvers = append(ruleResolvers, rbacAuthorizer)
-		default:
-			return nil, nil, fmt.Errorf("Unknown authorization mode %s specified", authorizationMode)
 		}
-		authorizerMap[authorizationMode] = true
 	}
 
-	if !authorizerMap[modes.ModeABAC] && config.PolicyFile != "" {
-		return nil, nil, errors.New("Cannot specify --authorization-policy-file without mode ABAC")
-	}
-	if !authorizerMap[modes.ModeWebhook] && config.WebhookConfigFile != "" {
-		return nil, nil, errors.New("Cannot specify --authorization-webhook-config-file without mode Webhook")
+	// Require all non-webhook authorizer types to remain specified in the file on reload
+	seenTypes.Delete(authzconfig.TypeWebhook)
+	r.requireNonWebhookTypes = seenTypes
+
+	// Construct the authorizers / ruleResolvers for the given configuration
+	authorizer, ruleResolver, err := r.newForConfig(r.initialConfig.AuthorizationConfiguration)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return union.New(authorizers...), union.NewRuleResolvers(ruleResolvers...), nil
+	r.current.Store(&authorizerResolver{
+		authorizer:   authorizer,
+		ruleResolver: ruleResolver,
+	})
+
+	if r.initialConfig.ReloadFile != "" {
+		go r.runReload(ctx)
+	}
+
+	return r, r, nil
+}
+
+// RepeatableAuthorizerTypes is the list of Authorizer that can be repeated in the Authorization Config
+var repeatableAuthorizerTypes = []string{modes.ModeWebhook}
+
+// GetNameForAuthorizerMode returns the name to be set for the mode in AuthorizationConfiguration
+// For now, lower cases the mode name
+func GetNameForAuthorizerMode(mode string) string {
+	return strings.ToLower(mode)
+}
+
+func LoadAndValidateFile(configFile string, compiler authorizationcel.Compiler, requireNonWebhookTypes sets.Set[authzconfig.AuthorizerType]) (*authzconfig.AuthorizationConfiguration, string, error) {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil, "", err
+	}
+	config, err := LoadAndValidateData(data, compiler, requireNonWebhookTypes)
+	if err != nil {
+		return nil, "", err
+	}
+	return config, string(data), nil
+}
+
+func LoadAndValidateData(data []byte, compiler authorizationcel.Compiler, requireNonWebhookTypes sets.Set[authzconfig.AuthorizerType]) (*authzconfig.AuthorizationConfiguration, error) {
+	// load the file and check for errors
+	authorizationConfiguration, err := load.LoadFromData(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AuthorizationConfiguration from file: %w", err)
+	}
+
+	// validate the file and return any error
+	if errors := validation.ValidateAuthorizationConfiguration(compiler, nil, authorizationConfiguration,
+		sets.New(modes.AuthorizationModeChoices...),
+		sets.New(repeatableAuthorizerTypes...),
+	); len(errors) != 0 {
+		return nil, errors.ToAggregate()
+	}
+
+	// test to check if the authorizer names passed conform to the authorizers for type!=Webhook
+	// this test is only for kube-apiserver and hence checked here
+	// it preserves compatibility with o.buildAuthorizationConfiguration
+	var allErrors []error
+	seenModes := sets.New[authzconfig.AuthorizerType]()
+	for _, authorizer := range authorizationConfiguration.Authorizers {
+		if string(authorizer.Type) == modes.ModeWebhook {
+			continue
+		}
+		seenModes.Insert(authorizer.Type)
+
+		expectedName := GetNameForAuthorizerMode(string(authorizer.Type))
+		if expectedName != authorizer.Name {
+			allErrors = append(allErrors, fmt.Errorf("expected name %s for authorizer %s instead of %s", expectedName, authorizer.Type, authorizer.Name))
+		}
+	}
+
+	if missingTypes := requireNonWebhookTypes.Difference(seenModes); missingTypes.Len() > 0 {
+		allErrors = append(allErrors, fmt.Errorf("missing required types: %v", sets.List(missingTypes)))
+	}
+
+	if len(allErrors) > 0 {
+		return nil, utilerrors.NewAggregate(allErrors)
+	}
+
+	return authorizationConfiguration, nil
 }

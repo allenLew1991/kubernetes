@@ -17,26 +17,27 @@ limitations under the License.
 package utils
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-
-	"k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
+	apps "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	deploymentutil "k8s.io/kubernetes/pkg/controller/deployment/util"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
+	"k8s.io/utils/dump"
 )
 
 type LogfFn func(format string, args ...interface{})
 
-func LogReplicaSetsOfDeployment(deployment *extensions.Deployment, allOldRSs []*extensions.ReplicaSet, newRS *extensions.ReplicaSet, logf LogfFn) {
+func LogReplicaSetsOfDeployment(deployment *apps.Deployment, allOldRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, logf LogfFn) {
 	if newRS != nil {
-		logf(spew.Sprintf("New ReplicaSet %q of Deployment %q:\n%+v", newRS.Name, deployment.Name, *newRS))
+		logf("New ReplicaSet %q of Deployment %q:\n%s", newRS.Name, deployment.Name, dump.Pretty(*newRS))
 	} else {
 		logf("New ReplicaSet of Deployment %q is nil.", deployment.Name)
 	}
@@ -44,14 +45,14 @@ func LogReplicaSetsOfDeployment(deployment *extensions.Deployment, allOldRSs []*
 		logf("All old ReplicaSets of Deployment %q:", deployment.Name)
 	}
 	for i := range allOldRSs {
-		logf(spew.Sprintf("%+v", *allOldRSs[i]))
+		logf(dump.Pretty(*allOldRSs[i]))
 	}
 }
 
-func LogPodsOfDeployment(c clientset.Interface, deployment *extensions.Deployment, rsList []*extensions.ReplicaSet, logf LogfFn) {
+func LogPodsOfDeployment(c clientset.Interface, deployment *apps.Deployment, rsList []*apps.ReplicaSet, logf LogfFn) {
 	minReadySeconds := deployment.Spec.MinReadySeconds
 	podListFunc := func(namespace string, options metav1.ListOptions) (*v1.PodList, error) {
-		return c.CoreV1().Pods(namespace).List(options)
+		return c.CoreV1().Pods(namespace).List(context.TODO(), options)
 	}
 
 	podList, err := deploymentutil.ListPods(deployment, rsList, podListFunc)
@@ -64,7 +65,7 @@ func LogPodsOfDeployment(c clientset.Interface, deployment *extensions.Deploymen
 		if podutil.IsPodAvailable(&pod, minReadySeconds, metav1.Now()) {
 			availability = "available"
 		}
-		logf(spew.Sprintf("Pod %q is %s:\n%+v", pod.Name, availability, pod))
+		logf("Pod %q is %s:\n%s", pod.Name, availability, dump.Pretty(pod))
 	}
 }
 
@@ -72,15 +73,15 @@ func LogPodsOfDeployment(c clientset.Interface, deployment *extensions.Deploymen
 // If during a rolling update (rolling == true), returns an error if the deployment's
 // rolling update strategy (max unavailable or max surge) is broken at any times.
 // It's not seen as a rolling update if shortly after a scaling event or the deployment is just created.
-func waitForDeploymentCompleteMaybeCheckRolling(c clientset.Interface, d *extensions.Deployment, rolling bool, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
+func waitForDeploymentCompleteMaybeCheckRolling(c clientset.Interface, d *apps.Deployment, rolling bool, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
 	var (
-		deployment *extensions.Deployment
+		deployment *apps.Deployment
 		reason     string
 	)
 
 	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
 		var err error
-		deployment, err = c.ExtensionsV1beta1().Deployments(d.Namespace).Get(d.Name, metav1.GetOptions{})
+		deployment, err = c.AppsV1().Deployments(d.Namespace).Get(context.TODO(), d.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -105,7 +106,7 @@ func waitForDeploymentCompleteMaybeCheckRolling(c clientset.Interface, d *extens
 		return false, nil
 	})
 
-	if err == wait.ErrWaitTimeout {
+	if wait.Interrupted(err) {
 		err = fmt.Errorf("%s", reason)
 	}
 	if err != nil {
@@ -114,9 +115,9 @@ func waitForDeploymentCompleteMaybeCheckRolling(c clientset.Interface, d *extens
 	return nil
 }
 
-func checkRollingUpdateStatus(c clientset.Interface, deployment *extensions.Deployment, logf LogfFn) (string, error) {
+func checkRollingUpdateStatus(c clientset.Interface, deployment *apps.Deployment, logf LogfFn) (string, error) {
 	var reason string
-	oldRSs, allOldRSs, newRS, err := deploymentutil.GetAllReplicaSets(deployment, c.ExtensionsV1beta1())
+	oldRSs, allOldRSs, newRS, err := GetAllReplicaSets(deployment, c)
 	if err != nil {
 		return "", err
 	}
@@ -128,7 +129,7 @@ func checkRollingUpdateStatus(c clientset.Interface, deployment *extensions.Depl
 	allRSs := append(oldRSs, newRS)
 	// The old/new ReplicaSets need to contain the pod-template-hash label
 	for i := range allRSs {
-		if !labelsutil.SelectorHasLabel(allRSs[i].Spec.Selector, extensions.DefaultDeploymentUniqueLabelKey) {
+		if !labelsutil.SelectorHasLabel(allRSs[i].Spec.Selector, apps.DefaultDeploymentUniqueLabelKey) {
 			reason = "all replica sets need to contain the pod-template-hash label"
 			return reason, nil
 		}
@@ -151,9 +152,43 @@ func checkRollingUpdateStatus(c clientset.Interface, deployment *extensions.Depl
 	return "", nil
 }
 
+// GetAllReplicaSets returns the old and new replica sets targeted by the given Deployment. It gets PodList and ReplicaSetList from client interface.
+// Note that the first set of old replica sets doesn't include the ones with no pods, and the second set of old replica sets include all old replica sets.
+// The third returned value is the new replica set, and it may be nil if it doesn't exist yet.
+func GetAllReplicaSets(deployment *apps.Deployment, c clientset.Interface) ([]*apps.ReplicaSet, []*apps.ReplicaSet, *apps.ReplicaSet, error) {
+	rsList, err := deploymentutil.ListReplicaSets(deployment, deploymentutil.RsListFromClient(c.AppsV1()))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	oldRSes, allOldRSes := deploymentutil.FindOldReplicaSets(deployment, rsList)
+	newRS := deploymentutil.FindNewReplicaSet(deployment, rsList)
+	return oldRSes, allOldRSes, newRS, nil
+}
+
+// GetOldReplicaSets returns the old replica sets targeted by the given Deployment; get PodList and ReplicaSetList from client interface.
+// Note that the first set of old replica sets doesn't include the ones with no pods, and the second set of old replica sets include all old replica sets.
+func GetOldReplicaSets(deployment *apps.Deployment, c clientset.Interface) ([]*apps.ReplicaSet, []*apps.ReplicaSet, error) {
+	rsList, err := deploymentutil.ListReplicaSets(deployment, deploymentutil.RsListFromClient(c.AppsV1()))
+	if err != nil {
+		return nil, nil, err
+	}
+	oldRSes, allOldRSes := deploymentutil.FindOldReplicaSets(deployment, rsList)
+	return oldRSes, allOldRSes, nil
+}
+
+// GetNewReplicaSet returns a replica set that matches the intent of the given deployment; get ReplicaSetList from client interface.
+// Returns nil if the new replica set doesn't exist yet.
+func GetNewReplicaSet(deployment *apps.Deployment, c clientset.Interface) (*apps.ReplicaSet, error) {
+	rsList, err := deploymentutil.ListReplicaSets(deployment, deploymentutil.RsListFromClient(c.AppsV1()))
+	if err != nil {
+		return nil, err
+	}
+	return deploymentutil.FindNewReplicaSet(deployment, rsList), nil
+}
+
 // Waits for the deployment to complete, and check rolling update strategy isn't broken at any times.
 // Rolling update strategy should not be broken during a rolling update.
-func WaitForDeploymentCompleteAndCheckRolling(c clientset.Interface, d *extensions.Deployment, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
+func WaitForDeploymentCompleteAndCheckRolling(c clientset.Interface, d *apps.Deployment, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
 	rolling := true
 	return waitForDeploymentCompleteMaybeCheckRolling(c, d, rolling, logf, pollInterval, pollTimeout)
 }
@@ -161,7 +196,7 @@ func WaitForDeploymentCompleteAndCheckRolling(c clientset.Interface, d *extensio
 // Waits for the deployment to complete, and don't check if rolling update strategy is broken.
 // Rolling update strategy is used only during a rolling update, and can be violated in other situations,
 // such as shortly after a scaling event or the deployment is just created.
-func WaitForDeploymentComplete(c clientset.Interface, d *extensions.Deployment, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
+func WaitForDeploymentComplete(c clientset.Interface, d *apps.Deployment, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
 	rolling := false
 	return waitForDeploymentCompleteMaybeCheckRolling(c, d, rolling, logf, pollInterval, pollTimeout)
 }
@@ -169,17 +204,17 @@ func WaitForDeploymentComplete(c clientset.Interface, d *extensions.Deployment, 
 // WaitForDeploymentRevisionAndImage waits for the deployment's and its new RS's revision and container image to match the given revision and image.
 // Note that deployment revision and its new RS revision should be updated shortly, so we only wait for 1 minute here to fail early.
 func WaitForDeploymentRevisionAndImage(c clientset.Interface, ns, deploymentName string, revision, image string, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
-	var deployment *extensions.Deployment
-	var newRS *extensions.ReplicaSet
+	var deployment *apps.Deployment
+	var newRS *apps.ReplicaSet
 	var reason string
 	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
 		var err error
-		deployment, err = c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
+		deployment, err = c.AppsV1().Deployments(ns).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 		// The new ReplicaSet needs to be non-nil and contain the pod-template-hash label
-		newRS, err = deploymentutil.GetNewReplicaSet(deployment, c.ExtensionsV1beta1())
+		newRS, err = GetNewReplicaSet(deployment, c)
 		if err != nil {
 			return false, err
 		}
@@ -190,41 +225,52 @@ func WaitForDeploymentRevisionAndImage(c clientset.Interface, ns, deploymentName
 		}
 		return true, nil
 	})
-	if err == wait.ErrWaitTimeout {
+	if wait.Interrupted(err) {
 		LogReplicaSetsOfDeployment(deployment, nil, newRS, logf)
-		err = fmt.Errorf(reason)
+		err = errors.New(reason)
 	}
 	if newRS == nil {
 		return fmt.Errorf("deployment %q failed to create new replica set", deploymentName)
 	}
 	if err != nil {
-		return fmt.Errorf("error waiting for deployment %q (got %s / %s) and new replica set %q (got %s / %s) revision and image to match expectation (expected %s / %s): %v", deploymentName, deployment.Annotations[deploymentutil.RevisionAnnotation], deployment.Spec.Template.Spec.Containers[0].Image, newRS.Name, newRS.Annotations[deploymentutil.RevisionAnnotation], newRS.Spec.Template.Spec.Containers[0].Image, revision, image, err)
+		if deployment == nil {
+			return fmt.Errorf("error creating new replica set for deployment %q: %w", deploymentName, err)
+		}
+		deploymentImage := ""
+		if len(deployment.Spec.Template.Spec.Containers) > 0 {
+			deploymentImage = deployment.Spec.Template.Spec.Containers[0].Image
+		}
+		newRSImage := ""
+		if len(newRS.Spec.Template.Spec.Containers) > 0 {
+			newRSImage = newRS.Spec.Template.Spec.Containers[0].Image
+		}
+		return fmt.Errorf("error waiting for deployment %q (got %s / %s) and new replica set %q (got %s / %s) revision and image to match expectation (expected %s / %s): %v", deploymentName, deployment.Annotations[deploymentutil.RevisionAnnotation], deploymentImage, newRS.Name, newRS.Annotations[deploymentutil.RevisionAnnotation], newRSImage, revision, image, err)
 	}
 	return nil
 }
 
 // CheckDeploymentRevisionAndImage checks if the input deployment's and its new replica set's revision and image are as expected.
 func CheckDeploymentRevisionAndImage(c clientset.Interface, ns, deploymentName, revision, image string) error {
-	deployment, err := c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
+	deployment, err := c.AppsV1().Deployments(ns).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("unable to get deployment %s during revision check: %v", deploymentName, err)
 	}
 
 	// Check revision of the new replica set of this deployment
-	newRS, err := deploymentutil.GetNewReplicaSet(deployment, c.ExtensionsV1beta1())
+	newRS, err := GetNewReplicaSet(deployment, c)
 	if err != nil {
 		return fmt.Errorf("unable to get new replicaset of deployment %s during revision check: %v", deploymentName, err)
 	}
 	return checkRevisionAndImage(deployment, newRS, revision, image)
 }
 
-func checkRevisionAndImage(deployment *extensions.Deployment, newRS *extensions.ReplicaSet, revision, image string) error {
+func checkRevisionAndImage(deployment *apps.Deployment, newRS *apps.ReplicaSet, revision, image string) error {
 	// The new ReplicaSet needs to be non-nil and contain the pod-template-hash label
 	if newRS == nil {
 		return fmt.Errorf("new replicaset for deployment %q is yet to be created", deployment.Name)
 	}
-	if !labelsutil.SelectorHasLabel(newRS.Spec.Selector, extensions.DefaultDeploymentUniqueLabelKey) {
-		return fmt.Errorf("new replica set %q doesn't have %q label selector", newRS.Name, extensions.DefaultDeploymentUniqueLabelKey)
+	if !labelsutil.SelectorHasLabel(newRS.Spec.Selector, apps.DefaultDeploymentUniqueLabelKey) {
+		return fmt.Errorf("new replica set %q doesn't have %q label selector", newRS.Name, apps.DefaultDeploymentUniqueLabelKey)
 	}
 	// Check revision of this deployment, and of the new replica set of this deployment
 	if deployment.Annotations == nil || deployment.Annotations[deploymentutil.RevisionAnnotation] != revision {
@@ -252,61 +298,42 @@ func containsImage(containers []v1.Container, imageName string) bool {
 	return false
 }
 
-type UpdateDeploymentFunc func(d *extensions.Deployment)
+type UpdateDeploymentFunc func(d *apps.Deployment)
 
-func UpdateDeploymentWithRetries(c clientset.Interface, namespace, name string, applyUpdate UpdateDeploymentFunc, logf LogfFn, pollInterval, pollTimeout time.Duration) (*extensions.Deployment, error) {
-	var deployment *extensions.Deployment
+func UpdateDeploymentWithRetries(c clientset.Interface, namespace, name string, applyUpdate UpdateDeploymentFunc, logf LogfFn, pollInterval, pollTimeout time.Duration) (*apps.Deployment, error) {
+	var deployment *apps.Deployment
 	var updateErr error
 	pollErr := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
 		var err error
-		if deployment, err = c.ExtensionsV1beta1().Deployments(namespace).Get(name, metav1.GetOptions{}); err != nil {
+		if deployment, err = c.AppsV1().Deployments(namespace).Get(context.TODO(), name, metav1.GetOptions{}); err != nil {
 			return false, err
 		}
 		// Apply the update, then attempt to push it to the apiserver.
 		applyUpdate(deployment)
-		if deployment, err = c.ExtensionsV1beta1().Deployments(namespace).Update(deployment); err == nil {
+		if deployment, err = c.AppsV1().Deployments(namespace).Update(context.TODO(), deployment, metav1.UpdateOptions{}); err == nil {
 			logf("Updating deployment %s", name)
 			return true, nil
 		}
 		updateErr = err
 		return false, nil
 	})
-	if pollErr == wait.ErrWaitTimeout {
+	if wait.Interrupted(pollErr) {
 		pollErr = fmt.Errorf("couldn't apply the provided updated to deployment %q: %v", name, updateErr)
 	}
 	return deployment, pollErr
 }
 
 func WaitForObservedDeployment(c clientset.Interface, ns, deploymentName string, desiredGeneration int64) error {
-	return deploymentutil.WaitForObservedDeployment(func() (*extensions.Deployment, error) {
-		return c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
+	return deploymentutil.WaitForObservedDeployment(func() (*apps.Deployment, error) {
+		return c.AppsV1().Deployments(ns).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 	}, desiredGeneration, 2*time.Second, 1*time.Minute)
 }
 
-// WaitForDeploymentRollbackCleared waits for given deployment either started rolling back or doesn't need to rollback.
-func WaitForDeploymentRollbackCleared(c clientset.Interface, ns, deploymentName string, pollInterval, pollTimeout time.Duration) error {
+// WaitForDeploymentUpdatedReplicasGTE waits for given deployment to be observed by the controller and has at least a number of updatedReplicas
+func WaitForDeploymentUpdatedReplicasGTE(c clientset.Interface, ns, deploymentName string, minUpdatedReplicas int32, desiredGeneration int64, pollInterval, pollTimeout time.Duration) error {
+	var deployment *apps.Deployment
 	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
-		deployment, err := c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
-		if err != nil {
-			return false, err
-		}
-		// Rollback not set or is kicked off
-		if deployment.Spec.RollbackTo == nil {
-			return true, nil
-		}
-		return false, nil
-	})
-	if err != nil {
-		return fmt.Errorf("error waiting for deployment %s rollbackTo to be cleared: %v", deploymentName, err)
-	}
-	return nil
-}
-
-// WaitForDeploymentUpdatedReplicasLTE waits for given deployment to be observed by the controller and has at least a number of updatedReplicas
-func WaitForDeploymentUpdatedReplicasLTE(c clientset.Interface, ns, deploymentName string, minUpdatedReplicas int32, desiredGeneration int64, pollInterval, pollTimeout time.Duration) error {
-	var deployment *extensions.Deployment
-	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
-		d, err := c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
+		d, err := c.AppsV1().Deployments(ns).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -319,10 +346,10 @@ func WaitForDeploymentUpdatedReplicasLTE(c clientset.Interface, ns, deploymentNa
 	return nil
 }
 
-func WaitForDeploymentWithCondition(c clientset.Interface, ns, deploymentName, reason string, condType extensions.DeploymentConditionType, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
-	var deployment *extensions.Deployment
+func WaitForDeploymentWithCondition(c clientset.Interface, ns, deploymentName, reason string, condType apps.DeploymentConditionType, logf LogfFn, pollInterval, pollTimeout time.Duration) error {
+	var deployment *apps.Deployment
 	pollErr := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
-		d, err := c.ExtensionsV1beta1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
+		d, err := c.AppsV1().Deployments(ns).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -330,9 +357,9 @@ func WaitForDeploymentWithCondition(c clientset.Interface, ns, deploymentName, r
 		cond := deploymentutil.GetDeploymentCondition(deployment.Status, condType)
 		return cond != nil && cond.Reason == reason, nil
 	})
-	if pollErr == wait.ErrWaitTimeout {
+	if wait.Interrupted(pollErr) {
 		pollErr = fmt.Errorf("deployment %q never updated with the desired condition and reason, latest deployment conditions: %+v", deployment.Name, deployment.Status.Conditions)
-		_, allOldRSs, newRS, err := deploymentutil.GetAllReplicaSets(deployment, c.ExtensionsV1beta1())
+		_, allOldRSs, newRS, err := GetAllReplicaSets(deployment, c)
 		if err == nil {
 			LogReplicaSetsOfDeployment(deployment, allOldRSs, newRS, logf)
 			LogPodsOfDeployment(c, deployment, append(allOldRSs, newRS), logf)

@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,26 +19,31 @@ limitations under the License.
 package preflight
 
 import (
-	"fmt"
-	"os/exec"
-	"strings"
+	"golang.org/x/sys/windows"
+
+	utilsexec "k8s.io/utils/exec"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
-// Check validates if an user has elevated (administrator) privileges.
-func (ipuc IsPrivilegedUserCheck) Check() (warnings, errors []error) {
-	errors = []error{}
-
-	// The "Well-known SID" of Administrator group is S-1-5-32-544
-	// The following powershell will return "True" if run as an administrator, "False" otherwise
-	// See https://msdn.microsoft.com/en-us/library/cc980032.aspx
-	args := []string{"[bool](([System.Security.Principal.WindowsIdentity]::GetCurrent()).groups -match \"S-1-5-32-544\")"}
-	isAdmin, err := exec.Command("powershell", args...).Output()
-
-	if err != nil {
-		errors = append(errors, fmt.Errorf("unable to determine if user is running as administrator: %s", err))
-	} else if strings.EqualFold(strings.TrimSpace(string(isAdmin)), "false") {
-		errors = append(errors, fmt.Errorf("user is not running as administrator"))
+// Check validates if a user has elevated (administrator) privileges.
+func (ipuc IsPrivilegedUserCheck) Check() (warnings, errorList []error) {
+	hProcessToken := windows.GetCurrentProcessToken()
+	if hProcessToken.IsElevated() {
+		return nil, nil
 	}
+	return nil, []error{errors.New("the kubeadm process must be run by a user with elevated privileges")}
+}
 
-	return nil, errors
+// Check number of memory required by kubeadm
+// No-op for Windows.
+func (mc MemCheck) Check() (warnings, errorList []error) {
+	return nil, nil
+}
+
+// addExecChecks adds checks that verify if certain binaries are in PATH.
+func addExecChecks(checks []Checker, execer utilsexec.Interface, _ string) []Checker {
+	// kubeadm requires xcopy to be present in PATH for copying etcd directories.
+	checks = append(checks, InPathCheck{executable: "xcopy", mandatory: true, exec: execer})
+	return checks
 }

@@ -17,12 +17,15 @@ limitations under the License.
 package container
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
-// Specified a policy for garbage collecting containers.
-type ContainerGCPolicy struct {
+// GCPolicy specifies a policy for garbage collecting containers.
+type GCPolicy struct {
 	// Minimum age at which a container can be garbage collected, zero for no limit.
 	MinAge time.Duration
 
@@ -34,14 +37,14 @@ type ContainerGCPolicy struct {
 	MaxContainers int
 }
 
-// Manages garbage collection of dead containers.
+// GC manages garbage collection of dead containers.
 //
 // Implementation is thread-compatible.
-type ContainerGC interface {
+type GC interface {
 	// Garbage collect containers.
-	GarbageCollect() error
+	GarbageCollect(ctx context.Context) error
 	// Deletes all unused containers, including containers belonging to pods that are terminated but not deleted
-	DeleteAllUnusedContainers() error
+	DeleteAllUnusedContainers(ctx context.Context) error
 }
 
 // SourcesReadyProvider knows how to determine if configuration sources are ready
@@ -56,14 +59,14 @@ type realContainerGC struct {
 	runtime Runtime
 
 	// Policy for garbage collection.
-	policy ContainerGCPolicy
+	policy GCPolicy
 
-	// sourcesReadyProvider provides the readyness of kubelet configuration sources.
+	// sourcesReadyProvider provides the readiness of kubelet configuration sources.
 	sourcesReadyProvider SourcesReadyProvider
 }
 
-// New ContainerGC instance with the specified policy.
-func NewContainerGC(runtime Runtime, policy ContainerGCPolicy, sourcesReadyProvider SourcesReadyProvider) (ContainerGC, error) {
+// NewContainerGC creates a new instance of GC with the specified policy.
+func NewContainerGC(runtime Runtime, policy GCPolicy, sourcesReadyProvider SourcesReadyProvider) (GC, error) {
 	if policy.MinAge < 0 {
 		return nil, fmt.Errorf("invalid minimum garbage collection age: %v", policy.MinAge)
 	}
@@ -75,10 +78,11 @@ func NewContainerGC(runtime Runtime, policy ContainerGCPolicy, sourcesReadyProvi
 	}, nil
 }
 
-func (cgc *realContainerGC) GarbageCollect() error {
-	return cgc.runtime.GarbageCollect(cgc.policy, cgc.sourcesReadyProvider.AllReady(), false)
+func (cgc *realContainerGC) GarbageCollect(ctx context.Context) error {
+	return cgc.runtime.GarbageCollect(ctx, cgc.policy, cgc.sourcesReadyProvider.AllReady(), false)
 }
 
-func (cgc *realContainerGC) DeleteAllUnusedContainers() error {
-	return cgc.runtime.GarbageCollect(cgc.policy, cgc.sourcesReadyProvider.AllReady(), true)
+func (cgc *realContainerGC) DeleteAllUnusedContainers(ctx context.Context) error {
+	klog.FromContext(ctx).Info("Attempting to delete unused containers")
+	return cgc.runtime.GarbageCollect(ctx, cgc.policy, cgc.sourcesReadyProvider.AllReady(), true)
 }

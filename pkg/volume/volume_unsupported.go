@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -18,10 +18,21 @@ limitations under the License.
 
 package volume
 
-func SetVolumeOwnership(mounter Mounter, fsGroup *int64) error {
-	return nil
+import (
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/volume/util/types"
+)
+
+// NewVolumeOwnership returns an interface that can be used to recursively change volume permissions and ownership
+func NewVolumeOwnership(mounter Mounter, dir string, fsGroup *int64, fsGroupChangePolicy *v1.PodFSGroupChangePolicy, completeFunc func(types.CompleteFuncParam)) VolumeOwnershipChanger {
+	return &VolumeOwnership{}
 }
 
-func IsSameFSGroup(dir string, fsGroup int64) (bool, int, error) {
-	return true, int(fsGroup), nil
+func (vo *VolumeOwnership) AddProgressNotifier(pod *v1.Pod, recorder record.EventRecorder) VolumeOwnershipChanger {
+	return vo
+}
+
+func (vo *VolumeOwnership) ChangePermissions() error {
+	return nil
 }

@@ -17,41 +17,76 @@ limitations under the License.
 package builder
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/test/utils"
 )
 
-var k8sBinDir = flag.String("k8s-bin-dir", "", "Directory containing k8s kubelet binaries.")
+var k8sBinDir = CommandLine.String("k8s-bin-dir", "", "Directory containing k8s kubelet binaries.")
+var useDockerizedBuild = CommandLine.Bool("use-dockerized-build", false, "Use dockerized build for test artifacts")
+var targetBuildArch = CommandLine.String("target-build-arch", "linux/amd64", "Target architecture for the test artifacts for dockerized build")
 
+// buildTargets is what the `test/e2e_node/runners/remote` builds via `make WHAT=`
+// when invoked via "make test-e2e-node". In this mode, separate binaries are
+// used for each command.
 var buildTargets = []string{
 	"cmd/kubelet",
 	"test/e2e_node/e2e_node.test",
-	"vendor/github.com/onsi/ginkgo/ginkgo",
+	"github.com/onsi/ginkgo/v2/ginkgo",
 	"cluster/gce/gci/mounter",
+	"test/e2e_node/plugins/gcp-credential-provider",
 }
 
+// BuildGo builds some default k8s binaries.
 func BuildGo() error {
-	glog.Infof("Building k8s binaries...")
-	k8sRoot, err := GetK8sRootDir()
+	return BuildTargets(buildTargets...)
+}
+
+// BuildTargets builds the specified k8s binaries (= WHAT targets).
+func BuildTargets(targets ...string) error {
+	k8sRoot, err := utils.GetK8sRootDir()
 	if err != nil {
-		return fmt.Errorf("failed to locate kubernetes root directory %v.", err)
+		return fmt.Errorf("failed to locate kubernetes root directory %v", err)
 	}
-	targets := strings.Join(buildTargets, " ")
-	cmd := exec.Command("make", "-C", k8sRoot, fmt.Sprintf("WHAT=%s", targets))
+	arch := GetTargetBuildArch()
+	klog.Infof("Building k8s binaries %v in %q for %s...", targets, k8sRoot, arch)
+	what := strings.Join(targets, " ")
+	cmd := exec.Command("make", "-C", k8sRoot,
+		fmt.Sprintf("WHAT=%s", what))
+	if IsDockerizedBuild() {
+		klog.Infof("Building dockerized k8s binaries targets %s for architecture %s", targets, GetTargetBuildArch())
+		// Multi-architecture build is only supported in dockerized build
+		cmd = exec.Command(filepath.Join(k8sRoot, "build/run.sh"), "make", fmt.Sprintf("WHAT=%s", what), fmt.Sprintf("KUBE_BUILD_PLATFORMS=%s", arch))
+		// Ensure we run this command in k8s root directory for dockerized build
+		cmd.Dir = k8sRoot
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
-		return fmt.Errorf("failed to build go packages %v\n", err)
+		return fmt.Errorf("failed to build go packages %v", err)
 	}
 	return nil
+}
+
+// IsDockerizedBuild returns if test needs to use dockerized build
+func IsDockerizedBuild() bool {
+	return *useDockerizedBuild
+}
+
+// GetTargetBuildArch returns the target build architecture for dockerized build
+func GetTargetBuildArch() string {
+	return *targetBuildArch
+}
+
+// IsTargetArchArm64 returns if the target is for linux/arm64 platform
+func IsTargetArchArm64() bool {
+	return GetTargetBuildArch() == "linux/arm64"
 }
 
 func getK8sBin(bin string) (string, error) {
@@ -62,20 +97,20 @@ func getK8sBin(bin string) (string, error) {
 			return "", err
 		}
 		if _, err := os.Stat(filepath.Join(*k8sBinDir, bin)); err != nil {
-			return "", fmt.Errorf("Could not find %s under directory %s.", bin, absPath)
+			return "", fmt.Errorf("Could not find %s under directory %s", bin, absPath)
 		}
 		return filepath.Join(absPath, bin), nil
 	}
 
 	path, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		return "", fmt.Errorf("Could not find absolute path of directory containing the tests %s.", filepath.Dir(os.Args[0]))
+		return "", fmt.Errorf("Could not find absolute path of directory containing the tests %s", filepath.Dir(os.Args[0]))
 	}
 	if _, err := os.Stat(filepath.Join(path, bin)); err == nil {
 		return filepath.Join(path, bin), nil
 	}
 
-	buildOutputDir, err := GetK8sBuildOutputDir()
+	buildOutputDir, err := utils.GetK8sBuildOutputDir(IsDockerizedBuild(), GetTargetBuildArch())
 	if err != nil {
 		return "", err
 	}
@@ -84,40 +119,14 @@ func getK8sBin(bin string) (string, error) {
 	}
 
 	// Give up with error
-	return "", fmt.Errorf("Unable to locate %s.  Can be defined using --k8s-path.", bin)
+	return "", fmt.Errorf("unable to locate %s, Can be defined using --k8s-path", bin)
 }
 
-// TODO: Dedup / merge this with comparable utilities in e2e/util.go
-func GetK8sRootDir() (string, error) {
-	// Get the directory of the current executable
-	_, testExec, _, _ := runtime.Caller(0)
-	path := filepath.Dir(testExec)
-
-	// Look for the kubernetes source root directory
-	if strings.Contains(path, "k8s.io/kubernetes") {
-		splitPath := strings.Split(path, "k8s.io/kubernetes")
-		return filepath.Join(splitPath[0], "k8s.io/kubernetes/"), nil
-	}
-
-	return "", fmt.Errorf("Could not find kubernetes source root directory.")
-}
-
-func GetK8sBuildOutputDir() (string, error) {
-	k8sRoot, err := GetK8sRootDir()
-	if err != nil {
-		return "", err
-	}
-	buildOutputDir := filepath.Join(k8sRoot, "_output/local/go/bin")
-	if _, err := os.Stat(buildOutputDir); err != nil {
-		return "", err
-	}
-	return buildOutputDir, nil
-}
-
+// GetKubeletServerBin returns the path of kubelet binary.
 func GetKubeletServerBin() string {
 	bin, err := getK8sBin("kubelet")
 	if err != nil {
-		glog.Fatalf("Could not locate kubelet binary %v.", err)
+		klog.Fatalf("Could not locate kubelet binary %v.", err)
 	}
 	return bin
 }

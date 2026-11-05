@@ -16,17 +16,22 @@ limitations under the License.
 
 package chaosmonkey
 
-import . "github.com/onsi/ginkgo"
+import (
+	"context"
+	"fmt"
 
-// Disruption is the type to construct a chaosmonkey with; see Do for more information.
-type Disruption func()
+	"github.com/onsi/ginkgo/v2"
+)
 
-// Test is the type to register with a chaosmonkey.  A test will run asynchronously across the
-// chaosmonkey's Disruption.  A Test takes a Semaphore as an argument.  It should call sem.Ready()
+// Disruption is the type to construct a Chaosmonkey with; see Do for more information.
+type Disruption func(ctx context.Context)
+
+// Test is the type to register with a Chaosmonkey.  A test will run asynchronously across the
+// Chaosmonkey's Disruption.  A Test takes a Semaphore as an argument.  It should call sem.Ready()
 // once it's ready for the disruption to start and should then wait until sem.StopCh (which is a
 // <-chan struct{}) is closed, which signals that the disruption is over.  It should then clean up
 // and return.  See Do and Semaphore for more information.
-type Test func(sem *Semaphore)
+type Test func(ctx context.Context, sem *Semaphore)
 
 // Interface can be implemented if you prefer to define tests without dealing with a Semaphore.  You
 // may define a struct that implements Interface's three methods (Setup, Test, and Teardown) and
@@ -37,31 +42,32 @@ type Interface interface {
 	Teardown()
 }
 
-type chaosmonkey struct {
+// Chaosmonkey is the type that holds the necessary content for chaosmonkey test
+type Chaosmonkey struct {
 	disruption Disruption
 	tests      []Test
 }
 
-// New creates and returns a chaosmonkey, with which the caller should register Tests and call Do.
+// New creates and returns a Chaosmonkey, with which the caller should register Tests and call Do.
 // See Do for more information.
-func New(disruption Disruption) *chaosmonkey {
-	return &chaosmonkey{
+func New(disruption Disruption) *Chaosmonkey {
+	return &Chaosmonkey{
 		disruption,
 		[]Test{},
 	}
 }
 
-// Register registers the given Test with the chaosmonkey, so that the test will run over the
+// Register registers the given Test with the Chaosmonkey, so that the test will run over the
 // Disruption.
-func (cm *chaosmonkey) Register(test Test) {
+func (cm *Chaosmonkey) Register(test Test) {
 	cm.tests = append(cm.tests, test)
 }
 
-// RegisterInterface registers the given Interface with the chaosmonkey, so the chaosmonkey will
+// RegisterInterface registers the given Interface with the Chaosmonkey, so the Chaosmonkey will
 // call Setup, Test, and Teardown properly.  Test can tell that the Disruption is finished when
 // stopCh is closed.
-func (cm *chaosmonkey) RegisterInterface(in Interface) {
-	cm.Register(func(sem *Semaphore) {
+func (cm *Chaosmonkey) RegisterInterface(in Interface) {
+	cm.Register(func(ctx context.Context, sem *Semaphore) {
 		in.Setup()
 		sem.Ready()
 		in.Test(sem.StopCh)
@@ -70,45 +76,44 @@ func (cm *chaosmonkey) RegisterInterface(in Interface) {
 }
 
 // Do performs the Disruption while testing the registered Tests.  Once the caller has registered
-// all Tests with the chaosmonkey, they call Do.  Do starts each registered test asynchronously and
+// all Tests with the Chaosmonkey, they call Do.  Do starts each registered test asynchronously and
 // waits for each test to signal that it is ready by calling sem.Ready().  Do will then do the
 // Disruption, and when it's complete, close sem.StopCh to signal to the registered Tests that the
 // Disruption is over, and wait for all Tests to return.
-func (cm *chaosmonkey) Do() {
+func (cm *Chaosmonkey) Do(ctx context.Context) {
 	sems := []*Semaphore{}
 	// All semaphores have the same StopCh.
 	stopCh := make(chan struct{})
 
 	for _, test := range cm.tests {
-		test := test
 		sem := newSemaphore(stopCh)
 		sems = append(sems, sem)
 		go func() {
-			defer GinkgoRecover()
+			defer ginkgo.GinkgoRecover()
 			defer sem.done()
-			test(sem)
+			test(ctx, sem)
 		}()
 	}
 
-	By("Waiting for all async tests to be ready")
+	fmt.Println("Waiting for all async tests to be ready")
 	for _, sem := range sems {
 		// Wait for test to be ready.  We have to wait for ready *or done* because a test
 		// may panic before signaling that its ready, and we shouldn't block.  Since we
-		// defered sem.done() above, if a test panics, it's marked as done.
+		// deferred sem.done() above, if a test panics, it's marked as done.
 		sem.waitForReadyOrDone()
 	}
 
 	defer func() {
 		close(stopCh)
-		By("Waiting for async validations to complete")
+		fmt.Println("Waiting for async validations to complete")
 		for _, sem := range sems {
 			sem.waitForDone()
 		}
 	}()
 
-	By("Starting disruption")
-	cm.disruption()
-	By("Disruption complete; stopping async validations")
+	fmt.Println("Starting disruption")
+	cm.disruption(ctx)
+	fmt.Println("Disruption complete; stopping async validations")
 }
 
 // Semaphore is taken by a Test and provides: Ready(), for the Test to call when it's ready for the

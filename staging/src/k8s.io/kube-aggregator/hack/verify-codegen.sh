@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Kubernetes Authors.
 #
@@ -18,19 +18,29 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_ROOT=$(dirname "${BASH_SOURCE}")/..
-SCRIPT_BASE=${SCRIPT_ROOT}/../..
-
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DIFFROOT="${SCRIPT_ROOT}/pkg"
-TMP_DIFFROOT="${SCRIPT_ROOT}/_tmp/pkg"
-_tmp="${SCRIPT_ROOT}/_tmp"
+TMP_DIFFROOT="$(mktemp -d -t "$(basename "$0").XXXXXX")/pkg"
 
 cleanup() {
-  rm -rf "${_tmp}"
+  rm -rf "${TMP_DIFFROOT}"
 }
 trap "cleanup" EXIT SIGINT
 
 cleanup
+
+# Ensure model-schema generator matches the version from
+# k8s.io/kubernetes/pkg/generated/openapi/cmd/models-schema/main.go
+echo "Ensuring models-schema is up-to-date"
+K8S_MODELS_SCHEMA="${SCRIPT_ROOT}/../../../../pkg/generated/openapi/cmd/models-schema/main.go"
+KUBE_AGGREGATOR_MODELS_SCHEMA="${SCRIPT_ROOT}/pkg/generated/openapi/cmd/models-schema/main.go"
+# these two files will only differ in the imported lines for generated openapi
+if ! diff -I "k8s.io/kubernetes/pkg/generated/openapi" \
+  -I "k8s.io/kube-aggregator/pkg/generated/openapi" \
+  "${K8S_MODELS_SCHEMA}" "${KUBE_AGGREGATOR_MODELS_SCHEMA}"; then
+  echo "${KUBE_AGGREGATOR_MODELS_SCHEMA} is out of date. Compare changes with ${K8S_MODELS_SCHEMA}"
+  exit 1
+fi
 
 mkdir -p "${TMP_DIFFROOT}"
 cp -a "${DIFFROOT}"/* "${TMP_DIFFROOT}"
@@ -39,11 +49,9 @@ cp -a "${DIFFROOT}"/* "${TMP_DIFFROOT}"
 echo "diffing ${DIFFROOT} against freshly generated codegen"
 ret=0
 diff -Naupr "${DIFFROOT}" "${TMP_DIFFROOT}" || ret=$?
-cp -a "${TMP_DIFFROOT}"/* "${DIFFROOT}"
-if [[ $ret -eq 0 ]]
-then
+if [[ $ret -eq 0 ]]; then
   echo "${DIFFROOT} up to date."
 else
   echo "${DIFFROOT} is out of date. Please run hack/update-codegen.sh"
-  exit 1
 fi
+exit $ret

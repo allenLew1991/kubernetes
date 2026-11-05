@@ -17,8 +17,11 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -194,6 +197,43 @@ func TestProxyTransport(t *testing.T) {
 			contentType:  "text/html",
 			forwardedURI: "/proxy/node/node1:10250/logs/log.log",
 		},
+		"forwarded URI must be escaped": {
+			input:        "<html></html>",
+			sourceURL:    "http://mynode.com/logs/log.log%00<script>alert(1)</script>",
+			transport:    testTransport,
+			output:       "<html></html>",
+			contentType:  "text/html",
+			forwardedURI: "/proxy/node/node1:10250/logs/log.log%00%3Cscript%3Ealert%281%29%3C/script%3E",
+		},
+		"redirect rel must be escaped": {
+			sourceURL:    "http://mynode.com/redirect",
+			transport:    testTransport,
+			redirect:     "/redirected/target/%00<script>alert(1)</script>/",
+			redirectWant: "http://foo.com/proxy/node/node1:10250/redirected/target/%00%3Cscript%3Ealert%281%29%3C/script%3E/",
+			forwardedURI: "/proxy/node/node1:10250/redirect",
+		},
+		"redirect abs same host must be escaped": {
+			sourceURL:    "http://mynode.com/redirect",
+			transport:    testTransport,
+			redirect:     "http://mynode.com/redirected/target/%00<script>alert(1)</script>/",
+			redirectWant: "http://foo.com/proxy/node/node1:10250/redirected/target/%00%3Cscript%3Ealert%281%29%3C/script%3E/",
+			forwardedURI: "/proxy/node/node1:10250/redirect",
+		},
+		"redirect abs other host must be escaped": {
+			sourceURL:    "http://mynode.com/redirect",
+			transport:    testTransport,
+			redirect:     "http://example.com/redirected/target/%00<script>alert(1)</script>/",
+			redirectWant: "http://example.com/redirected/target/%00%3Cscript%3Ealert%281%29%3C/script%3E/",
+			forwardedURI: "/proxy/node/node1:10250/redirect",
+		},
+		"redirect abs use reqHost no host no scheme must be escaped": {
+			sourceURL:    "http://mynode.com/redirect",
+			transport:    emptyHostAndSchemeTransport,
+			redirect:     "http://10.0.0.1:8001/redirected/target/%00<script>alert(1)</script>/",
+			redirectWant: "http://10.0.0.1:8001/proxy/node/node1:10250/redirected/target/%00%3Cscript%3Ealert%281%29%3C/script%3E/",
+			forwardedURI: "/proxy/node/node1:10250/redirect",
+			reqHost:      "10.0.0.1:8001",
+		},
 	}
 
 	testItem := func(name string, item *Item) {
@@ -240,7 +280,7 @@ func TestProxyTransport(t *testing.T) {
 		item.redirect = strings.Replace(item.redirect, sourceURL.Host, serverURL.Host, -1)
 		sourceURL.Host = serverURL.Host
 
-		req, err := http.NewRequest("GET", sourceURL.String(), nil)
+		req, err := http.NewRequest(http.MethodGet, sourceURL.String(), nil)
 		if err != nil {
 			t.Errorf("%v: Unexpected error: %v", name, err)
 			return
@@ -260,7 +300,7 @@ func TestProxyTransport(t *testing.T) {
 			}
 			return
 		}
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Errorf("%v: Unexpected error: %v", name, err)
 			return
@@ -272,5 +312,85 @@ func TestProxyTransport(t *testing.T) {
 
 	for name, item := range table {
 		testItem(name, &item)
+	}
+}
+
+func TestRewriteResponse(t *testing.T) {
+	gzipbuf := bytes.NewBuffer(nil)
+	flatebuf := bytes.NewBuffer(nil)
+
+	testTransport := &Transport{
+		Scheme:      "http",
+		Host:        "foo.com",
+		PathPrepend: "/proxy/node/node1:10250",
+	}
+	expected := []string{
+		"short body test",
+		strings.Repeat("long body test", 4097),
+	}
+	test := []struct {
+		encodeType string
+		writer     func(string) *http.Response
+		reader     func(*http.Response) string
+	}{
+		{
+			encodeType: "gzip",
+			writer: func(ept string) *http.Response {
+				gzw := gzip.NewWriter(gzipbuf)
+				defer gzw.Close()
+
+				gzw.Write([]byte(ept))
+				gzw.Flush()
+				return &http.Response{
+					Body: io.NopCloser(gzipbuf),
+				}
+			},
+			reader: func(rep *http.Response) string {
+				reader, _ := gzip.NewReader(rep.Body)
+				s, _ := io.ReadAll(reader)
+				return string(s)
+			},
+		},
+		{
+			encodeType: "deflate",
+			writer: func(ept string) *http.Response {
+				flw, _ := flate.NewWriter(flatebuf, flate.BestCompression)
+				defer flw.Close()
+
+				flw.Write([]byte(ept))
+				flw.Flush()
+				return &http.Response{
+					Body: io.NopCloser(flatebuf),
+				}
+			},
+			reader: func(rep *http.Response) string {
+				reader := flate.NewReader(rep.Body)
+				s, _ := io.ReadAll(reader)
+				return string(s)
+			},
+		},
+	}
+
+	errFn := func(encode string, err error) {
+		t.Errorf("%s failed to read and write: %v", encode, err)
+	}
+	for _, v := range test {
+		request, _ := http.NewRequest(http.MethodGet, "http://mynode.com/", nil)
+		request.Header.Set("Content-Encoding", v.encodeType)
+		request.Header.Add("Accept-Encoding", v.encodeType)
+
+		for _, exp := range expected {
+			resp := v.writer(exp)
+			gotResponse, err := testTransport.rewriteResponse(request, resp)
+
+			if err != nil {
+				errFn(v.encodeType, err)
+			}
+
+			result := v.reader(gotResponse)
+			if result != exp {
+				errFn(v.encodeType, fmt.Errorf("expected %s, get %s", exp, result))
+			}
+		}
 	}
 }

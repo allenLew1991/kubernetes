@@ -21,34 +21,43 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/apiserver/pkg/apis/example"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
+
+// TestWipeObjectMetaSystemFields validates that system populated fields are set on an object
+func TestWipeObjectMetaSystemFields(t *testing.T) {
+	resource := metav1.ObjectMeta{}
+	WipeObjectMetaSystemFields(&resource)
+	if !resource.CreationTimestamp.Time.IsZero() {
+		t.Errorf("resource.CreationTimestamp is set")
+	}
+	if len(resource.UID) != 0 {
+		t.Errorf("resource.UID is set")
+	}
+	if resource.DeletionTimestamp != nil {
+		t.Errorf("resource.DeletionTimestamp is set")
+	}
+	if resource.DeletionGracePeriodSeconds != nil {
+		t.Errorf("resource.DeletionGracePeriodSeconds is set")
+	}
+	if len(resource.SelfLink) != 0 {
+		t.Errorf("resource.SelfLink is set")
+	}
+}
 
 // TestFillObjectMetaSystemFields validates that system populated fields are set on an object
 func TestFillObjectMetaSystemFields(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
 	resource := metav1.ObjectMeta{}
-	FillObjectMetaSystemFields(ctx, &resource)
+	FillObjectMetaSystemFields(&resource)
 	if resource.CreationTimestamp.Time.IsZero() {
 		t.Errorf("resource.CreationTimestamp is zero")
-	} else if len(resource.UID) == 0 {
-		t.Errorf("resource.UID missing")
 	}
-	// verify we can inject a UID
-	uid := uuid.NewUUID()
-	ctx = genericapirequest.WithUID(ctx, uid)
-	resource = metav1.ObjectMeta{}
-	FillObjectMetaSystemFields(ctx, &resource)
-	if resource.UID != uid {
-		t.Errorf("resource.UID expected: %v, actual: %v", uid, resource.UID)
+	if len(resource.UID) == 0 {
+		t.Errorf("resource.UID missing")
 	}
 }
 
 // TestHasObjectMetaSystemFieldValues validates that true is returned if and only if all fields are populated
 func TestHasObjectMetaSystemFieldValues(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
 	resource := metav1.ObjectMeta{}
 	objMeta, err := meta.Accessor(&resource)
 	if err != nil {
@@ -57,36 +66,71 @@ func TestHasObjectMetaSystemFieldValues(t *testing.T) {
 	if metav1.HasObjectMetaSystemFieldValues(objMeta) {
 		t.Errorf("the resource does not have all fields yet populated, but incorrectly reports it does")
 	}
-	FillObjectMetaSystemFields(ctx, &resource)
+	FillObjectMetaSystemFields(&resource)
 	if !metav1.HasObjectMetaSystemFieldValues(objMeta) {
 		t.Errorf("the resource does have all fields populated, but incorrectly reports it does not")
 	}
 }
 
-// TestValidNamespace validates that namespace rules are enforced on a resource prior to create or update
-func TestValidNamespace(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
-	namespace, _ := genericapirequest.NamespaceFrom(ctx)
-	// TODO: use some genericapiserver type here instead of clientapiv1
-	resource := example.Pod{}
-	if !ValidNamespace(ctx, &resource.ObjectMeta) {
-		t.Fatalf("expected success")
+func TestEnsureObjectNamespaceMatchesRequestNamespace(t *testing.T) {
+	testcases := []struct {
+		name        string
+		reqNS       string
+		objNS       string
+		expectErr   bool
+		expectObjNS string
+	}{
+		{
+			name:        "cluster-scoped req, cluster-scoped obj",
+			reqNS:       "",
+			objNS:       "",
+			expectErr:   false,
+			expectObjNS: "",
+		},
+		{
+			name:        "cluster-scoped req, namespaced obj",
+			reqNS:       "",
+			objNS:       "foo",
+			expectErr:   false,
+			expectObjNS: "", // no error, object is forced to cluster-scoped for backwards compatibility
+		},
+		{
+			name:        "namespaced req, no-namespace obj",
+			reqNS:       "foo",
+			objNS:       "",
+			expectErr:   false,
+			expectObjNS: "foo", // no error, object is updated to match request for backwards compatibility
+		},
+		{
+			name:        "namespaced req, matching obj",
+			reqNS:       "foo",
+			objNS:       "foo",
+			expectErr:   false,
+			expectObjNS: "foo",
+		},
+		{
+			name:      "namespaced req, mis-matched obj",
+			reqNS:     "foo",
+			objNS:     "bar",
+			expectErr: true,
+		},
 	}
-	if namespace != resource.Namespace {
-		t.Fatalf("expected resource to have the default namespace assigned during validation")
-	}
-	resource = example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "other"}}
-	if ValidNamespace(ctx, &resource.ObjectMeta) {
-		t.Fatalf("Expected error that resource and context errors do not match because resource has different namespace")
-	}
-	ctx = genericapirequest.NewContext()
-	if ValidNamespace(ctx, &resource.ObjectMeta) {
-		t.Fatalf("Expected error that resource and context errors do not match since context has no namespace")
-	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := metav1.ObjectMeta{Namespace: tc.objNS}
+			err := EnsureObjectNamespaceMatchesRequestNamespace(tc.reqNS, &obj)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatal("expected err, got none")
+				}
+				return
+			} else if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
 
-	ctx = genericapirequest.NewContext()
-	ns := genericapirequest.NamespaceValue(ctx)
-	if ns != "" {
-		t.Fatalf("Expected the empty string")
+			if obj.Namespace != tc.expectObjNS {
+				t.Fatalf("expected obj ns %q, got %q", tc.expectObjNS, obj.Namespace)
+			}
+		})
 	}
 }

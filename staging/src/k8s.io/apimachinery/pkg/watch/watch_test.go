@@ -17,11 +17,13 @@ limitations under the License.
 package watch_test
 
 import (
+	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	. "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/ktesting"
 )
 
 type testType string
@@ -30,7 +32,8 @@ func (obj testType) GetObjectKind() schema.ObjectKind { return schema.EmptyObjec
 func (obj testType) DeepCopyObject() runtime.Object   { return obj }
 
 func TestFake(t *testing.T) {
-	f := NewFake()
+	logger := ktesting.Init(t).Logger()
+	f := NewFakeWithOptions(FakeOptions{Logger: &logger})
 
 	table := []struct {
 		t EventType
@@ -77,7 +80,8 @@ func TestFake(t *testing.T) {
 }
 
 func TestRaceFreeFake(t *testing.T) {
-	f := NewRaceFreeFake()
+	logger := ktesting.Init(t).Logger()
+	f := NewRaceFreeFakeWithLogger(logger)
 
 	table := []struct {
 		t EventType
@@ -134,4 +138,41 @@ func TestEmpty(t *testing.T) {
 	if ok {
 		t.Errorf("unexpected result channel result")
 	}
+}
+
+func TestProxyWatcher(t *testing.T) {
+	events := []Event{
+		{Added, testType("foo")},
+		{Modified, testType("qux")},
+		{Modified, testType("bar")},
+		{Deleted, testType("bar")},
+		{Error, testType("error: blah")},
+	}
+
+	ch := make(chan Event, len(events))
+	w := NewProxyWatcher(ch)
+
+	for _, e := range events {
+		ch <- e
+	}
+
+	for _, e := range events {
+		g := <-w.ResultChan()
+		if !reflect.DeepEqual(e, g) {
+			t.Errorf("Expected %#v, got %#v", e, g)
+			continue
+		}
+	}
+
+	w.Stop()
+
+	select {
+	// Closed channel always reads immediately
+	case <-w.StopChan():
+	default:
+		t.Error("Channel isn't closed")
+	}
+
+	// Test double close
+	w.Stop()
 }

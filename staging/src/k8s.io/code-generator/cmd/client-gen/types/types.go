@@ -16,6 +16,8 @@ limitations under the License.
 
 package types
 
+import "strings"
+
 type Version string
 
 func (v Version) String() string {
@@ -29,6 +31,10 @@ func (v Version) NonEmpty() string {
 	return v.String()
 }
 
+func (v Version) PackageName() string {
+	return strings.ToLower(v.NonEmpty())
+}
+
 type Group string
 
 func (g Group) String() string {
@@ -36,11 +42,21 @@ func (g Group) String() string {
 }
 
 func (g Group) NonEmpty() string {
-	if g == "api" {
+	if g == "" {
 		return "core"
 	}
 	return string(g)
 }
+
+func (g Group) PackageName() string {
+	parts := strings.Split(g.NonEmpty(), ".")
+	if parts[0] == "internal" && len(parts) > 1 {
+		return strings.ToLower(parts[1] + parts[0])
+	}
+	return strings.ToLower(parts[0])
+}
+
+type Kind string
 
 type PackageVersion struct {
 	Version
@@ -53,6 +69,24 @@ type GroupVersion struct {
 	Version Version
 }
 
+type GroupVersionKind struct {
+	Group   Group
+	Version Version
+	Kind    Kind
+}
+
+func (gv GroupVersion) ToAPIVersion() string {
+	if len(gv.Group) > 0 && gv.Group != "" {
+		return gv.Group.String() + "/" + gv.Version.String()
+	} else {
+		return gv.Version.String()
+	}
+}
+
+func (gv GroupVersion) WithKind(kind Kind) GroupVersionKind {
+	return GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: kind}
+}
+
 type GroupVersions struct {
 	// The name of the package for this group, e.g. apps.
 	PackageName string
@@ -62,11 +96,8 @@ type GroupVersions struct {
 
 // GroupVersionInfo contains all the info around a group version.
 type GroupVersionInfo struct {
-	Group   Group
-	Version Version
-	// If a user calls a group client without specifying the version (e.g.,
-	// c.Core(), instead of c.CoreV1()), the default version will be returned.
-	IsDefaultVersion     bool
+	Group                Group
+	Version              Version
 	PackageAlias         string
 	GroupGoName          string
 	LowerCaseGroupGoName string

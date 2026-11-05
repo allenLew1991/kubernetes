@@ -17,14 +17,18 @@ limitations under the License.
 package persistentvolume
 
 import (
+	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -36,58 +40,84 @@ import (
 
 // persistentvolumeStrategy implements behavior for PersistentVolume objects
 type persistentvolumeStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating PersistentVolume
 // objects via the REST API.
-var Strategy = persistentvolumeStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = persistentvolumeStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (persistentvolumeStrategy) NamespaceScoped() bool {
 	return false
 }
 
-// ResetBeforeCreate clears the Status field which is not allowed to be set by end users on creation.
-func (persistentvolumeStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
-	pv := obj.(*api.PersistentVolume)
-	pv.Status = api.PersistentVolumeStatus{}
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (persistentvolumeStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
 
-	pvutil.DropDisabledAlphaFields(&pv.Spec)
+	return fields
 }
 
-func (persistentvolumeStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+// ResetBeforeCreate clears the Status field which is not allowed to be set by end users on creation.
+func (persistentvolumeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	pv := obj.(*api.PersistentVolume)
+	pv.Status = api.PersistentVolumeStatus{}
+	pvutil.DropDisabledSpecFields(&pv.Spec, nil)
+
+	pv.Status.Phase = api.VolumePending
+	now := NowFunc()
+	pv.Status.LastPhaseTransitionTime = &now
+}
+
+func (persistentvolumeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	persistentvolume := obj.(*api.PersistentVolume)
-	errorList := validation.ValidatePersistentVolume(persistentvolume)
+	opts := validation.ValidationOptionsForPersistentVolume(persistentvolume, nil)
+	errorList := validation.ValidatePersistentVolume(persistentvolume, opts)
 	return append(errorList, volumevalidation.ValidatePersistentVolume(persistentvolume)...)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (persistentvolumeStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return pvutil.GetWarningsForPersistentVolume(obj.(*api.PersistentVolume))
 }
 
 // Canonicalize normalizes the object after validation.
 func (persistentvolumeStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (persistentvolumeStrategy) AllowCreateOnUpdate() bool {
+func (persistentvolumeStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
 // PrepareForUpdate sets the Status fields which is not allowed to be set by an end user updating a PV
-func (persistentvolumeStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (persistentvolumeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newPv := obj.(*api.PersistentVolume)
 	oldPv := old.(*api.PersistentVolume)
 	newPv.Status = oldPv.Status
-
-	pvutil.DropDisabledAlphaFields(&newPv.Spec)
-	pvutil.DropDisabledAlphaFields(&oldPv.Spec)
+	pvutil.DropDisabledSpecFields(&newPv.Spec, &oldPv.Spec)
 }
 
-func (persistentvolumeStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (persistentvolumeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newPv := obj.(*api.PersistentVolume)
-	errorList := validation.ValidatePersistentVolume(newPv)
+	oldPv := old.(*api.PersistentVolume)
+	opts := validation.ValidationOptionsForPersistentVolume(newPv, oldPv)
+	errorList := validation.ValidatePersistentVolume(newPv, opts)
 	errorList = append(errorList, volumevalidation.ValidatePersistentVolume(newPv)...)
-	return append(errorList, validation.ValidatePersistentVolumeUpdate(newPv, old.(*api.PersistentVolume))...)
+	return append(errorList, validation.ValidatePersistentVolumeUpdate(newPv, oldPv, opts)...)
 }
 
-func (persistentvolumeStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (persistentvolumeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return pvutil.GetWarningsForPersistentVolume(obj.(*api.PersistentVolume))
+}
+
+func (persistentvolumeStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -97,24 +127,55 @@ type persistentvolumeStatusStrategy struct {
 
 var StatusStrategy = persistentvolumeStatusStrategy{Strategy}
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (persistentvolumeStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
+
+var NowFunc = metav1.Now
+
 // PrepareForUpdate sets the Spec field which is not allowed to be changed when updating a PV's Status
-func (persistentvolumeStatusStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (persistentvolumeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newPv := obj.(*api.PersistentVolume)
 	oldPv := old.(*api.PersistentVolume)
 	newPv.Spec = oldPv.Spec
+
+	switch {
+	case oldPv.Status.Phase == newPv.Status.Phase && newPv.Status.LastPhaseTransitionTime == nil:
+		// phase didn't change, preserve the existing transition time if set
+		newPv.Status.LastPhaseTransitionTime = oldPv.Status.LastPhaseTransitionTime
+
+	case oldPv.Status.Phase != newPv.Status.Phase && (newPv.Status.LastPhaseTransitionTime == nil || newPv.Status.LastPhaseTransitionTime.Equal(oldPv.Status.LastPhaseTransitionTime)):
+		// phase changed and client didn't set or didn't change the transition time
+		now := NowFunc()
+		newPv.Status.LastPhaseTransitionTime = &now
+	}
+
 }
 
-func (persistentvolumeStatusStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (persistentvolumeStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidatePersistentVolumeStatusUpdate(obj.(*api.PersistentVolume), old.(*api.PersistentVolume))
 }
 
+// WarningsOnUpdate returns warnings for the given update.
+func (persistentvolumeStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	persistentvolumeObj, ok := obj.(*api.PersistentVolume)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("not a persistentvolume")
+		return nil, nil, fmt.Errorf("not a persistentvolume")
 	}
-	return labels.Set(persistentvolumeObj.Labels), PersistentVolumeToSelectableFields(persistentvolumeObj), persistentvolumeObj.Initializers != nil, nil
+	return labels.Set(persistentvolumeObj.Labels), PersistentVolumeToSelectableFields(persistentvolumeObj), nil
 }
 
 // MatchPersistentVolume returns a generic matcher for a given label and field selector.

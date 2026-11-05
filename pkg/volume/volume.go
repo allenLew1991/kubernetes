@@ -17,12 +17,15 @@ limitations under the License.
 package volume
 
 import (
+	"sync/atomic"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
 )
 
 // Volume represents a directory used by pods or hosts on a node. All method
@@ -41,13 +44,21 @@ type Volume interface {
 // and pod device map path.
 type BlockVolume interface {
 	// GetGlobalMapPath returns a global map path which contains
-	// symbolic links associated to a block device.
+	// bind mount associated to a block device.
 	// ex. plugins/kubernetes.io/{PluginName}/{DefaultKubeletVolumeDevicesDirName}/{volumePluginDependentPath}/{pod uuid}
 	GetGlobalMapPath(spec *Spec) (string, error)
 	// GetPodDeviceMapPath returns a pod device map path
 	// and name of a symbolic link associated to a block device.
-	// ex. pods/{podUid}}/{DefaultKubeletVolumeDevicesDirName}/{escapeQualifiedPluginName}/{volumeName}
+	// ex. pods/{podUid}/{DefaultKubeletVolumeDevicesDirName}/{escapeQualifiedPluginName}/, {volumeName}
 	GetPodDeviceMapPath() (string, string)
+
+	// SupportsMetrics should return true if the MetricsProvider is
+	// initialized
+	SupportsMetrics() bool
+
+	// MetricsProvider embeds methods for exposing metrics (e.g.
+	// used, available space).
+	MetricsProvider
 }
 
 // MetricsProvider exposes metrics (e.g. used,available space) related to a
@@ -88,7 +99,7 @@ type Metrics struct {
 	// and will not equal InodesUsed + InodesFree as the fs is shared.
 	Inodes *resource.Quantity
 
-	// InodesFree represent the inodes available for the volume.  For Volumes that share
+	// InodesFree represents the inodes available for the volume. For Volumes that share
 	// a filesystem with the host (e.g. emptydir, hostpath), this is the free inodes
 	// on the underlying storage, and is shared with host processes and other volumes
 	InodesFree *resource.Quantity
@@ -96,9 +107,55 @@ type Metrics struct {
 
 // Attributes represents the attributes of this mounter.
 type Attributes struct {
-	ReadOnly        bool
-	Managed         bool
-	SupportsSELinux bool
+	ReadOnly       bool
+	Managed        bool
+	SELinuxRelabel bool
+}
+
+// MounterArgs provides more easily extensible arguments to Mounter
+type MounterArgs struct {
+	// When FsUser is set, the ownership of the volume will be modified to be
+	// owned and writable by FsUser. Otherwise, there is no side effects.
+	// Currently only supported with projected service account tokens.
+	FsUser              *int64
+	FsGroup             *int64
+	FSGroupChangePolicy *v1.PodFSGroupChangePolicy
+	DesiredSize         *resource.Quantity
+	SELinuxLabel        string
+	Recorder            record.EventRecorder
+
+	// Optional interface that will be used to change the ownership of the volume, if specified.
+	// mainly used by unit tests
+	VolumeOwnershipApplicator VolumeOwnershipChanger
+	ReconstructedVolume       bool
+
+	// IsRemount is true when SetUp is being invoked on a volume that the
+	// reconciler considers already mounted to the pod, e.g. a periodic
+	// republish triggered by CSIDriver.spec.requiresRepublish=true. Volume
+	// plugins should use this to avoid destroying state (e.g. mount
+	// directories, volume metadata files) that the pod is currently
+	// observing through an existing bind mount, since teardown on a
+	// failed remount cannot be repaired by a subsequent successful
+	// remount and would leave the pod with stale contents.
+	IsRemount bool
+}
+
+type VolumeOwnershipChanger interface {
+	AddProgressNotifier(pod *v1.Pod, recorder record.EventRecorder) VolumeOwnershipChanger
+	ChangePermissions() error
+}
+
+type VolumeOwnership struct {
+	mounter             Mounter
+	dir                 string
+	fsGroup             *int64
+	fsGroupChangePolicy *v1.PodFSGroupChangePolicy
+	completionCallback  func(volumetypes.CompleteFuncParam)
+
+	// for monitoring progress of permission change operation
+	pod         *v1.Pod
+	fileCounter atomic.Int64
+	recorder    record.EventRecorder
 }
 
 // Mounter interface provides methods to set up/mount the volume.
@@ -106,31 +163,26 @@ type Mounter interface {
 	// Uses Interface to provide the path for Docker binds.
 	Volume
 
-	// CanMount is called immediately prior to Setup to check if
-	// the required components (binaries, etc.) are available on
-	// the underlying node to complete the subsequent SetUp (mount)
-	// operation. If CanMount returns error, the mount operation is
-	// aborted and an event is generated indicating that the node
-	// does not have the required binaries to complete the mount.
-	// If CanMount succeeds, the mount operation continues
-	// normally. The CanMount check can be enabled or disabled
-	// using the experimental-check-mount-binaries binary flag
-	CanMount() error
-
 	// SetUp prepares and mounts/unpacks the volume to a
 	// self-determined directory path. The mount point and its
-	// content should be owned by 'fsGroup' so that it can be
+	// content should be owned by `fsUser` or 'fsGroup' so that it can be
 	// accessed by the pod. This may be called more than once, so
 	// implementations must be idempotent.
-	SetUp(fsGroup *int64) error
+	// It could return following types of errors:
+	//   - TransientOperationFailure
+	//   - UncertainProgressError
+	//   - Error of any other type should be considered a final error
+	SetUp(mounterArgs MounterArgs) error
+
 	// SetUpAt prepares and mounts/unpacks the volume to the
 	// specified directory path, which may or may not exist yet.
-	// The mount point and its content should be owned by
+	// The mount point and its content should be owned by `fsUser`
 	// 'fsGroup' so that it can be accessed by the pod. This may
 	// be called more than once, so implementations must be
 	// idempotent.
-	SetUpAt(dir string, fsGroup *int64) error
+	SetUpAt(dir string, mounterArgs MounterArgs) error
 	// GetAttributes returns the attributes of the mounter.
+	// This function is called after SetUp()/SetUpAt().
 	GetAttributes() Attributes
 }
 
@@ -145,32 +197,48 @@ type Unmounter interface {
 	TearDownAt(dir string) error
 }
 
-// BlockVolumeMapper interface provides methods to set up/map the volume.
+// BlockVolumeMapper interface is a mapper interface for block volume.
 type BlockVolumeMapper interface {
 	BlockVolume
-	// SetUpDevice prepares the volume to a self-determined directory path,
-	// which may or may not exist yet and returns combination of physical
-	// device path of a block volume and error.
-	// If the plugin is non-attachable, it should prepare the device
-	// in /dev/ (or where appropriate) and return unique device path.
-	// Unique device path across kubelet node reboot is required to avoid
-	// unexpected block volume destruction.
-	// If the plugin is attachable, it should not do anything here,
-	// just return empty string for device path.
-	// Instead, attachable plugin have to return unique device path
-	// at attacher.Attach() and attacher.WaitForAttach().
-	// This may be called more than once, so implementations must be idempotent.
-	SetUpDevice() (string, error)
 }
 
-// BlockVolumeUnmapper interface provides methods to cleanup/unmap the volumes.
+// CustomBlockVolumeMapper interface provides custom methods to set up/map the volume.
+type CustomBlockVolumeMapper interface {
+	BlockVolumeMapper
+	// SetUpDevice prepares the volume to the node by the plugin specific way.
+	// For most in-tree plugins, attacher.Attach() and attacher.WaitForAttach()
+	// will do necessary works.
+	// This may be called more than once, so implementations must be idempotent.
+	// SetUpDevice returns stagingPath if device setup was successful
+	SetUpDevice() (stagingPath string, err error)
+
+	// MapPodDevice maps the block device to a path and return the path.
+	// Unique device path across kubelet node reboot is required to avoid
+	// unexpected block volume destruction.
+	// If empty string is returned, the path returned by attacher.Attach() and
+	// attacher.WaitForAttach() will be used.
+	MapPodDevice() (publishPath string, err error)
+
+	// GetStagingPath returns path that was used for staging the volume
+	// it is mainly used by CSI plugins
+	GetStagingPath() string
+}
+
+// BlockVolumeUnmapper interface is an unmapper interface for block volume.
 type BlockVolumeUnmapper interface {
 	BlockVolume
-	// TearDownDevice removes traces of the SetUpDevice procedure under
-	// a self-determined directory.
+}
+
+// CustomBlockVolumeUnmapper interface provides custom methods to cleanup/unmap the volumes.
+type CustomBlockVolumeUnmapper interface {
+	BlockVolumeUnmapper
+	// TearDownDevice removes traces of the SetUpDevice procedure.
 	// If the plugin is non-attachable, this method detaches the volume
 	// from a node.
 	TearDownDevice(mapPath string, devicePath string) error
+
+	// UnmapPodDevice removes traces of the MapPodDevice procedure.
+	UnmapPodDevice() error
 }
 
 // Provisioner is an interface that creates templates for PersistentVolumes
@@ -179,7 +247,7 @@ type Provisioner interface {
 	// Provision creates the resource by allocating the underlying volume in a
 	// storage system. This method should block until completion and returns
 	// PersistentVolume representing the created storage resource.
-	Provision() (*v1.PersistentVolume, error)
+	Provision(selectedNode *v1.Node, allowedTopologies []v1.TopologySelectorTerm) (*v1.PersistentVolume, error)
 }
 
 // Deleter removes the resource from the underlying storage provider. Calls
@@ -200,6 +268,8 @@ type Deleter interface {
 
 // Attacher can attach a volume to a node.
 type Attacher interface {
+	DeviceMounter
+
 	// Attaches the volume specified by the given spec to the node with the given Name.
 	// On success, returns the device path where the device was attached on the
 	// node.
@@ -215,7 +285,16 @@ type Attacher interface {
 	// is returned. Otherwise, if the device does not attach after
 	// the given timeout period, an error will be returned.
 	WaitForAttach(spec *Spec, devicePath string, pod *v1.Pod, timeout time.Duration) (string, error)
+}
 
+// DeviceMounterArgs provides auxiliary, optional arguments to DeviceMounter.
+type DeviceMounterArgs struct {
+	FsGroup      *int64
+	SELinuxLabel string
+}
+
+// DeviceMounter can mount a block volume to a global path.
+type DeviceMounter interface {
 	// GetDeviceMountPath returns a path where the device should
 	// be mounted after it is attached. This is a global mount
 	// point which should be bind mounted for individual volumes.
@@ -223,51 +302,27 @@ type Attacher interface {
 
 	// MountDevice mounts the disk to a global path which
 	// individual pods can then bind mount
-	MountDevice(spec *Spec, devicePath string, deviceMountPath string) error
-}
-
-type BulkVolumeVerifier interface {
-	// BulkVerifyVolumes checks whether the list of volumes still attached to the
-	// the clusters in the node. It returns a map which maps from the volume spec to the checking result.
-	// If an error occurs during check - error should be returned and volume on nodes
-	// should be assumed as still attached.
-	BulkVerifyVolumes(volumesByNode map[types.NodeName][]*Spec) (map[types.NodeName]map[*Spec]bool, error)
+	// Note that devicePath can be empty if the volume plugin does not implement any of Attach and WaitForAttach methods.
+	// It could return following types of errors:
+	//   - TransientOperationFailure
+	//   - UncertainProgressError
+	//   - Error of any other type should be considered a final error
+	MountDevice(spec *Spec, devicePath string, deviceMountPath string, deviceMounterArgs DeviceMounterArgs) error
 }
 
 // Detacher can detach a volume from a node.
 type Detacher interface {
+	DeviceUnmounter
 	// Detach the given volume from the node with the given Name.
 	// volumeName is name of the volume as returned from plugin's
 	// GetVolumeName().
 	Detach(volumeName string, nodeName types.NodeName) error
+}
 
+// DeviceUnmounter can unmount a block volume from the global path.
+type DeviceUnmounter interface {
 	// UnmountDevice unmounts the global mount of the disk. This
 	// should only be called once all bind mounts have been
 	// unmounted.
 	UnmountDevice(deviceMountPath string) error
-}
-
-// NewDeletedVolumeInUseError returns a new instance of DeletedVolumeInUseError
-// error.
-func NewDeletedVolumeInUseError(message string) error {
-	return deletedVolumeInUseError(message)
-}
-
-type deletedVolumeInUseError string
-
-var _ error = deletedVolumeInUseError("")
-
-// IsDeletedVolumeInUse returns true if an error returned from Delete() is
-// deletedVolumeInUseError
-func IsDeletedVolumeInUse(err error) bool {
-	switch err.(type) {
-	case deletedVolumeInUseError:
-		return true
-	default:
-		return false
-	}
-}
-
-func (err deletedVolumeInUseError) Error() string {
-	return string(err)
 }

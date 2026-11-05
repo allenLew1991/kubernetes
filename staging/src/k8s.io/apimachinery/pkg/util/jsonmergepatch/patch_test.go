@@ -21,10 +21,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/evanphx/json-patch"
-	"github.com/ghodss/yaml"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/utils/dump"
+	"sigs.k8s.io/yaml"
 )
 
 type FilterNullTestCases struct {
@@ -62,12 +62,12 @@ testCases:
     expectedWithoutNull: {}
   - description: simple map with all non-nil values
     originalObj:
-      nonNilKey: foo
-      nonNilKey: bar
+      nonNilKey1: foo
+      nonNilKey2: bar
     expectedWithNull: {}
     expectedWithoutNull:
-      nonNilKey: foo
-      nonNilKey: bar
+      nonNilKey1: foo
+      nonNilKey2: bar
   - description: nested map
     originalObj:
       mapKey:
@@ -88,19 +88,52 @@ testCases:
       mapKey:
         nilKey1: null
         nilKey2: null
-    expectedWithoutNull:
-      mapKey: {}
+    expectedWithoutNull: {}
   - description: nested map that all subkeys are non-nil
     originalObj:
       mapKey:
-        nonNilKey: foo
-        nonNilKey: bar
-    expectedWithNull:
-      mapKey: {}
+        nonNilKey1: foo
+        nonNilKey2: bar
+    expectedWithNull: {}
     expectedWithoutNull:
       mapKey:
-        nonNilKey: foo
-        nonNilKey: bar
+        nonNilKey1: foo
+        nonNilKey2: bar
+  - description: explicitly empty map as value
+    originalObj:
+      mapKey: {}
+    expectedWithNull: {}
+    expectedWithoutNull:
+      mapKey: {}
+  - description: explicitly empty nested map
+    originalObj:
+      mapKey:
+        nonNilKey: {}
+    expectedWithNull: {}
+    expectedWithoutNull:
+      mapKey:
+        nonNilKey: {}
+  - description: multiple expliclty empty nested maps
+    originalObj:
+      mapKey:
+        nonNilKey1: {}
+        nonNilKey2: {}
+    expectedWithNull: {}
+    expectedWithoutNull:
+      mapKey:
+        nonNilKey1: {}
+        nonNilKey2: {}
+  - description: nested map with non-null value as empty map
+    originalObj:
+      mapKey:
+        nonNilKey: {}
+        nilKey: null
+    expectedWithNull:
+      mapKey:
+        nilKey: null
+    expectedWithoutNull:
+      mapKey:
+        nonNilKey: {}
   - description: empty list
     originalObj:
       listKey: []
@@ -569,6 +602,57 @@ testCases:
       - false
       - b: 1
       bar: 0
+  - description: patch array with nil
+    original:
+      foo:
+      - a: true
+      - null
+      - false
+      bar: []
+      drop:
+      - 1
+    modified:
+      foo:
+      - 1
+      - false
+      - b: 1
+      bar:
+      - c
+      - null
+      - null
+      - a
+      drop:
+      - null
+    current:
+      foo:
+      - a: true
+      - 2
+      - false
+      bar:
+      - c
+      - null
+      - null
+      - a
+      drop:
+    threeWay:
+      foo:
+      - 1
+      - false
+      - b: 1
+      drop:
+      - null
+    result:
+      foo:
+      - 1
+      - false
+      - b: 1
+      drop:
+      - null
+      bar:
+      - c
+      - null
+      - null
+      - a
 `)
 
 func TestCreateThreeWayJSONMergePatch(t *testing.T) {
@@ -649,7 +733,7 @@ func jsonToYAMLOrError(j []byte) string {
 func toJSON(v interface{}) ([]byte, error) {
 	j, err := json.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("json marshal failed: %v\n%v\n", err, spew.Sdump(v))
+		return nil, fmt.Errorf("json marshal failed: %v\n%v\n", err, dump.Pretty(v))
 	}
 	return j, nil
 }

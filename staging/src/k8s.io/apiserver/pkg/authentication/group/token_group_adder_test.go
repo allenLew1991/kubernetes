@@ -17,6 +17,8 @@ limitations under the License.
 package group
 
 import (
+	"context"
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -25,17 +27,30 @@ import (
 )
 
 func TestTokenGroupAdder(t *testing.T) {
+	capacity := make([]string, 0, 1024)
+	response := &authenticator.Response{User: &user.DefaultInfo{Name: "user", Groups: append(capacity, "original")}}
+	orig := toJson(response)
+
 	adder := authenticator.Token(
 		NewTokenGroupAdder(
-			authenticator.TokenFunc(func(token string) (user.Info, bool, error) {
-				return &user.DefaultInfo{Name: "user", Groups: []string{"original"}}, true, nil
+			authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+				return response, true, nil
 			}),
 			[]string{"added"},
 		),
 	)
 
-	user, _, _ := adder.AuthenticateToken("")
-	if !reflect.DeepEqual(user.GetGroups(), []string{"original", "added"}) {
-		t.Errorf("Expected original,added groups, got %#v", user.GetGroups())
+	r, _, _ := adder.AuthenticateToken(context.Background(), "")
+	if !reflect.DeepEqual(r.User.GetGroups(), []string{"original", "added"}) {
+		t.Errorf("Expected original,added groups, got %#v", r.User.GetGroups())
 	}
+
+	if got := toJson(response); got != orig {
+		t.Errorf("Expected response from delegate to be unmodified: orig=%v got=%v", orig, got)
+	}
+}
+
+func toJson(x interface{}) string {
+	b, _ := json.Marshal(x)
+	return string(b)
 }

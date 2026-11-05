@@ -1,44 +1,28 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- caesarxuchao
-- deads2k
-- krousey
-- lavalamp
-- smarterclayton
-- sttts
-- liggitt
+  - aojea
+  - deads2k
+  - liggitt
+  - sttts
+  - yliaog
+  - jpbetz
+  - enj
 reviewers:
-- thockin
-- lavalamp
-- smarterclayton
-- wojtek-t
-- deads2k
-- yujuhong
-- derekwaynecarr
-- caesarxuchao
-- vishh
-- mikedanese
-- liggitt
-- nikhiljindal
-- gmarek
-- erictune
-- davidopp
-- pmorie
-- sttts
-- dchen1107
-- saad-ali
-- zmerlynn
-- luxas
-- janetkuo
-- justinsb
-- roberthbailey
-- ncdc
-- tallclair
-- yifan-gu
-- eparis
-- mwielgus
-- timothysc
-- feiskyer
-- jlowdermilk
-- soltysh
-- piosz
-- jsafrane
+  - aojea
+  - deads2k
+  - jpbetz
+  - liggitt
+  - skitt
+  - soltysh
+  - sttts
+  - yliaog
+  - jpbetz
+  - jefftree
+  - enj
+labels:
+  - sig/api-machinery
+emeritus_approvers:
+  - apelisse
+  - caesarxuchao
+  - lavalamp

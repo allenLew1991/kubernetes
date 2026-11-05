@@ -17,7 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -31,21 +31,25 @@ const (
 
 // ScaleSpec describes the attributes of a scale subresource
 type ScaleSpec struct {
-	// desired number of instances for the scaled object.
+	// replicas is the number of observed instances of the scaled object.
 	// +optional
+	// +k8s:beta(since: "1.37")=+k8s:optional
+	// +default=0
+	// +k8s:beta(since: "1.37")=+k8s:minimum=0
 	Replicas int32 `json:"replicas,omitempty" protobuf:"varint,1,opt,name=replicas"`
 }
 
 // ScaleStatus represents the current status of a scale subresource.
 type ScaleStatus struct {
-	// actual number of observed instances of the scaled object.
+	// replicas is the actual number of observed instances of the scaled object.
+	// +optional
 	Replicas int32 `json:"replicas" protobuf:"varint,1,opt,name=replicas"`
 
-	// label query over pods that should match the replicas count. More info: http://kubernetes.io/docs/user-guide/labels#label-selectors
+	// selector is a label query over pods that should match the replicas count. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
 	// +optional
 	Selector map[string]string `json:"selector,omitempty" protobuf:"bytes,2,rep,name=selector"`
 
-	// label selector for pods that should match the replicas count. This is a serializated
+	// targetSelector is the label selector for pods that should match the replicas count. This is a serializated
 	// version of both map-based and more expressive set-based selectors. This is done to
 	// avoid introspection in the clients. The string will be in the same format as the
 	// query-param syntax. If the target type only supports map-based selectors, both this
@@ -55,47 +59,60 @@ type ScaleStatus struct {
 	TargetSelector string `json:"targetSelector,omitempty" protobuf:"bytes,3,opt,name=targetSelector"`
 }
 
-// +genclient
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.6
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=autoscaling,v1,Scale
+// +k8s:isSubresource="/scale"
 
 // Scale represents a scaling request for a resource.
 type Scale struct {
-	metav1.TypeMeta `json:",inline"`
-	// Standard object metadata; More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata.
+	metav1.TypeMeta `json:""`
+	// metadata is the standard object metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata.
 	// +optional
+	// +k8s:opaqueType
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
-	// defines the behavior of the scale. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status.
+	// spec defines the behavior of the scale. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status.
 	// +optional
 	Spec ScaleSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
-	// current status of the scale. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status. Read-only.
+	// status defines current status of the scale. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status. Read-only.
 	// +optional
 	Status ScaleStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.5
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,StatefulSet
 
 // DEPRECATED - This group version of StatefulSet is deprecated by apps/v1beta2/StatefulSet. See the release notes for
 // more information.
 // StatefulSet represents a set of pods with consistent identities.
 // Identities are defined as:
-//  - Network: A single stable DNS and hostname.
-//  - Storage: As many VolumeClaims as requested.
+//   - Network: A single stable DNS and hostname.
+//   - Storage: As many VolumeClaims as requested.
+//
 // The StatefulSet guarantees that a given network identity will always
 // map to the same storage identity.
+// +k8s:supportsSubresource="/scale"
+// +k8s:supportsSubresource="/status"
 type StatefulSet struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
+	// metadata is the standard object metadata.
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
-	// Spec defines the desired identities of pods in this set.
-	// +optional
+	// spec defines the desired identities of pods in this set.
+	// +required
 	Spec StatefulSetSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
-	// Status is the current status of Pods in this StatefulSet. This data
+	// status is the current status of Pods in this StatefulSet. This data
 	// may be out of date by some window of time.
 	// +optional
 	Status StatefulSetStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
@@ -113,16 +130,18 @@ const (
 	// ParallelPodManagement will create and delete pods as soon as the stateful set
 	// replica count is changed, and will not wait for pods to be ready or complete
 	// termination.
-	ParallelPodManagement = "Parallel"
+	ParallelPodManagement PodManagementPolicyType = "Parallel"
 )
 
 // StatefulSetUpdateStrategy indicates the strategy that the StatefulSet
 // controller will use to perform updates. It includes any additional parameters
 // necessary to perform the update for the indicated strategy.
 type StatefulSetUpdateStrategy struct {
-	// Type indicates the type of the StatefulSetUpdateStrategy.
+	// type indicates the type of the StatefulSetUpdateStrategy.
+	// +optional
 	Type StatefulSetUpdateStrategyType `json:"type,omitempty" protobuf:"bytes,1,opt,name=type,casttype=StatefulSetStrategyType"`
-	// RollingUpdate is used to communicate parameters when Type is RollingUpdateStatefulSetStrategyType.
+	// rollingUpdate is used to communicate parameters when Type is RollingUpdateStatefulSetStrategyType.
+	// +optional
 	RollingUpdate *RollingUpdateStatefulSetStrategy `json:"rollingUpdate,omitempty" protobuf:"bytes,2,opt,name=rollingUpdate"`
 }
 
@@ -136,20 +155,86 @@ const (
 	// ordering constraints. When a scale operation is performed with this
 	// strategy, new Pods will be created from the specification version indicated
 	// by the StatefulSet's updateRevision.
-	RollingUpdateStatefulSetStrategyType = "RollingUpdate"
-	// OnDeleteStatefulSetStrategyType triggers the legacy behavior. Version
-	// tracking and ordered rolling restarts are disabled. Pods are recreated
-	// from the StatefulSetSpec when they are manually deleted. When a scale
-	// operation is performed with this strategy,specification version indicated
-	// by the StatefulSet's currentRevision.
-	OnDeleteStatefulSetStrategyType = "OnDelete"
+	RollingUpdateStatefulSetStrategyType StatefulSetUpdateStrategyType = "RollingUpdate"
+	// OnDeleteStatefulSetStrategyType disables ordered rolling restarts. Version
+	// tracking is done on a best-effort basis - the controller will try to
+	// eventually converge StatefulSet's currentRevision with updateRevision.
+	// Pods are recreated from the StatefulSetSpec when they are manually deleted.
+	// When a scale operation is performed with this strategy, new Pods will be
+	// created from the specification version indicated by the StatefulSet's updateRevision.
+	OnDeleteStatefulSetStrategyType StatefulSetUpdateStrategyType = "OnDelete"
 )
 
 // RollingUpdateStatefulSetStrategy is used to communicate parameter for RollingUpdateStatefulSetStrategyType.
 type RollingUpdateStatefulSetStrategy struct {
-	// Partition indicates the ordinal at which the StatefulSet should be
-	// partitioned.
+	// partition indicates the ordinal at which the StatefulSet should be partitioned
+	// for updates. During a rolling update, all pods from ordinal Replicas-1 to
+	// Partition are updated. All pods from ordinal Partition-1 to 0 remain untouched.
+	// This is helpful in being able to do a canary based deployment. The default value is 0.
+	// +optional
 	Partition *int32 `json:"partition,omitempty" protobuf:"varint,1,opt,name=partition"`
+	// maxUnavailable is the maximum number of pods that can be unavailable during the update.
+	// Value can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%).
+	// Absolute number is calculated from percentage by rounding down. This can not be 0.
+	// Defaults to 1. This field is beta-level and is enabled by default. The field applies to all pods in the range 0 to
+	// Replicas-1. That means if there is any unavailable pod in the range 0 to Replicas-1, it
+	// will be counted towards MaxUnavailable.
+	// This setting might not be effective for the OrderedReady podManagementPolicy. That policy ensures pods are created and become ready one at a time.
+	//
+	// +featureGate=MaxUnavailableStatefulSet
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty" protobuf:"varint,2,opt,name=maxUnavailable"`
+}
+
+// PersistentVolumeClaimRetentionPolicyType is a string enumeration of the policies that will determine
+// when volumes from the VolumeClaimTemplates will be deleted when the controlling StatefulSet is
+// deleted or scaled down.
+type PersistentVolumeClaimRetentionPolicyType string
+
+const (
+	// RetainPersistentVolumeClaimRetentionPolicyType is the default
+	// PersistentVolumeClaimRetentionPolicy and specifies that
+	// PersistentVolumeClaims associated with StatefulSet VolumeClaimTemplates
+	// will not be deleted.
+	RetainPersistentVolumeClaimRetentionPolicyType PersistentVolumeClaimRetentionPolicyType = "Retain"
+	// DeletePersistentVolumeClaimRetentionPolicyType specifies that
+	// PersistentVolumeClaims associated with StatefulSet VolumeClaimTemplates
+	// will be deleted in the scenario specified in
+	// StatefulSetPersistentVolumeClaimRetentionPolicy.
+	DeletePersistentVolumeClaimRetentionPolicyType PersistentVolumeClaimRetentionPolicyType = "Delete"
+)
+
+// StatefulSetPersistentVolumeClaimRetentionPolicy describes the policy used for PVCs
+// created from the StatefulSet VolumeClaimTemplates.
+type StatefulSetPersistentVolumeClaimRetentionPolicy struct {
+	// whenDeleted specifies what happens to PVCs created from StatefulSet
+	// VolumeClaimTemplates when the StatefulSet is deleted. The default policy
+	// of `Retain` causes PVCs to not be affected by StatefulSet deletion. The
+	// `Delete` policy causes those PVCs to be deleted.
+	// +optional
+	WhenDeleted PersistentVolumeClaimRetentionPolicyType `json:"whenDeleted,omitempty" protobuf:"bytes,1,opt,name=whenDeleted,casttype=PersistentVolumeClaimRetentionPolicyType"`
+	// whenScaled specifies what happens to PVCs created from StatefulSet
+	// VolumeClaimTemplates when the StatefulSet is scaled down. The default
+	// policy of `Retain` causes PVCs to not be affected by a scaledown. The
+	// `Delete` policy causes the associated PVCs for any excess pods above
+	// the replica count to be deleted.
+	// +optional
+	WhenScaled PersistentVolumeClaimRetentionPolicyType `json:"whenScaled,omitempty" protobuf:"bytes,2,opt,name=whenScaled,casttype=PersistentVolumeClaimRetentionPolicyType"`
+}
+
+// StatefulSetOrdinals describes the policy used for replica ordinal assignment
+// in this StatefulSet.
+type StatefulSetOrdinals struct {
+	// start is the number representing the first replica's index. It may be used
+	// to number replicas from an alternate index (eg: 1-indexed) over the default
+	// 0-indexed names, or to orchestrate progressive movement of replicas from
+	// one StatefulSet to another.
+	// If set, replica indices will be in the range:
+	//   [.spec.ordinals.start, .spec.ordinals.start + .spec.replicas).
+	// If unset, defaults to 0. Replica indices will be in the range:
+	//   [0, .spec.replicas).
+	// +optional
+	Start int32 `json:"start" protobuf:"varint,1,opt,name=start"`
 }
 
 // A StatefulSetSpec is the specification of a StatefulSet.
@@ -163,15 +248,21 @@ type StatefulSetSpec struct {
 	Replicas *int32 `json:"replicas,omitempty" protobuf:"varint,1,opt,name=replicas"`
 
 	// selector is a label query over pods that should match the replica count.
-	// If empty, defaulted to labels on the pod template.
+	// It must match the pod template's labels.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
-	// +optional
+	// +required
+	// +k8s:beta(since: "1.38")=+k8s:required
+	// +k8s:beta(since: "1.38")=+k8s:immutable
 	Selector *metav1.LabelSelector `json:"selector,omitempty" protobuf:"bytes,2,opt,name=selector"`
 
 	// template is the object that describes the pod that will be created if
 	// insufficient replicas are detected. Each pod stamped out by the StatefulSet
 	// will fulfill this Template, but have a unique identity from the rest
-	// of the StatefulSet.
+	// of the StatefulSet. Each pod will be named with the format
+	// <statefulsetname>-<podindex>. For example, a pod in a StatefulSet named
+	// "web" with index number "3" would be named "web-3".
+	// +required
+	// +k8s:alpha(since: "1.38")=+k8s:subfield(spec)=+k8s:subfield(restartPolicy)=+k8s:eq="Always"
 	Template v1.PodTemplateSpec `json:"template" protobuf:"bytes,3,opt,name=template"`
 
 	// volumeClaimTemplates is a list of claims that pods are allowed to reference.
@@ -182,6 +273,10 @@ type StatefulSetSpec struct {
 	// any volumes in the template, with the same name.
 	// TODO: Define the behavior if a claim already exists with the same name.
 	// +optional
+	// +k8s:beta(since: "1.38")=+k8s:immutable
+	// +k8s:beta(since: "1.38")=+k8s:optional
+	// +listType=atomic
+	// +k8s:beta(since: "1.38")=+k8s:eachVal=+k8s:opaqueType
 	VolumeClaimTemplates []v1.PersistentVolumeClaim `json:"volumeClaimTemplates,omitempty" protobuf:"bytes,4,rep,name=volumeClaimTemplates"`
 
 	// serviceName is the name of the service that governs this StatefulSet.
@@ -189,6 +284,9 @@ type StatefulSetSpec struct {
 	// the network identity of the set. Pods get DNS/hostnames that follow the
 	// pattern: pod-specific-string.serviceName.default.svc.cluster.local
 	// where "pod-specific-string" is managed by the StatefulSet controller.
+	// +optional
+	// +k8s:beta(since: "1.38")=+k8s:immutable
+	// +k8s:beta(since: "1.38")=+k8s:optional
 	ServiceName string `json:"serviceName" protobuf:"bytes,5,opt,name=serviceName"`
 
 	// podManagementPolicy controls how pods are created during initial scale up,
@@ -200,18 +298,43 @@ type StatefulSetSpec struct {
 	// to match the desired scale without waiting, and on scale down will delete
 	// all pods at once.
 	// +optional
+	// +k8s:beta(since: "1.38")=+k8s:immutable
+	// +k8s:beta(since: "1.38")=+k8s:optional
 	PodManagementPolicy PodManagementPolicyType `json:"podManagementPolicy,omitempty" protobuf:"bytes,6,opt,name=podManagementPolicy,casttype=PodManagementPolicyType"`
 
 	// updateStrategy indicates the StatefulSetUpdateStrategy that will be
 	// employed to update Pods in the StatefulSet when a revision is made to
 	// Template.
+	// +optional
 	UpdateStrategy StatefulSetUpdateStrategy `json:"updateStrategy,omitempty" protobuf:"bytes,7,opt,name=updateStrategy"`
 
 	// revisionHistoryLimit is the maximum number of revisions that will
 	// be maintained in the StatefulSet's revision history. The revision history
 	// consists of all revisions not represented by a currently applied
 	// StatefulSetSpec version. The default value is 10.
+	// +optional
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty" protobuf:"varint,8,opt,name=revisionHistoryLimit"`
+
+	// minReadySeconds is the minimum number of seconds for which a newly created pod should
+	// be ready without any of its container crashing for it to be considered available.
+	// Defaults to 0 (pod will be considered available as soon as it is ready)
+	// +optional
+	MinReadySeconds int32 `json:"minReadySeconds,omitempty" protobuf:"varint,9,opt,name=minReadySeconds"`
+
+	// persistentVolumeClaimRetentionPolicy describes the lifecycle of persistent
+	// volume claims created from volumeClaimTemplates. By default, all persistent
+	// volume claims are created as needed and retained until manually deleted. This
+	// policy allows the lifecycle to be altered, for example by deleting persistent
+	// volume claims when their stateful set is deleted, or when their pod is scaled
+	// down.
+	// +optional
+	PersistentVolumeClaimRetentionPolicy *StatefulSetPersistentVolumeClaimRetentionPolicy `json:"persistentVolumeClaimRetentionPolicy,omitempty" protobuf:"bytes,10,opt,name=persistentVolumeClaimRetentionPolicy"`
+
+	// ordinals controls the numbering of replica indices in a StatefulSet. The
+	// default ordinals behavior assigns a "0" index to the first replica and
+	// increments the index by one for each additional replica requested.
+	// +optional
+	Ordinals *StatefulSetOrdinals `json:"ordinals,omitempty" protobuf:"bytes,11,opt,name=ordinals"`
 }
 
 // StatefulSetStatus represents the current state of a StatefulSet.
@@ -224,7 +347,7 @@ type StatefulSetStatus struct {
 	// replicas is the number of Pods created by the StatefulSet controller.
 	Replicas int32 `json:"replicas" protobuf:"varint,2,opt,name=replicas"`
 
-	// readyReplicas is the number of Pods created by the StatefulSet controller that have a Ready Condition.
+	// readyReplicas is the number of pods created by this StatefulSet controller with a Ready Condition.
 	ReadyReplicas int32 `json:"readyReplicas,omitempty" protobuf:"varint,3,opt,name=readyReplicas"`
 
 	// currentReplicas is the number of Pods created by the StatefulSet controller from the StatefulSet version
@@ -239,7 +362,7 @@ type StatefulSetStatus struct {
 	// sequence [0,currentReplicas).
 	CurrentRevision string `json:"currentRevision,omitempty" protobuf:"bytes,6,opt,name=currentRevision"`
 
-	// updateRevision, if not empty, indicates the version of the StatefulSet used to generate Pods in the sequence
+	// updateRevision indicates the version of the StatefulSet used to generate Pods in the sequence
 	// [replicas-updatedReplicas,replicas)
 	UpdateRevision string `json:"updateRevision,omitempty" protobuf:"bytes,7,opt,name=updateRevision"`
 
@@ -249,37 +372,50 @@ type StatefulSetStatus struct {
 	// +optional
 	CollisionCount *int32 `json:"collisionCount,omitempty" protobuf:"varint,9,opt,name=collisionCount"`
 
-	// Represents the latest available observations of a statefulset's current state.
+	// conditions represent the latest available observations of a statefulset's current state.
 	// +optional
 	// +patchMergeKey=type
 	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=type
 	Conditions []StatefulSetCondition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,10,rep,name=conditions"`
+
+	// availableReplicas is the total number of available pods (ready for at least minReadySeconds)
+	// targeted by this StatefulSet.
+	// +optional
+	AvailableReplicas int32 `json:"availableReplicas" protobuf:"varint,11,opt,name=availableReplicas"`
 }
 
 type StatefulSetConditionType string
 
 // StatefulSetCondition describes the state of a statefulset at a certain point.
 type StatefulSetCondition struct {
-	// Type of statefulset condition.
+	// type of statefulset condition.
+	// +optional
 	Type StatefulSetConditionType `json:"type" protobuf:"bytes,1,opt,name=type,casttype=StatefulSetConditionType"`
-	// Status of the condition, one of True, False, Unknown.
+	// status of the condition, one of True, False, Unknown.
+	// +optional
 	Status v1.ConditionStatus `json:"status" protobuf:"bytes,2,opt,name=status,casttype=k8s.io/api/core/v1.ConditionStatus"`
-	// Last time the condition transitioned from one status to another.
+	// lastTransitionTime is the last time the condition transitioned from one status to another.
 	// +optional
 	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty" protobuf:"bytes,3,opt,name=lastTransitionTime"`
-	// The reason for the condition's last transition.
+	// reason for the condition's last transition.
 	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,4,opt,name=reason"`
-	// A human readable message indicating details about the transition.
+	// message is a human readable string indicating details about the transition.
 	// +optional
 	Message string `json:"message,omitempty" protobuf:"bytes,5,opt,name=message"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.5
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,StatefulSetList
 
 // StatefulSetList is a collection of StatefulSets.
 type StatefulSetList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 	Items           []StatefulSet `json:"items" protobuf:"bytes,2,rep,name=items"`
@@ -287,66 +423,75 @@ type StatefulSetList struct {
 
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.6
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,Deployment
 
 // DEPRECATED - This group version of Deployment is deprecated by apps/v1beta2/Deployment. See the release notes for
 // more information.
 // Deployment enables declarative updates for Pods and ReplicaSets.
+// +k8s:supportsSubresource="/scale"
+// +k8s:supportsSubresource="/status"
 type Deployment struct {
-	metav1.TypeMeta `json:",inline"`
-	// Standard object metadata.
+	metav1.TypeMeta `json:""`
+	// metadata is the standard object metadata.
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
-	// Specification of the desired behavior of the Deployment.
-	// +optional
+	// spec defines the desired behavior of the Deployment.
+	// +required
 	Spec DeploymentSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
-	// Most recently observed status of the Deployment.
+	// status is the most recently observed status of the Deployment.
 	// +optional
 	Status DeploymentStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 
 // DeploymentSpec is the specification of the desired behavior of the Deployment.
 type DeploymentSpec struct {
-	// Number of desired pods. This is a pointer to distinguish between explicit
-	// zero and not specified. Defaults to 1.
+	// replicas is the desired number of pods. This is a pointer to distinguish
+	// between explicit zero and not specified. Defaults to 1.
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty" protobuf:"varint,1,opt,name=replicas"`
 
-	// Label selector for pods. Existing ReplicaSets whose pods are
+	// selector is a label selector for pods. Existing ReplicaSets whose pods are
 	// selected by this will be the ones affected by this deployment.
 	// +optional
 	Selector *metav1.LabelSelector `json:"selector,omitempty" protobuf:"bytes,2,opt,name=selector"`
 
-	// Template describes the pods that will be created.
+	// template describes the pods that will be created.
+	// The only allowed template.spec.restartPolicy value is "Always".
+	// +required
 	Template v1.PodTemplateSpec `json:"template" protobuf:"bytes,3,opt,name=template"`
 
-	// The deployment strategy to use to replace existing pods with new ones.
+	// strategy to use to replace existing Deployment pods with new ones.
 	// +optional
-	Strategy DeploymentStrategy `json:"strategy,omitempty" protobuf:"bytes,4,opt,name=strategy"`
+	// +patchStrategy=retainKeys
+	Strategy DeploymentStrategy `json:"strategy,omitempty" patchStrategy:"retainKeys" protobuf:"bytes,4,opt,name=strategy"`
 
-	// Minimum number of seconds for which a newly created pod should be ready
-	// without any of its container crashing, for it to be considered available.
-	// Defaults to 0 (pod will be considered available as soon as it is ready)
+	// minReadySeconds is the minimum number of seconds for which a newly created pod should
+	// be ready without any of its container crashing, for it to be considered available.
+	// Defaults to 0 (pod will be considered available as soon as it is ready).
 	// +optional
 	MinReadySeconds int32 `json:"minReadySeconds,omitempty" protobuf:"varint,5,opt,name=minReadySeconds"`
 
-	// The number of old ReplicaSets to retain to allow rollback.
+	// revisionHistoryLimit is the number of old ReplicaSets to retain to allow rollback.
 	// This is a pointer to distinguish between explicit zero and not specified.
 	// Defaults to 2.
 	// +optional
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty" protobuf:"varint,6,opt,name=revisionHistoryLimit"`
 
-	// Indicates that the deployment is paused.
+	// paused indicates that the deployment is paused.
 	// +optional
 	Paused bool `json:"paused,omitempty" protobuf:"varint,7,opt,name=paused"`
 
+	// rollbackTo is the config this deployment is rolling back to. Will be cleared after rollback is done.
 	// DEPRECATED.
-	// The config this deployment is rolling back to. Will be cleared after rollback is done.
 	// +optional
 	RollbackTo *RollbackConfig `json:"rollbackTo,omitempty" protobuf:"bytes,8,opt,name=rollbackTo"`
 
-	// The maximum time in seconds for a deployment to make progress before it
+	// progressDeadlineSeconds is the maximum time in seconds for a deployment to make progress before it
 	// is considered to be failed. The deployment controller will continue to
 	// process failed deployments and a condition with a ProgressDeadlineExceeded
 	// reason will be surfaced in the deployment status. Note that progress will
@@ -356,45 +501,49 @@ type DeploymentSpec struct {
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.6
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,DeploymentRollback
 
 // DEPRECATED.
 // DeploymentRollback stores the information required to rollback a deployment.
 type DeploymentRollback struct {
-	metav1.TypeMeta `json:",inline"`
-	// Required: This must match the Name of a deployment.
+	metav1.TypeMeta `json:""`
+	// name must match the name of a Deployment.
+	// +required
 	Name string `json:"name" protobuf:"bytes,1,opt,name=name"`
-	// The annotations to be updated to a deployment
+	// updatedAnnotations are the annotations to be updated to a deployment
 	// +optional
 	UpdatedAnnotations map[string]string `json:"updatedAnnotations,omitempty" protobuf:"bytes,2,rep,name=updatedAnnotations"`
-	// The config of this deployment rollback.
+	// rollbackTo is the config of this deployment rollback.
+	// +optional
 	RollbackTo RollbackConfig `json:"rollbackTo" protobuf:"bytes,3,opt,name=rollbackTo"`
 }
 
 // DEPRECATED.
 type RollbackConfig struct {
-	// The revision to rollback to. If set to 0, rollback to the last revision.
+	// revision to rollback to. If set to 0, rollback to the last revision.
 	// +optional
 	Revision int64 `json:"revision,omitempty" protobuf:"varint,1,opt,name=revision"`
 }
 
 const (
 	// DefaultDeploymentUniqueLabelKey is the default key of the selector that is added
-	// to existing RCs (and label key that is added to its pods) to prevent the existing RCs
-	// to select new pods (and old pods being select by new RC).
+	// to existing ReplicaSets (and label key that is added to its pods) to prevent the existing ReplicaSets
+	// to select new pods (and old pods being select by new ReplicaSet).
 	DefaultDeploymentUniqueLabelKey string = "pod-template-hash"
 )
 
 // DeploymentStrategy describes how to replace existing pods with new ones.
 type DeploymentStrategy struct {
-	// Type of deployment. Can be "Recreate" or "RollingUpdate". Default is RollingUpdate.
+	// type of deployment. Can be "Recreate" or "RollingUpdate". Default is RollingUpdate.
 	// +optional
 	Type DeploymentStrategyType `json:"type,omitempty" protobuf:"bytes,1,opt,name=type,casttype=DeploymentStrategyType"`
 
-	// Rolling update config params. Present only if DeploymentStrategyType =
-	// RollingUpdate.
+	// rollingUpdate config params. Present only if type = RollingUpdate.
 	//---
-	// TODO: Update this to follow our convention for oneOf, whatever we decide it
-	// to be.
+	// TODO: Update this to follow our convention for oneOf, whatever we decide it to be.
 	// +optional
 	RollingUpdate *RollingUpdateDeployment `json:"rollingUpdate,omitempty" protobuf:"bytes,2,opt,name=rollingUpdate"`
 }
@@ -405,74 +554,86 @@ const (
 	// Kill all existing pods before creating new ones.
 	RecreateDeploymentStrategyType DeploymentStrategyType = "Recreate"
 
-	// Replace the old RCs by new one using rolling update i.e gradually scale down the old RCs and scale up the new one.
+	// Replace the old ReplicaSets by new one using rolling update i.e gradually scale down the old ReplicaSets and scale up the new one.
 	RollingUpdateDeploymentStrategyType DeploymentStrategyType = "RollingUpdate"
 )
 
 // Spec to control the desired behavior of rolling update.
 type RollingUpdateDeployment struct {
-	// The maximum number of pods that can be unavailable during the update.
+	// maxUnavailable is the maximum number of pods that can be unavailable during the update.
 	// Value can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%).
 	// Absolute number is calculated from percentage by rounding down.
 	// This can not be 0 if MaxSurge is 0.
 	// Defaults to 25%.
-	// Example: when this is set to 30%, the old RC can be scaled down to 70% of desired pods
-	// immediately when the rolling update starts. Once new pods are ready, old RC
-	// can be scaled down further, followed by scaling up the new RC, ensuring
+	// Example: when this is set to 30%, the old ReplicaSet can be scaled down to 70% of desired pods
+	// immediately when the rolling update starts. Once new pods are ready, old ReplicaSet
+	// can be scaled down further, followed by scaling up the new ReplicaSet, ensuring
 	// that the total number of pods available at all times during the update is at
 	// least 70% of desired pods.
 	// +optional
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty" protobuf:"bytes,1,opt,name=maxUnavailable"`
 
-	// The maximum number of pods that can be scheduled above the desired number of
-	// pods.
+	// maxSurge is the maximum number of pods that can be scheduled above the desired number of pods.
 	// Value can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%).
 	// This can not be 0 if MaxUnavailable is 0.
 	// Absolute number is calculated from percentage by rounding up.
 	// Defaults to 25%.
-	// Example: when this is set to 30%, the new RC can be scaled up immediately when
+	// Example: when this is set to 30%, the new ReplicaSet can be scaled up immediately when
 	// the rolling update starts, such that the total number of old and new pods do not exceed
 	// 130% of desired pods. Once old pods have been killed,
-	// new RC can be scaled up further, ensuring that total number of pods running
-	// at any time during the update is atmost 130% of desired pods.
+	// new ReplicaSet can be scaled up further, ensuring that total number of pods running
+	// at any time during the update is at most 130% of desired pods.
 	// +optional
 	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty" protobuf:"bytes,2,opt,name=maxSurge"`
 }
 
 // DeploymentStatus is the most recently observed status of the Deployment.
 type DeploymentStatus struct {
-	// The generation observed by the deployment controller.
+	// observedGeneration reflects the generation observed by the deployment controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty" protobuf:"varint,1,opt,name=observedGeneration"`
 
-	// Total number of non-terminated pods targeted by this deployment (their labels match the selector).
+	// replicas is the total number of non-terminating pods targeted by
+	// this deployment (their labels match the selector).
 	// +optional
 	Replicas int32 `json:"replicas,omitempty" protobuf:"varint,2,opt,name=replicas"`
 
-	// Total number of non-terminated pods targeted by this deployment that have the desired template spec.
+	// updatedReplicas is the total number of non-terminating pods targeted by this deployment that have the desired
+	// template spec.
 	// +optional
 	UpdatedReplicas int32 `json:"updatedReplicas,omitempty" protobuf:"varint,3,opt,name=updatedReplicas"`
 
-	// Total number of ready pods targeted by this deployment.
+	// readyReplicas is the total number of non-terminating pods targeted by this Deployment with a Ready Condition.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty" protobuf:"varint,7,opt,name=readyReplicas"`
 
-	// Total number of available pods (ready for at least minReadySeconds) targeted by this deployment.
+	// availableReplicas is the total number of available non-terminating pods (ready for at least minReadySeconds)
+	// targeted by this deployment.
 	// +optional
 	AvailableReplicas int32 `json:"availableReplicas,omitempty" protobuf:"varint,4,opt,name=availableReplicas"`
 
-	// Total number of unavailable pods targeted by this deployment. This is the total number of
-	// pods that are still required for the deployment to have 100% available capacity. They may
+	// unavailableReplicas is the total number of unavailable pods targeted by this deployment. This is the total
+	// number of pods that are still required for the deployment to have 100% available capacity. They may
 	// either be pods that are running but not yet available or pods that still have not been created.
 	// +optional
 	UnavailableReplicas int32 `json:"unavailableReplicas,omitempty" protobuf:"varint,5,opt,name=unavailableReplicas"`
 
-	// Represents the latest available observations of a deployment's current state.
+	// terminatingReplicas is the total number of terminating pods targeted by this deployment.
+	// Terminating pods have a non-null .metadata.deletionTimestamp and have not yet reached
+	// the Failed or Succeeded .status.phase.
+	//
+	// This is a beta field and requires enabling DeploymentReplicaSetTerminatingReplicas feature (enabled by default).
+	// +optional
+	TerminatingReplicas *int32 `json:"terminatingReplicas,omitempty" protobuf:"varint,9,opt,name=terminatingReplicas"`
+
+	// conditions lists the latest available observations of a deployment's current state.
 	// +patchMergeKey=type
 	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=type
 	Conditions []DeploymentCondition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,6,rep,name=conditions"`
 
-	// Count of hash collisions for the Deployment. The Deployment controller uses this
+	// collisionCount is the count of hash collisions for the Deployment. The Deployment controller uses this
 	// field as a collision avoidance mechanism when it needs to create the name for the
 	// newest ReplicaSet.
 	// +optional
@@ -498,25 +659,35 @@ const (
 
 // DeploymentCondition describes the state of a deployment at a certain point.
 type DeploymentCondition struct {
-	// Type of deployment condition.
+	// type of deployment condition.
+	// +optional
 	Type DeploymentConditionType `json:"type" protobuf:"bytes,1,opt,name=type,casttype=DeploymentConditionType"`
-	// Status of the condition, one of True, False, Unknown.
+	// status of the condition, one of True, False, Unknown.
+	// +optional
 	Status v1.ConditionStatus `json:"status" protobuf:"bytes,2,opt,name=status,casttype=k8s.io/api/core/v1.ConditionStatus"`
-	// The last time this condition was updated.
+	// lastUpdateTime is the last time this condition was updated.
+	// +optional
 	LastUpdateTime metav1.Time `json:"lastUpdateTime,omitempty" protobuf:"bytes,6,opt,name=lastUpdateTime"`
-	// Last time the condition transitioned from one status to another.
+	// lastTransitionTime is the last time the condition transitioned from one status to another.
+	// +optional
 	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty" protobuf:"bytes,7,opt,name=lastTransitionTime"`
-	// The reason for the condition's last transition.
+	// reason for the condition's last transition.
+	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,4,opt,name=reason"`
-	// A human readable message indicating details about the transition.
+	// message is a human readable string indicating details about the transition.
+	// +optional
 	Message string `json:"message,omitempty" protobuf:"bytes,5,opt,name=message"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.6
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,DeploymentList
 
 // DeploymentList is a list of Deployments.
 type DeploymentList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
@@ -527,6 +698,10 @@ type DeploymentList struct {
 
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.7
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,ControllerRevision
 
 // DEPRECATED - This group version of ControllerRevision is deprecated by apps/v1beta2/ControllerRevision. See the
 // release notes for more information.
@@ -540,26 +715,32 @@ type DeploymentList struct {
 // it may be subject to name and representation changes in future releases, and clients should not
 // depend on its stability. It is primarily for internal use by controllers.
 type ControllerRevision struct {
-	metav1.TypeMeta `json:",inline"`
-	// Standard object's metadata.
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata
+	metav1.TypeMeta `json:""`
+	// metadata is the standard object metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
-	// Data is the serialized representation of the state.
-	Data runtime.RawExtension `json:"data,omitempty" protobuf:"bytes,2,opt,name=data"`
+	// data is the serialized representation of the state.
+	// +required
+	Data runtime.RawExtension `json:"data" protobuf:"bytes,2,opt,name=data"`
 
-	// Revision indicates the revision of the state represented by Data.
+	// revision indicates the revision of the state represented by Data.
+	// +optional
 	Revision int64 `json:"revision" protobuf:"varint,3,opt,name=revision"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:prerelease-lifecycle-gen:introduced=1.7
+// +k8s:prerelease-lifecycle-gen:deprecated=1.8
+// +k8s:prerelease-lifecycle-gen:removed=1.16
+// +k8s:prerelease-lifecycle-gen:replacement=apps,v1,ControllerRevisionList
 
 // ControllerRevisionList is a resource containing a list of ControllerRevision objects.
 type ControllerRevisionList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 

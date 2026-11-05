@@ -1,17 +1,20 @@
 package edge
 
-import . "github.com/onsi/gomega/matchers/support/goraph/node"
+import (
+	. "github.com/onsi/gomega/matchers/support/goraph/node"
+	"slices"
+)
 
 type Edge struct {
-	Node1 Node
-	Node2 Node
+	Node1 int
+	Node2 int
 }
 
 type EdgeSet []Edge
 
 func (ec EdgeSet) Free(node Node) bool {
 	for _, e := range ec {
-		if e.Node1 == node || e.Node2 == node {
+		if e.Node1 == node.ID || e.Node2 == node.ID {
 			return false
 		}
 	}
@@ -20,18 +23,12 @@ func (ec EdgeSet) Free(node Node) bool {
 }
 
 func (ec EdgeSet) Contains(edge Edge) bool {
-	for _, e := range ec {
-		if e == edge {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(ec, edge)
 }
 
 func (ec EdgeSet) FindByNodes(node1, node2 Node) (Edge, bool) {
 	for _, e := range ec {
-		if (e.Node1 == node1 && e.Node2 == node2) || (e.Node1 == node2 && e.Node2 == node1) {
+		if (e.Node1 == node1.ID && e.Node2 == node2.ID) || (e.Node1 == node2.ID && e.Node2 == node1.ID) {
 			return e, true
 		}
 	}

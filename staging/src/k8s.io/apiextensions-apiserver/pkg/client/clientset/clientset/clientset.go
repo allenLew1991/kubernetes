@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,82 +17,34 @@ limitations under the License.
 package clientset
 
 import (
-	glog "github.com/golang/glog"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1beta1"
-	discovery "k8s.io/client-go/discovery"
-	rest "k8s.io/client-go/rest"
-	flowcontrol "k8s.io/client-go/util/flowcontrol"
+	"net/http"
+
+	clientset "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
+	"k8s.io/client-go/rest"
 )
 
-type Interface interface {
-	Discovery() discovery.DiscoveryInterface
-	ApiextensionsV1beta1() apiextensionsv1beta1.ApiextensionsV1beta1Interface
-	// Deprecated: please explicitly pick a version if possible.
-	Apiextensions() apiextensionsv1beta1.ApiextensionsV1beta1Interface
+//go:fix inline
+type Clientset = clientset.Clientset
+
+//go:fix inline
+type Interface = clientset.Interface
+
+//go:fix inline
+func New(c rest.Interface) *clientset.Clientset {
+	return clientset.New(c)
 }
 
-// Clientset contains the clients for groups. Each group has exactly one
-// version included in a Clientset.
-type Clientset struct {
-	*discovery.DiscoveryClient
-	apiextensionsV1beta1 *apiextensionsv1beta1.ApiextensionsV1beta1Client
+//go:fix inline
+func NewForConfig(c *rest.Config) (*clientset.Clientset, error) {
+	return clientset.NewForConfig(c)
 }
 
-// ApiextensionsV1beta1 retrieves the ApiextensionsV1beta1Client
-func (c *Clientset) ApiextensionsV1beta1() apiextensionsv1beta1.ApiextensionsV1beta1Interface {
-	return c.apiextensionsV1beta1
+//go:fix inline
+func NewForConfigAndClient(c *rest.Config, httpClient *http.Client) (*clientset.Clientset, error) {
+	return clientset.NewForConfigAndClient(c, httpClient)
 }
 
-// Deprecated: Apiextensions retrieves the default version of ApiextensionsClient.
-// Please explicitly pick a version.
-func (c *Clientset) Apiextensions() apiextensionsv1beta1.ApiextensionsV1beta1Interface {
-	return c.apiextensionsV1beta1
-}
-
-// Discovery retrieves the DiscoveryClient
-func (c *Clientset) Discovery() discovery.DiscoveryInterface {
-	if c == nil {
-		return nil
-	}
-	return c.DiscoveryClient
-}
-
-// NewForConfig creates a new Clientset for the given config.
-func NewForConfig(c *rest.Config) (*Clientset, error) {
-	configShallowCopy := *c
-	if configShallowCopy.RateLimiter == nil && configShallowCopy.QPS > 0 {
-		configShallowCopy.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(configShallowCopy.QPS, configShallowCopy.Burst)
-	}
-	var cs Clientset
-	var err error
-	cs.apiextensionsV1beta1, err = apiextensionsv1beta1.NewForConfig(&configShallowCopy)
-	if err != nil {
-		return nil, err
-	}
-
-	cs.DiscoveryClient, err = discovery.NewDiscoveryClientForConfig(&configShallowCopy)
-	if err != nil {
-		glog.Errorf("failed to create the DiscoveryClient: %v", err)
-		return nil, err
-	}
-	return &cs, nil
-}
-
-// NewForConfigOrDie creates a new Clientset for the given config and
-// panics if there is an error in the config.
-func NewForConfigOrDie(c *rest.Config) *Clientset {
-	var cs Clientset
-	cs.apiextensionsV1beta1 = apiextensionsv1beta1.NewForConfigOrDie(c)
-
-	cs.DiscoveryClient = discovery.NewDiscoveryClientForConfigOrDie(c)
-	return &cs
-}
-
-// New creates a new Clientset for the given RESTClient.
-func New(c rest.Interface) *Clientset {
-	var cs Clientset
-	cs.apiextensionsV1beta1 = apiextensionsv1beta1.New(c)
-
-	cs.DiscoveryClient = discovery.NewDiscoveryClient(c)
-	return &cs
+//go:fix inline
+func NewForConfigOrDie(c *rest.Config) *clientset.Clientset {
+	return clientset.NewForConfigOrDie(c)
 }

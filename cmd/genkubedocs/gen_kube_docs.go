@@ -17,12 +17,14 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra/doc"
 	"github.com/spf13/pflag"
-	ccmapp "k8s.io/kubernetes/cmd/cloud-controller-manager/app"
 	"k8s.io/kubernetes/cmd/genutils"
 	apiservapp "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	cmapp "k8s.io/kubernetes/cmd/kube-controller-manager/app"
@@ -44,6 +46,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
 	outDir, err := genutils.OutDir(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get output directory: %v\n", err)
@@ -59,10 +62,6 @@ func main() {
 		// generate docs for kube-controller-manager
 		controllermanager := cmapp.NewControllerManagerCommand()
 		doc.GenMarkdownTree(controllermanager, outDir)
-	case "cloud-controller-manager":
-		// generate docs for cloud-controller-manager
-		cloudcontrollermanager := ccmapp.NewCloudControllerManagerCommand()
-		doc.GenMarkdownTree(cloudcontrollermanager, outDir)
 	case "kube-proxy":
 		// generate docs for kube-proxy
 		proxy := proxyapp.NewProxyCommand()
@@ -73,17 +72,16 @@ func main() {
 		doc.GenMarkdownTree(scheduler, outDir)
 	case "kubelet":
 		// generate docs for kubelet
-		kubelet := kubeletapp.NewKubeletCommand()
+		kubelet := kubeletapp.NewKubeletCommand(ctx)
 		doc.GenMarkdownTree(kubelet, outDir)
 	case "kubeadm":
 		// resets global flags created by kubelet or other commands e.g.
 		// --azure-container-registry-config from pkg/credentialprovider/azure
-		// --google-json-key from pkg/credentialprovider/gcp
 		// --version pkg/version/verflag
 		pflag.CommandLine = pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
 
 		// generate docs for kubeadm
-		kubeadm := kubeadmapp.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
+		kubeadm := kubeadmapp.NewKubeadmCommand(bytes.NewReader(nil), io.Discard, io.Discard)
 		doc.GenMarkdownTree(kubeadm, outDir)
 
 		// cleanup generated code for usage as include in the website

@@ -17,6 +17,7 @@ limitations under the License.
 package gc
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -27,12 +28,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
 
+// PluginName indicates name of admission plugin.
+const PluginName = "OwnerReferencesPermissionEnforcement"
+
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
-	plugins.Register("OwnerReferencesPermissionEnforcement", func(config io.Reader) (admission.Interface, error) {
+	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
 		// the pods/status endpoint is ignored by this plugin since old kubelets
 		// corrupt them.  the pod status strategy ensures status updates cannot mutate
 		// ownerRef.
@@ -53,7 +58,7 @@ func Register(plugins *admission.Plugins) {
 type gcPermissionsEnforcement struct {
 	*admission.Handler
 
-	authorizer authorizer.Authorizer
+	authorizer authorizer.UnconditionalAuthorizer
 
 	restMapper meta.RESTMapper
 
@@ -81,7 +86,7 @@ func (a *gcPermissionsEnforcement) isWhiteListed(groupResource schema.GroupResou
 	return false
 }
 
-func (a *gcPermissionsEnforcement) Validate(attributes admission.Attributes) (err error) {
+func (a *gcPermissionsEnforcement) Validate(ctx context.Context, attributes admission.Attributes, o admission.ObjectInterfaces) (err error) {
 	// // if the request is in the whitelist, we skip mutation checks for this resource.
 	if a.isWhiteListed(attributes.GetResource().GroupResource(), attributes.GetSubresource()) {
 		return nil
@@ -92,37 +97,54 @@ func (a *gcPermissionsEnforcement) Validate(attributes admission.Attributes) (er
 		return nil
 	}
 
-	deleteAttributes := authorizer.AttributesRecord{
-		User:            attributes.GetUserInfo(),
-		Verb:            "delete",
-		Namespace:       attributes.GetNamespace(),
-		APIGroup:        attributes.GetResource().Group,
-		APIVersion:      attributes.GetResource().Version,
-		Resource:        attributes.GetResource().Resource,
-		Subresource:     attributes.GetSubresource(),
-		Name:            attributes.GetName(),
-		ResourceRequest: true,
-		Path:            "",
-	}
-	decision, reason, err := a.authorizer.Authorize(deleteAttributes)
-	if decision != authorizer.DecisionAllow {
-		return admission.NewForbidden(attributes, fmt.Errorf("cannot set an ownerRef on a resource you can't delete: %v, %v", reason, err))
+	// if you are creating a thing, you should always be allowed to set an owner ref since you logically had the power
+	// to never create it.  We still need to check block owner deletion below, because the power to delete does not
+	// imply the power to prevent deletion on other resources.
+	if attributes.GetOperation() != admission.Create {
+		deleteAttributes := authorizer.AttributesRecord{
+			User:            attributes.GetUserInfo(),
+			Verb:            "delete",
+			Namespace:       attributes.GetNamespace(),
+			APIGroup:        attributes.GetResource().Group,
+			APIVersion:      attributes.GetResource().Version,
+			Resource:        attributes.GetResource().Resource,
+			Subresource:     attributes.GetSubresource(),
+			Name:            attributes.GetName(),
+			ResourceRequest: true,
+			Path:            "",
+		}
+		decision, reason, err := a.authorizer.Authorize(ctx, deleteAttributes)
+		if decision != authorizer.DecisionAllow {
+			return admission.NewForbidden(attributes, fmt.Errorf("cannot set an ownerRef on a resource you can't delete: %v, %v", reason, err))
+		}
 	}
 
 	// Further check if the user is setting ownerReference.blockOwnerDeletion to
 	// true. If so, only allows the change if the user has delete permission of
 	// the _OWNER_
 	newBlockingRefs := newBlockingOwnerDeletionRefs(attributes.GetObject(), attributes.GetOldObject())
+	if len(newBlockingRefs) == 0 {
+		return nil
+	}
+
+	// There can be a case where a restMapper tries to hit discovery endpoints and times out if the network is inaccessible.
+	// This can prevent creating the pod to run the network to be able to do discovery and it appears as a timeout, not a rejection.
+	// Because the timeout is wrapper on admission/request, we can run a single check to see if the user can finalize any
+	// possible resource.
+	if decision, _, _ := a.authorizer.Authorize(ctx, finalizeAnythingRecord(attributes.GetUserInfo())); decision == authorizer.DecisionAllow {
+		return nil
+	}
+
 	for _, ref := range newBlockingRefs {
 		records, err := a.ownerRefToDeleteAttributeRecords(ref, attributes)
 		if err != nil {
-			return admission.NewForbidden(attributes, fmt.Errorf("cannot set blockOwnerDeletion in this case because cannot find RESTMapping for APIVersion %s Kind %s: %v, %v", ref.APIVersion, ref.Kind, reason, err))
+			return admission.NewForbidden(attributes, fmt.Errorf("cannot set blockOwnerDeletion in this case because cannot find RESTMapping for APIVersion %s Kind %s: %v", ref.APIVersion, ref.Kind, err))
 		}
 		// Multiple records are returned if ref.Kind could map to multiple
 		// resources. User needs to have delete permission on all the
 		// matched Resources.
 		for _, record := range records {
-			decision, reason, err := a.authorizer.Authorize(record)
+			decision, reason, err := a.authorizer.Authorize(ctx, record)
 			if decision != authorizer.DecisionAllow {
 				return admission.NewForbidden(attributes, fmt.Errorf("cannot set blockOwnerDeletion if an ownerReference refers to a resource you can't set finalizers on: %v, %v", reason, err))
 			}
@@ -164,6 +186,20 @@ func isChangingOwnerReference(newObj, oldObj runtime.Object) bool {
 	return false
 }
 
+func finalizeAnythingRecord(userInfo user.Info) authorizer.AttributesRecord {
+	return authorizer.AttributesRecord{
+		User:            userInfo,
+		Verb:            "update",
+		APIGroup:        "*",
+		APIVersion:      "*",
+		Resource:        "*",
+		Subresource:     "finalizers",
+		Name:            "*",
+		ResourceRequest: true,
+		Path:            "",
+	}
+}
+
 // Translates ref to a DeleteAttribute deleting the object referred by the ref.
 // OwnerReference only records the object kind, which might map to multiple
 // resources, so multiple DeleteAttribute might be returned.
@@ -178,19 +214,22 @@ func (a *gcPermissionsEnforcement) ownerRefToDeleteAttributeRecords(ref metav1.O
 		return ret, err
 	}
 	for _, mapping := range mappings {
-		ret = append(ret, authorizer.AttributesRecord{
-			User: attributes.GetUserInfo(),
-			Verb: "update",
-			// ownerReference can only refer to an object in the same namespace, so attributes.GetNamespace() equals to the owner's namespace
-			Namespace:       attributes.GetNamespace(),
-			APIGroup:        groupVersion.Group,
-			APIVersion:      groupVersion.Version,
-			Resource:        mapping.Resource,
+		ar := authorizer.AttributesRecord{
+			User:            attributes.GetUserInfo(),
+			Verb:            "update",
+			APIGroup:        mapping.Resource.Group,
+			APIVersion:      mapping.Resource.Version,
+			Resource:        mapping.Resource.Resource,
 			Subresource:     "finalizers",
 			Name:            ref.Name,
 			ResourceRequest: true,
 			Path:            "",
-		})
+		}
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			// if the owner is namespaced, it must be in the same namespace as the dependent is.
+			ar.Namespace = attributes.GetNamespace()
+		}
+		ret = append(ret, ar)
 	}
 	return ret, nil
 }
@@ -199,7 +238,7 @@ func (a *gcPermissionsEnforcement) ownerRefToDeleteAttributeRecords(ref metav1.O
 func blockingOwnerRefs(refs []metav1.OwnerReference) []metav1.OwnerReference {
 	var ret []metav1.OwnerReference
 	for _, ref := range refs {
-		if ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion == true {
+		if ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion {
 			ret = append(ret, ref)
 		}
 	}
@@ -254,7 +293,7 @@ func newBlockingOwnerDeletionRefs(newObj, oldObj runtime.Object) []metav1.OwnerR
 	return ret
 }
 
-func (a *gcPermissionsEnforcement) SetAuthorizer(authorizer authorizer.Authorizer) {
+func (a *gcPermissionsEnforcement) SetUnconditionalAuthorizer(authorizer authorizer.UnconditionalAuthorizer) {
 	a.authorizer = authorizer
 }
 

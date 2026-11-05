@@ -19,25 +19,26 @@ package cert
 import (
 	"crypto/x509"
 	"crypto/x509/pkix"
+	_ "embed"
 	"encoding/pem"
-	"io/ioutil"
 	"net"
 	"testing"
+
+	"k8s.io/client-go/util/keyutil"
+	netutils "k8s.io/utils/net"
 )
 
+//go:embed testdata/dontUseThisKey.pem
+var dontUseThisKeyPEM []byte
+
 func TestMakeCSR(t *testing.T) {
-	keyFile := "testdata/dontUseThisKey.pem"
 	subject := &pkix.Name{
 		CommonName: "kube-worker",
 	}
 	dnsSANs := []string{"localhost"}
-	ipSANs := []net.IP{net.ParseIP("127.0.0.1")}
+	ipSANs := []net.IP{netutils.ParseIPSloppy("127.0.0.1")}
 
-	keyData, err := ioutil.ReadFile(keyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := ParsePrivateKeyPEM(keyData)
+	key, err := keyutil.ParsePrivateKeyPEM(dontUseThisKeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +48,7 @@ func TestMakeCSR(t *testing.T) {
 	}
 	csrBlock, rest := pem.Decode(csrPEM)
 	if csrBlock == nil {
-		t.Error("Unable to decode MakeCSR result.")
+		t.Fatal("Unable to decode MakeCSR result.")
 	}
 	if len(rest) != 0 {
 		t.Error("Found more than one PEM encoded block in the result.")

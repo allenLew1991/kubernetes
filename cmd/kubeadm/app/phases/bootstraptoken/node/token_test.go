@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,43 +17,120 @@ limitations under the License.
 package node
 
 import (
-	"bytes"
+	"context"
 	"testing"
-	"time"
 
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientsetfake "k8s.io/client-go/kubernetes/fake"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 )
 
-func TestEncodeTokenSecretData(t *testing.T) {
-	var tests = []struct {
-		token *kubeadmapi.TokenDiscovery
-		t     time.Duration
+func TestUpdateOrCreateTokens(t *testing.T) {
+	tests := []struct {
+		name         string
+		failIfExists bool
+		tokens       []bootstraptokenv1.BootstrapToken
+		wantErr      bool
 	}{
-		{token: &kubeadmapi.TokenDiscovery{ID: "foo", Secret: "bar"}},                 // should use default
-		{token: &kubeadmapi.TokenDiscovery{ID: "foo", Secret: "bar"}, t: time.Second}, // should use default
+		{
+			name:         "token is nil",
+			failIfExists: true,
+			tokens:       []bootstraptokenv1.BootstrapToken{},
+			wantErr:      false,
+		},
+		{
+			name:         "create secret which does not exist",
+			failIfExists: true,
+			tokens: []bootstraptokenv1.BootstrapToken{
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "token1",
+						Secret: "token1data",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "create multiple secrets which do not exist",
+			failIfExists: true,
+			tokens: []bootstraptokenv1.BootstrapToken{
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "token1",
+						Secret: "token1data",
+					},
+				},
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "token2",
+						Secret: "token2data",
+					},
+				},
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "token3",
+						Secret: "token3data",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "create secret which exists, failIfExists is false",
+			failIfExists: false,
+			tokens: []bootstraptokenv1.BootstrapToken{
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "foo",
+						Secret: "bar",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "create secret which exists, failIfExists is true",
+			failIfExists: true,
+			tokens: []bootstraptokenv1.BootstrapToken{
+				{
+					Token: &bootstraptokenv1.BootstrapTokenString{
+						ID:     "foo",
+						Secret: "bar",
+					},
+				},
+			},
+			wantErr: true,
+		},
 	}
-	for _, rt := range tests {
-		actual, _ := encodeTokenSecretData(rt.token.ID, rt.token.Secret, rt.t, []string{}, []string{}, "")
-		if !bytes.Equal(actual["token-id"], []byte(rt.token.ID)) {
-			t.Errorf(
-				"failed EncodeTokenSecretData:\n\texpected: %s\n\t  actual: %s",
-				rt.token.ID,
-				actual["token-id"],
-			)
-		}
-		if !bytes.Equal(actual["token-secret"], []byte(rt.token.Secret)) {
-			t.Errorf(
-				"failed EncodeTokenSecretData:\n\texpected: %s\n\t  actual: %s",
-				rt.token.Secret,
-				actual["token-secret"],
-			)
-		}
-		if rt.t > 0 {
-			if actual["expiration"] == nil {
-				t.Errorf(
-					"failed EncodeTokenSecretData, duration was not added to time",
-				)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newMockClientForTest(t)
+			if err := UpdateOrCreateTokens(client, tc.failIfExists, tc.tokens); (err != nil) != tc.wantErr {
+				t.Fatalf("UpdateOrCreateTokens() error = %v, wantErr %v", err, tc.wantErr)
 			}
-		}
+		})
 	}
+}
+
+func newMockClientForTest(t *testing.T) *clientsetfake.Clientset {
+	client := clientsetfake.NewSimpleClientset()
+	_, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Create(context.TODO(), &v1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Secret",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bootstrap-token-foo",
+			Labels:    map[string]string{"app": "foo"},
+			Namespace: metav1.NamespaceSystem,
+		},
+		Data: map[string][]byte{"foo": {'f', 'o', 'o'}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("error creating sercet: %v", err)
+	}
+	return client
 }

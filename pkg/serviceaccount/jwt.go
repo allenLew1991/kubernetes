@@ -17,234 +17,479 @@ limitations under the License.
 package serviceaccount
 
 import (
-	"bytes"
+	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
-	"errors"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"strings"
 
-	"k8s.io/api/core/v1"
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	v1 "k8s.io/api/core/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
-	"k8s.io/apiserver/pkg/authentication/user"
-
-	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/golang/glog"
-)
-
-const (
-	Issuer = "kubernetes/serviceaccount"
-
-	SubjectClaim            = "sub"
-	IssuerClaim             = "iss"
-	ServiceAccountNameClaim = "kubernetes.io/serviceaccount/service-account.name"
-	ServiceAccountUIDClaim  = "kubernetes.io/serviceaccount/service-account.uid"
-	SecretNameClaim         = "kubernetes.io/serviceaccount/secret.name"
-	NamespaceClaim          = "kubernetes.io/serviceaccount/namespace"
 )
 
 // ServiceAccountTokenGetter defines functions to retrieve a named service account and secret
 type ServiceAccountTokenGetter interface {
-	GetServiceAccount(namespace, name string) (*v1.ServiceAccount, error)
-	GetSecret(namespace, name string) (*v1.Secret, error)
+	GetServiceAccount(ctx context.Context, namespace, name string) (*v1.ServiceAccount, error)
+	GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error)
+	GetSecret(ctx context.Context, namespace, name string) (*v1.Secret, error)
+	GetNode(ctx context.Context, name string) (*v1.Node, error)
+	GetValidatingWebhookConfiguration(ctx context.Context, name string) (*admissionregistrationv1.ValidatingWebhookConfiguration, error)
+	GetMutatingWebhookConfiguration(ctx context.Context, name string) (*admissionregistrationv1.MutatingWebhookConfiguration, error)
 }
 
 type TokenGenerator interface {
-	// GenerateToken generates a token which will identify the given ServiceAccount.
-	// The returned token will be stored in the given (and yet-unpersisted) Secret.
-	GenerateToken(serviceAccount v1.ServiceAccount, secret v1.Secret) (string, error)
+	// GenerateToken generates a token which will identify the given
+	// ServiceAccount. privateClaims is an interface that will be
+	// serialized into the JWT payload JSON encoding at the root level of
+	// the payload object. Public claims take precedent over private
+	// claims i.e. if both claims and privateClaims have an "exp" field,
+	// the value in claims will be used.
+	GenerateToken(ctx context.Context, claims *jwt.Claims, privateClaims interface{}) (string, error)
 }
 
 // JWTTokenGenerator returns a TokenGenerator that generates signed JWT tokens, using the given privateKey.
 // privateKey is a PEM-encoded byte array of a private RSA key.
-// JWTTokenAuthenticator()
-func JWTTokenGenerator(privateKey interface{}) TokenGenerator {
-	return &jwtTokenGenerator{privateKey}
+func JWTTokenGenerator(iss string, privateKey interface{}) (TokenGenerator, error) {
+	var signer jose.Signer
+	var err error
+	switch pk := privateKey.(type) {
+	case *rsa.PrivateKey:
+		signer, err = signerFromRSAPrivateKey(pk)
+		if err != nil {
+			return nil, fmt.Errorf("could not generate signer for RSA keypair: %v", err)
+		}
+	case *ecdsa.PrivateKey:
+		signer, err = signerFromECDSAPrivateKey(pk)
+		if err != nil {
+			return nil, fmt.Errorf("could not generate signer for ECDSA keypair: %v", err)
+		}
+	case jose.OpaqueSigner:
+		signer, err = signerFromOpaqueSigner(pk)
+		if err != nil {
+			return nil, fmt.Errorf("could not generate signer for OpaqueSigner: %v", err)
+		}
+	default:
+		return nil, fmt.Errorf("unknown private key type %T, must be *rsa.PrivateKey, *ecdsa.PrivateKey, or jose.OpaqueSigner", privateKey)
+	}
+
+	return &jwtTokenGenerator{
+		iss:    iss,
+		signer: signer,
+	}, nil
+}
+
+// keyIDFromPublicKey derives a key ID non-reversibly from a public key.
+//
+// The Key ID is field on a given on JWTs and JWKs that help relying parties
+// pick the correct key for verification when the identity party advertises
+// multiple keys.
+//
+// Making the derivation non-reversible makes it impossible for someone to
+// accidentally obtain the real key from the key ID and use it for token
+// validation.
+func keyIDFromPublicKey(publicKey interface{}) (string, error) {
+	publicKeyDERBytes, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize public key to DER format: %v", err)
+	}
+
+	hasher := crypto.SHA256.New()
+	hasher.Write(publicKeyDERBytes)
+	publicKeyDERHash := hasher.Sum(nil)
+
+	keyID := base64.RawURLEncoding.EncodeToString(publicKeyDERHash)
+
+	return keyID, nil
+}
+
+func signerFromRSAPrivateKey(keyPair *rsa.PrivateKey) (jose.Signer, error) {
+	keyID, err := keyIDFromPublicKey(&keyPair.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive keyID: %v", err)
+	}
+
+	// IMPORTANT: The RSA algorithms listed below must be kept in sync with:
+	// - pkg/serviceaccount/externaljwt/plugin/plugin.go validateJWTHeader
+	// - pkg/serviceaccount/jwt.go signerFromRSAPrivateKey
+	// - pkg/serviceaccount/jwt.go signerFromECDSAPrivateKey
+	// - test/images/agnhost/openidmetadata/openidmetadata.go validate SupportedSigningAlgs
+
+	// Wrap the RSA keypair in a JOSE JWK with the designated key ID.
+	privateJWK := &jose.JSONWebKey{
+		Algorithm: string(jose.RS256),
+		Key:       keyPair,
+		KeyID:     keyID,
+		Use:       "sig",
+	}
+
+	signer, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: jose.RS256,
+			Key:       privateJWK,
+		},
+		nil,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %v", err)
+	}
+
+	return signer, nil
+}
+
+func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
+	var alg jose.SignatureAlgorithm
+
+	// IMPORTANT: The EC algorithms listed below must be kept in sync with:
+	// - pkg/serviceaccount/externaljwt/plugin/plugin.go validateJWTHeader
+	// - pkg/serviceaccount/jwt.go signerFromRSAPrivateKey
+	// - pkg/serviceaccount/jwt.go signerFromECDSAPrivateKey
+	// - test/images/agnhost/openidmetadata/openidmetadata.go validate SupportedSigningAlgs
+
+	switch keyPair.Curve {
+	case elliptic.P256():
+		alg = jose.ES256
+	case elliptic.P384():
+		alg = jose.ES384
+	case elliptic.P521():
+		alg = jose.ES512
+	default:
+		return nil, fmt.Errorf("unknown private key curve, must be 256, 384, or 521")
+	}
+
+	keyID, err := keyIDFromPublicKey(&keyPair.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive keyID: %v", err)
+	}
+
+	// Wrap the ECDSA keypair in a JOSE JWK with the designated key ID.
+	privateJWK := &jose.JSONWebKey{
+		Algorithm: string(alg),
+		Key:       keyPair,
+		KeyID:     keyID,
+		Use:       "sig",
+	}
+
+	signer, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: alg,
+			Key:       privateJWK,
+		},
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %v", err)
+	}
+
+	return signer, nil
+}
+
+func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner) (jose.Signer, error) {
+	alg := jose.SignatureAlgorithm(opaqueSigner.Public().Algorithm)
+
+	signer, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: alg,
+			Key: &jose.JSONWebKey{
+				Algorithm: string(alg),
+				Key:       opaqueSigner,
+				KeyID:     opaqueSigner.Public().KeyID,
+				Use:       "sig",
+			},
+		},
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %v", err)
+	}
+
+	return signer, nil
 }
 
 type jwtTokenGenerator struct {
-	privateKey interface{}
+	iss    string
+	signer jose.Signer
 }
 
-func (j *jwtTokenGenerator) GenerateToken(serviceAccount v1.ServiceAccount, secret v1.Secret) (string, error) {
-	var method jwt.SigningMethod
-	switch privateKey := j.privateKey.(type) {
-	case *rsa.PrivateKey:
-		method = jwt.SigningMethodRS256
-	case *ecdsa.PrivateKey:
-		switch privateKey.Curve {
-		case elliptic.P256():
-			method = jwt.SigningMethodES256
-		case elliptic.P384():
-			method = jwt.SigningMethodES384
-		case elliptic.P521():
-			method = jwt.SigningMethodES512
-		default:
-			return "", fmt.Errorf("unknown private key curve, must be 256, 384, or 521")
-		}
-	default:
-		return "", fmt.Errorf("unknown private key type %T, must be *rsa.PrivateKey or *ecdsa.PrivateKey", j.privateKey)
-	}
-
-	token := jwt.New(method)
-
-	claims, _ := token.Claims.(jwt.MapClaims)
-
-	// Identify the issuer
-	claims[IssuerClaim] = Issuer
-
-	// Username
-	claims[SubjectClaim] = apiserverserviceaccount.MakeUsername(serviceAccount.Namespace, serviceAccount.Name)
-
-	// Persist enough structured info for the authenticator to be able to look up the service account and secret
-	claims[NamespaceClaim] = serviceAccount.Namespace
-	claims[ServiceAccountNameClaim] = serviceAccount.Name
-	claims[ServiceAccountUIDClaim] = serviceAccount.UID
-	claims[SecretNameClaim] = secret.Name
-
-	// Sign and get the complete encoded token as a string
-	return token.SignedString(j.privateKey)
+func (j *jwtTokenGenerator) GenerateToken(ctx context.Context, claims *jwt.Claims, privateClaims interface{}) (string, error) {
+	return GenerateToken(j.signer, j.iss, claims, privateClaims)
 }
 
 // JWTTokenAuthenticator authenticates tokens as JWT tokens produced by JWTTokenGenerator
 // Token signatures are verified using each of the given public keys until one works (allowing key rotation)
 // If lookup is true, the service account and secret referenced as claims inside the token are retrieved and verified with the provided ServiceAccountTokenGetter
-func JWTTokenAuthenticator(keys []interface{}, lookup bool, getter ServiceAccountTokenGetter) authenticator.Token {
-	return &jwtTokenAuthenticator{keys, lookup, getter}
+func JWTTokenAuthenticator[PrivateClaims any](issuers []string, publicKeysGetter PublicKeysGetter, implicitAuds authenticator.Audiences, validator Validator[PrivateClaims]) authenticator.Token {
+	issuersMap := make(map[string]bool)
+	for _, issuer := range issuers {
+		issuersMap[issuer] = true
+	}
+	return &jwtTokenAuthenticator[PrivateClaims]{
+		issuers:      issuersMap,
+		keysGetter:   publicKeysGetter,
+		implicitAuds: implicitAuds,
+		validator:    validator,
+	}
 }
 
-type jwtTokenAuthenticator struct {
-	keys   []interface{}
-	lookup bool
-	getter ServiceAccountTokenGetter
+// Listener is an interface to use to notify interested parties of a change.
+type Listener interface {
+	// Enqueue should be called when an input may have changed
+	Enqueue()
 }
 
-var errMismatchedSigningMethod = errors.New("invalid signing method")
+// PublicKeysGetter returns public keys for a given key id.
+type PublicKeysGetter interface {
+	// AddListener is adds a listener to be notified of potential input changes.
+	// This is a noop on static providers.
+	AddListener(listener Listener)
 
-func (j *jwtTokenAuthenticator) AuthenticateToken(token string) (user.Info, bool, error) {
-	var validationError error
+	// GetCacheAgeMaxSeconds returns the seconds a call to GetPublicKeys() can be cached for.
+	// If the results of GetPublicKeys() can be dynamic, this means a new key must be included in the results
+	// for at least this long before it is used to sign new tokens.
+	GetCacheAgeMaxSeconds() int
 
-	for i, key := range j.keys {
-		// Attempt to verify with each key until we find one that works
-		parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-			switch token.Method.(type) {
-			case *jwt.SigningMethodRSA:
-				if _, ok := key.(*rsa.PublicKey); ok {
-					return key, nil
-				}
-				return nil, errMismatchedSigningMethod
-			case *jwt.SigningMethodECDSA:
-				if _, ok := key.(*ecdsa.PublicKey); ok {
-					return key, nil
-				}
-				return nil, errMismatchedSigningMethod
-			default:
-				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
-			}
-		})
+	// GetPublicKeys returns public keys to use for verifying a token with the given key id.
+	// keyIDHint may be empty if the token did not have a kid header, or if all public keys are desired.
+	GetPublicKeys(ctx context.Context, keyIDHint string) []PublicKey
+}
 
+type PublicKey struct {
+	KeyID                    string
+	PublicKey                interface{}
+	ExcludeFromOIDCDiscovery bool
+}
+
+type staticPublicKeysGetter struct {
+	allPublicKeys  []PublicKey
+	publicKeysByID map[string][]PublicKey
+}
+
+// StaticPublicKeysGetter constructs an implementation of PublicKeysGetter
+// which returns all public keys when key id is unspecified, and returns
+// the public keys matching the keyIDFromPublicKey-derived key id when
+// a key id is specified.
+func StaticPublicKeysGetter(keys []interface{}) (PublicKeysGetter, error) {
+	allPublicKeys := []PublicKey{}
+	publicKeysByID := map[string][]PublicKey{}
+	for _, key := range keys {
+		if privateKey, isPrivateKey := key.(publicKeyGetter); isPrivateKey {
+			// This is a private key. Extract its public key.
+			key = privateKey.Public()
+		}
+
+		keyID, err := keyIDFromPublicKey(key)
 		if err != nil {
-			switch err := err.(type) {
-			case *jwt.ValidationError:
-				if (err.Errors & jwt.ValidationErrorMalformed) != 0 {
-					// Not a JWT, no point in continuing
-					return nil, false, nil
-				}
-
-				if (err.Errors & jwt.ValidationErrorSignatureInvalid) != 0 {
-					// Signature error, perhaps one of the other keys will verify the signature
-					// If not, we want to return this error
-					glog.V(4).Infof("Signature error (key %d): %v", i, err)
-					validationError = err
-					continue
-				}
-
-				// This key doesn't apply to the given signature type
-				// Perhaps one of the other keys will verify the signature
-				// If not, we want to return this error
-				if err.Inner == errMismatchedSigningMethod {
-					glog.V(4).Infof("Mismatched key type (key %d): %v", i, err)
-					validationError = err
-					continue
-				}
-			}
-
-			// Other errors should just return as errors
-			return nil, false, err
+			return nil, err
 		}
+		pk := PublicKey{PublicKey: key, KeyID: keyID}
+		publicKeysByID[keyID] = append(publicKeysByID[keyID], pk)
+		allPublicKeys = append(allPublicKeys, pk)
+	}
+	return &staticPublicKeysGetter{
+		allPublicKeys:  allPublicKeys,
+		publicKeysByID: publicKeysByID,
+	}, nil
+}
 
-		// If we get here, we have a token with a recognized signature
+func (s staticPublicKeysGetter) AddListener(listener Listener) {
+	// no-op, static key content never changes
+}
 
-		claims, _ := parsedToken.Claims.(jwt.MapClaims)
+func (s staticPublicKeysGetter) GetCacheAgeMaxSeconds() int {
+	// hard-coded to match cache max-age set in OIDC discovery
+	return 3600
+}
 
-		// Make sure we issued the token
-		iss, _ := claims[IssuerClaim].(string)
-		if iss != Issuer {
-			return nil, false, nil
-		}
+func (s staticPublicKeysGetter) GetPublicKeys(ctx context.Context, keyID string) []PublicKey {
+	if len(keyID) == 0 {
+		return s.allPublicKeys
+	}
+	return s.publicKeysByID[keyID]
+}
 
-		// Make sure the claims we need exist
-		sub, _ := claims[SubjectClaim].(string)
-		if len(sub) == 0 {
-			return nil, false, errors.New("sub claim is missing")
-		}
-		namespace, _ := claims[NamespaceClaim].(string)
-		if len(namespace) == 0 {
-			return nil, false, errors.New("namespace claim is missing")
-		}
-		secretName, _ := claims[SecretNameClaim].(string)
-		if len(secretName) == 0 {
-			return nil, false, errors.New("secretName claim is missing")
-		}
-		serviceAccountName, _ := claims[ServiceAccountNameClaim].(string)
-		if len(serviceAccountName) == 0 {
-			return nil, false, errors.New("serviceAccountName claim is missing")
-		}
-		serviceAccountUID, _ := claims[ServiceAccountUIDClaim].(string)
-		if len(serviceAccountUID) == 0 {
-			return nil, false, errors.New("serviceAccountUID claim is missing")
-		}
+type jwtTokenAuthenticator[PrivateClaims any] struct {
+	issuers      map[string]bool
+	keysGetter   PublicKeysGetter
+	validator    Validator[PrivateClaims]
+	implicitAuds authenticator.Audiences
+}
 
-		subjectNamespace, subjectName, err := apiserverserviceaccount.SplitUsername(sub)
-		if err != nil || subjectNamespace != namespace || subjectName != serviceAccountName {
-			return nil, false, errors.New("sub claim is invalid")
-		}
+// Validator is called by the JWT token authenticator to apply domain specific
+// validation to a token and extract user information.
+// PrivateClaims is the struct that the authenticator should deserialize the JWT payload into, thus
+// it should contain fields for any private claims that the Validator requires to validate the JWT.
+type Validator[PrivateClaims any] interface {
+	// Validate validates a token and returns user information or an error.
+	// Validator can assume that the issuer and signature of a token are already
+	// verified when this function is called.
+	Validate(ctx context.Context, tokenData string, public *jwt.Claims, private *PrivateClaims) (*apiserverserviceaccount.ServiceAccountInfo, error)
+}
 
-		if j.lookup {
-			// Make sure token hasn't been invalidated by deletion of the secret
-			secret, err := j.getter.GetSecret(namespace, secretName)
-			if err != nil {
-				glog.V(4).Infof("Could not retrieve token %s/%s for service account %s/%s: %v", namespace, secretName, namespace, serviceAccountName, err)
-				return nil, false, errors.New("Token has been invalidated")
-			}
-			if secret.DeletionTimestamp != nil {
-				glog.V(4).Infof("Token is deleted and awaiting removal: %s/%s for service account %s/%s", namespace, secretName, namespace, serviceAccountName)
-				return nil, false, errors.New("Token has been invalidated")
-			}
-			if bytes.Compare(secret.Data[v1.ServiceAccountTokenKey], []byte(token)) != 0 {
-				glog.V(4).Infof("Token contents no longer matches %s/%s for service account %s/%s", namespace, secretName, namespace, serviceAccountName)
-				return nil, false, errors.New("Token does not match server's copy")
-			}
+// IMPORTANT: The algorithms listed below must be kept in sync with:
+// - pkg/serviceaccount/externaljwt/plugin/plugin.go validateJWTHeader
+// - pkg/serviceaccount/jwt.go signerFromRSAPrivateKey
+// - pkg/serviceaccount/jwt.go signerFromECDSAPrivateKey
+// - pkg/serviceaccount/jwt.go AcceptableServiceAccountSignatureAlgorithms
+// - test/images/agnhost/openidmetadata/openidmetadata.go validate SupportedSigningAlgs
+var AcceptableServiceAccountSignatureAlgorithms = []jose.SignatureAlgorithm{
+	jose.ES256,
+	jose.ES384,
+	jose.ES512,
+	jose.RS256,
+}
 
-			// Make sure service account still exists (name and UID)
-			serviceAccount, err := j.getter.GetServiceAccount(namespace, serviceAccountName)
-			if err != nil {
-				glog.V(4).Infof("Could not retrieve service account %s/%s: %v", namespace, serviceAccountName, err)
-				return nil, false, err
-			}
-			if serviceAccount.DeletionTimestamp != nil {
-				glog.V(4).Infof("Service account has been deleted %s/%s", namespace, serviceAccountName)
-				return nil, false, fmt.Errorf("ServiceAccount %s/%s has been deleted", namespace, serviceAccountName)
-			}
-			if string(serviceAccount.UID) != serviceAccountUID {
-				glog.V(4).Infof("Service account UID no longer matches %s/%s: %q != %q", namespace, serviceAccountName, string(serviceAccount.UID), serviceAccountUID)
-				return nil, false, fmt.Errorf("ServiceAccount UID (%s) does not match claim (%s)", serviceAccount.UID, serviceAccountUID)
-			}
-		}
-
-		return UserInfo(namespace, serviceAccountName, serviceAccountUID), true, nil
+func (j *jwtTokenAuthenticator[PrivateClaims]) AuthenticateToken(ctx context.Context, tokenData string) (*authenticator.Response, bool, error) {
+	if !j.hasCorrectIssuer(tokenData) {
+		return nil, false, nil
 	}
 
-	return nil, false, validationError
+	tok, err := jwt.ParseSigned(tokenData, AcceptableServiceAccountSignatureAlgorithms)
+	if err != nil {
+		return nil, false, nil
+	}
+
+	public := &jwt.Claims{}
+	private := new(PrivateClaims)
+
+	// Pick the key that has the same key ID as `tok`, if one exists.
+	var kid string
+	for _, header := range tok.Headers {
+		if header.KeyID != "" {
+			kid = header.KeyID
+			break
+		}
+	}
+
+	var (
+		found   bool
+		errlist []error
+	)
+	keys := j.keysGetter.GetPublicKeys(ctx, kid)
+	if len(keys) == 0 {
+		return nil, false, fmt.Errorf("invalid signature, no keys found")
+	}
+	for _, key := range keys {
+		if err := tok.Claims(key.PublicKey, public, private); err != nil {
+			errlist = append(errlist, err)
+			continue
+		}
+		found = true
+		break
+	}
+
+	if !found {
+		return nil, false, utilerrors.NewAggregate(errlist)
+	}
+
+	// sanity check issuer since we parsed it out before signature validation
+	if !j.issuers[public.Issuer] {
+		return nil, false, fmt.Errorf("token issuer %q is invalid", public.Issuer)
+	}
+
+	tokenAudiences := authenticator.Audiences(public.Audience)
+	if len(tokenAudiences) == 0 {
+		// only apiserver audiences are allowed for legacy tokens
+		audit.AddAuditAnnotation(ctx, "authentication.k8s.io/legacy-token", public.Subject)
+		legacyTokensTotal.WithContext(ctx).Inc()
+		tokenAudiences = j.implicitAuds
+	}
+
+	requestedAudiences, ok := authenticator.AudiencesFrom(ctx)
+	if !ok {
+		// default to apiserver audiences
+		requestedAudiences = j.implicitAuds
+	}
+
+	auds := authenticator.Audiences(tokenAudiences).Intersect(requestedAudiences)
+	if len(auds) == 0 && len(j.implicitAuds) != 0 {
+		return nil, false, fmt.Errorf("token audiences %q is invalid for the target audiences %q", tokenAudiences, requestedAudiences)
+	}
+
+	// If we get here, we have a token with a recognized signature and
+	// issuer string.
+	sa, err := j.validator.Validate(ctx, tokenData, public, private)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return &authenticator.Response{
+		User:      sa.UserInfo(),
+		Audiences: auds,
+	}, true, nil
+}
+
+// hasCorrectIssuer returns true if tokenData is a valid JWT in compact
+// serialization format and the "iss" claim matches the iss field of this token
+// authenticator, and otherwise returns false.
+//
+// Note: go-jose currently does not allow access to unverified JWS payloads.
+// See https://github.com/square/go-jose/issues/169
+func (j *jwtTokenAuthenticator[PrivateClaims]) hasCorrectIssuer(tokenData string) bool {
+	if strings.HasPrefix(strings.TrimSpace(tokenData), "{") {
+		return false
+	}
+	parts := strings.Split(tokenData, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	claims := struct {
+		// WARNING: this JWT is not verified. Do not trust these claims.
+		Issuer string `json:"iss"`
+	}{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return false
+	}
+	return j.issuers[claims.Issuer]
+}
+
+// audienceOverrider is a utility struct used to
+// ensure that the audience claim always serializes
+// as a list of string values.
+// This prevents the go-jose change in https://github.com/go-jose/go-jose/blob/25b55feb059b8b08e16a73c601c8b80571fa5208/jwt/claims.go#L129-L135
+// from causing the 'aud' claim in serviceaccount tokens
+// to suddenly be plain strings.
+// Use of this utility struct is intended to allow
+// updating to the latest version of go-jose while maintaining
+// backwards compatibility for serviceaccount token payloads.
+type audienceOverrider struct {
+	Aud []string `json:"aud,omitempty"`
+}
+
+// GenerateToken is shared between internal and external signer code to ensure that claim merging logic remains consistent between them.
+func GenerateToken(signer jose.Signer, iss string, claims *jwt.Claims, privateClaims interface{}) (string, error) {
+	audOverride := &audienceOverrider{
+		Aud: []string{},
+	}
+
+	if claims != nil {
+		for _, aud := range claims.Audience {
+			audOverride.Aud = append(audOverride.Aud, aud)
+		}
+	}
+
+	// claims are applied in reverse precedence
+	return jwt.Signed(signer).
+		Claims(privateClaims).
+		Claims(claims).
+		Claims(&jwt.Claims{
+			Issuer: iss,
+		}).
+		Claims(audOverride).
+		Serialize()
 }

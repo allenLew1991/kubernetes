@@ -17,135 +17,23 @@ limitations under the License.
 package util
 
 import (
-	"io/ioutil"
 	"os"
+	"reflect"
+	"runtime"
+	"slices"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	// util.go uses api.Codecs.LegacyCodec so import this package to do some
-	// resource initialization.
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
-	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/utils/ptr"
 )
-
-var nodeLabels map[string]string = map[string]string{
-	"test-key1": "test-value1",
-	"test-key2": "test-value2",
-}
-
-func TestCheckNodeAffinity(t *testing.T) {
-	type affinityTest struct {
-		name          string
-		expectSuccess bool
-		pv            *v1.PersistentVolume
-	}
-
-	cases := []affinityTest{
-		{
-			name:          "valid-no-constraints",
-			expectSuccess: true,
-			pv:            testVolumeWithNodeAffinity(t, &v1.NodeAffinity{}),
-		},
-		{
-			name:          "valid-constraints",
-			expectSuccess: true,
-			pv: testVolumeWithNodeAffinity(t, &v1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "invalid-key",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-								{
-									Key:      "test-key3",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "invalid-values",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value3", "test-value4"},
-								},
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-	}
-
-	for _, c := range cases {
-		err := CheckNodeAffinity(c.pv, nodeLabels)
-
-		if err != nil && c.expectSuccess {
-			t.Errorf("CheckTopology %v returned error: %v", c.name, err)
-		}
-		if err == nil && !c.expectSuccess {
-			t.Errorf("CheckTopology %v returned success, expected error", c.name)
-		}
-	}
-}
-
-func testVolumeWithNodeAffinity(t *testing.T, affinity *v1.NodeAffinity) *v1.PersistentVolume {
-	objMeta := metav1.ObjectMeta{Name: "test-constraints"}
-	objMeta.Annotations = map[string]string{}
-	err := helper.StorageNodeAffinityToAlphaAnnotation(objMeta.Annotations, affinity)
-	if err != nil {
-		t.Fatalf("Failed to get node affinity annotation: %v", err)
-	}
-
-	return &v1.PersistentVolume{
-		ObjectMeta: objMeta,
-	}
-}
 
 func TestLoadPodFromFile(t *testing.T) {
 	tests := []struct {
@@ -162,7 +50,7 @@ metadata:
   name: testpod
 spec:
   containers:
-    - image: gcr.io/google_containers/busybox
+    - image: registry.k8s.io/busybox
 `,
 			false,
 		},
@@ -179,7 +67,7 @@ spec:
   "spec": {
     "containers": [
       {
-        "image": "gcr.io/google_containers/busybox"
+        "image": "registry.k8s.io/busybox"
       }
     ]
   }
@@ -195,14 +83,14 @@ kind: Pod
 metadata:
   name: testpod
 spec:
-  - image: gcr.io/google_containers/busybox
+  - image: registry.k8s.io/busybox
 `,
 			true,
 		},
 	}
 
 	for _, test := range tests {
-		tempFile, err := ioutil.TempFile("", "podfile")
+		tempFile, err := os.CreateTemp("", "podfile")
 		defer os.Remove(tempFile.Name())
 		if err != nil {
 			t.Fatalf("cannot create temporary file: %v", err)
@@ -230,36 +118,997 @@ spec:
 		}
 	}
 }
-func TestZonesToSet(t *testing.T) {
-	functionUnderTest := "ZonesToSet"
-	// First part: want an error
-	sliceOfZones := []string{"", ",", "us-east-1a, , us-east-1d", ", us-west-1b", "us-west-2b,"}
-	for _, zones := range sliceOfZones {
-		if got, err := ZonesToSet(zones); err == nil {
-			t.Errorf("%v(%v) returned (%v), want (%v)", functionUnderTest, zones, got, "an error")
-		}
-	}
 
-	// Second part: want no error
-	tests := []struct {
-		zones string
-		want  sets.String
-	}{
-		{
-			zones: "us-east-1a",
-			want:  sets.String{"us-east-1a": sets.Empty{}},
-		},
-		{
-			zones: "us-east-1a, us-west-2a",
-			want: sets.String{
-				"us-east-1a": sets.Empty{},
-				"us-west-2a": sets.Empty{},
+func TestCalculateTimeoutForVolume(t *testing.T) {
+	pv := &v1.PersistentVolume{
+		Spec: v1.PersistentVolumeSpec{
+			Capacity: v1.ResourceList{
+				v1.ResourceName(v1.ResourceStorage): resource.MustParse("500M"),
 			},
 		},
 	}
-	for _, tt := range tests {
-		if got, err := ZonesToSet(tt.zones); err != nil || !got.Equal(tt.want) {
-			t.Errorf("%v(%v) returned (%v), want (%v)", functionUnderTest, tt.zones, got, tt.want)
+
+	timeout := CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 50 {
+		t.Errorf("Expected 50 for timeout but got %v", timeout)
+	}
+
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("2Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 60 {
+		t.Errorf("Expected 60 for timeout but got %v", timeout)
+	}
+
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("150Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 4500 {
+		t.Errorf("Expected 4500 for timeout but got %v", timeout)
+	}
+
+	// Largest size whose timeout fits the activeDeadlineSeconds ceiling.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582788Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 2147483640 {
+		t.Errorf("Expected 2147483640 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The size fits int64 but the product does not fit int32; the timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582789Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 2147483670 {
+		t.Errorf("Expected 2147483670 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("100E")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 257698037730 {
+		t.Errorf("Expected 257698037730 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("18446744073709551616")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 257698037730 {
+		t.Errorf("Expected 257698037730 for timeout but got %v", timeout)
+	}
+}
+
+func TestFsUserFrom(t *testing.T) {
+	tests := []struct {
+		desc       string
+		pod        *v1.Pod
+		wantFsUser *int64
+	}{
+		{
+			desc: "no runAsUser specified",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{},
+			},
+			wantFsUser: nil,
+		},
+		{
+			desc: "some have runAsUser specified",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{},
+						},
+					},
+				},
+			},
+			wantFsUser: nil,
+		},
+		{
+			desc: "all have runAsUser specified but not the same",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](999),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1001),
+								},
+							},
+						},
+					},
+				},
+			},
+			wantFsUser: nil,
+		},
+		{
+			desc: "init and regular containers have runAsUser specified and the same",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+				},
+			},
+			wantFsUser: ptr.To[int64](1000),
+		},
+		{
+			desc: "all have runAsUser specified and the same",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1000),
+								},
+							},
+						},
+					},
+				},
+			},
+			wantFsUser: ptr.To[int64](1000),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			fsUser := FsUserFrom(test.pod)
+			if fsUser == nil && test.wantFsUser != nil {
+				t.Errorf("FsUserFrom(%v) = %v, want %d", test.pod, fsUser, *test.wantFsUser)
+			}
+			if fsUser != nil && test.wantFsUser == nil {
+				t.Errorf("FsUserFrom(%v) = %d, want %v", test.pod, *fsUser, test.wantFsUser)
+			}
+			if fsUser != nil && test.wantFsUser != nil && *fsUser != *test.wantFsUser {
+				t.Errorf("FsUserFrom(%v) = %d, want %d", test.pod, *fsUser, *test.wantFsUser)
+			}
+		})
+	}
+}
+
+func TestHasMountRefs(t *testing.T) {
+	testCases := map[string]struct {
+		mountPath string
+		mountRefs []string
+		expected  bool
+	}{
+		"plugin mounts only": {
+			mountPath: "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			mountRefs: []string{
+				"/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			},
+			expected: false,
+		},
+		"extra local mount": {
+			mountPath: "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			mountRefs: []string{
+				"/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/local/data/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			},
+			expected: true,
+		},
+	}
+	for name, test := range testCases {
+		actual := HasMountRefs(test.mountPath, test.mountRefs)
+		if actual != test.expected {
+			t.Errorf("for %s expected %v but got %v", name, test.expected, actual)
 		}
+	}
+}
+
+func TestMountOptionFromSpec(t *testing.T) {
+	scenarios := map[string]struct {
+		volume            *volume.Spec
+		expectedMountList []string
+		systemOptions     []string
+	}{
+		"volume-with-mount-options": {
+			volume: createVolumeSpecWithMountOption("good-mount-opts", "ro,nfsvers=3", v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					NFS: &v1.NFSVolumeSource{Server: "localhost", Path: "/srv", ReadOnly: false},
+				},
+			}),
+			expectedMountList: []string{"ro", "nfsvers=3"},
+			systemOptions:     nil,
+		},
+		"volume-with-bad-mount-options": {
+			volume: createVolumeSpecWithMountOption("good-mount-opts", "", v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					NFS: &v1.NFSVolumeSource{Server: "localhost", Path: "/srv", ReadOnly: false},
+				},
+			}),
+			expectedMountList: []string{},
+			systemOptions:     nil,
+		},
+		"vol-with-sys-opts": {
+			volume: createVolumeSpecWithMountOption("good-mount-opts", "ro,nfsvers=3", v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					NFS: &v1.NFSVolumeSource{Server: "localhost", Path: "/srv", ReadOnly: false},
+				},
+			}),
+			expectedMountList: []string{"ro", "nfsvers=3", "fsid=100", "hard"},
+			systemOptions:     []string{"fsid=100", "hard"},
+		},
+		"vol-with-sys-opts-with-dup": {
+			volume: createVolumeSpecWithMountOption("good-mount-opts", "ro,nfsvers=3", v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					NFS: &v1.NFSVolumeSource{Server: "localhost", Path: "/srv", ReadOnly: false},
+				},
+			}),
+			expectedMountList: []string{"ro", "nfsvers=3", "fsid=100"},
+			systemOptions:     []string{"fsid=100", "ro"},
+		},
+	}
+
+	for name, scenario := range scenarios {
+		mountOptions := MountOptionFromSpec(scenario.volume, scenario.systemOptions...)
+		slices.Sort(mountOptions)
+		slices.Sort(scenario.expectedMountList)
+		if !reflect.DeepEqual(mountOptions, scenario.expectedMountList) {
+			t.Errorf("for %s expected mount options : %v got %v", name, scenario.expectedMountList, mountOptions)
+		}
+	}
+}
+
+func createVolumeSpecWithMountOption(name string, mountOptions string, spec v1.PersistentVolumeSpec) *volume.Spec {
+	annotations := map[string]string{
+		v1.MountOptionAnnotation: mountOptions,
+	}
+	objMeta := metav1.ObjectMeta{
+		Name:        name,
+		Annotations: annotations,
+	}
+
+	pv := &v1.PersistentVolume{
+		ObjectMeta: objMeta,
+		Spec:       spec,
+	}
+	return &volume.Spec{PersistentVolume: pv}
+}
+
+func TestGetWindowsPath(t *testing.T) {
+	tests := []struct {
+		path         string
+		expectedPath string
+	}{
+		{
+			path:         `/var/lib/kubelet/pods/146f8428-83e7-11e7-8dd4-000d3a31dac4/volumes/kubernetes.io~disk`,
+			expectedPath: `c:\var\lib\kubelet\pods\146f8428-83e7-11e7-8dd4-000d3a31dac4\volumes\kubernetes.io~disk`,
+		},
+		{
+			path:         `\var/lib/kubelet/pods/146f8428-83e7-11e7-8dd4-000d3a31dac4\volumes\kubernetes.io~disk`,
+			expectedPath: `c:\var\lib\kubelet\pods\146f8428-83e7-11e7-8dd4-000d3a31dac4\volumes\kubernetes.io~disk`,
+		},
+		{
+			path:         `/`,
+			expectedPath: `c:\`,
+		},
+		{
+			path:         ``,
+			expectedPath: ``,
+		},
+	}
+
+	for _, test := range tests {
+		result := GetWindowsPath(test.path)
+		if result != test.expectedPath {
+			t.Errorf("GetWindowsPath(%v) returned (%v), want (%v)", test.path, result, test.expectedPath)
+		}
+	}
+}
+
+func TestIsWindowsUNCPath(t *testing.T) {
+	tests := []struct {
+		goos      string
+		path      string
+		isUNCPath bool
+	}{
+		{
+			goos:      "linux",
+			path:      `/usr/bin`,
+			isUNCPath: false,
+		},
+		{
+			goos:      "linux",
+			path:      `\\.\pipe\foo`,
+			isUNCPath: false,
+		},
+		{
+			goos:      "windows",
+			path:      `C:\foo`,
+			isUNCPath: false,
+		},
+		{
+			goos:      "windows",
+			path:      `\\server\share\foo`,
+			isUNCPath: true,
+		},
+		{
+			goos:      "windows",
+			path:      `\\?\server\share`,
+			isUNCPath: true,
+		},
+		{
+			goos:      "windows",
+			path:      `\\?\c:\`,
+			isUNCPath: true,
+		},
+		{
+			goos:      "windows",
+			path:      `\\.\pipe\valid_pipe`,
+			isUNCPath: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := IsWindowsUNCPath(test.goos, test.path)
+		if result != test.isUNCPath {
+			t.Errorf("IsWindowsUNCPath(%v) returned (%v), expected (%v)", test.path, result, test.isUNCPath)
+		}
+	}
+}
+
+func TestIsWindowsLocalPath(t *testing.T) {
+	tests := []struct {
+		goos               string
+		path               string
+		isWindowsLocalPath bool
+	}{
+		{
+			goos:               "linux",
+			path:               `/usr/bin`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "linux",
+			path:               `\\.\pipe\foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `C:\foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `:\foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `X:\foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `\\server\share\foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `\\?\server\share`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `\\?\c:\`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `\\.\pipe\valid_pipe`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `:foo`,
+			isWindowsLocalPath: false,
+		},
+		{
+			goos:               "windows",
+			path:               `\foo`,
+			isWindowsLocalPath: true,
+		},
+		{
+			goos:               "windows",
+			path:               `\foo\bar`,
+			isWindowsLocalPath: true,
+		},
+		{
+			goos:               "windows",
+			path:               `/foo`,
+			isWindowsLocalPath: true,
+		},
+		{
+			goos:               "windows",
+			path:               `/foo/bar`,
+			isWindowsLocalPath: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := IsWindowsLocalPath(test.goos, test.path)
+		if result != test.isWindowsLocalPath {
+			t.Errorf("isWindowsLocalPath(%v) returned (%v), expected (%v)", test.path, result, test.isWindowsLocalPath)
+		}
+	}
+}
+
+func TestMakeAbsolutePath(t *testing.T) {
+	tests := []struct {
+		goos         string
+		path         string
+		expectedPath string
+		name         string
+	}{
+		{
+			goos:         "linux",
+			path:         "non-absolute/path",
+			expectedPath: "/non-absolute/path",
+			name:         "linux non-absolute path",
+		},
+		{
+			goos:         "linux",
+			path:         "/absolute/path",
+			expectedPath: "/absolute/path",
+			name:         "linux absolute path",
+		},
+		{
+			goos:         "windows",
+			path:         "some\\path",
+			expectedPath: "c:\\some\\path",
+			name:         "basic windows",
+		},
+		{
+			goos:         "windows",
+			path:         "/some/path",
+			expectedPath: "c:/some/path",
+			name:         "linux path on windows",
+		},
+		{
+			goos:         "windows",
+			path:         "\\some\\path",
+			expectedPath: "c:\\some\\path",
+			name:         "windows path no drive",
+		},
+		{
+			goos:         "windows",
+			path:         "\\:\\some\\path",
+			expectedPath: "\\:\\some\\path",
+			name:         "windows path with colon",
+		},
+	}
+	for _, test := range tests {
+		if runtime.GOOS == test.goos {
+			path := MakeAbsolutePath(test.goos, test.path)
+			if path != test.expectedPath {
+				t.Errorf("[%s] Expected %s saw %s", test.name, test.expectedPath, path)
+			}
+		}
+	}
+}
+
+func TestGetPodVolumeNames(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, true)
+	tests := []struct {
+		name                    string
+		pod                     *v1.Pod
+		expectedMounts          sets.Set[string]
+		expectedDevices         sets.Set[string]
+		expectedSELinuxContexts map[string][]*v1.SELinuxOptions
+	}{
+		{
+			name: "empty pod",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{},
+			},
+			expectedMounts:  sets.New[string](),
+			expectedDevices: sets.New[string](),
+		},
+		{
+			name: "pod with volumes",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "container",
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+								{
+									Name: "vol2",
+								},
+							},
+							VolumeDevices: []v1.VolumeDevice{
+								{
+									Name: "vol3",
+								},
+								{
+									Name: "vol4",
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+						{
+							Name: "vol3",
+						},
+						{
+							Name: "vol4",
+						},
+					},
+				},
+			},
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
+		},
+		{
+			name: "pod with init containers",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name: "initContainer",
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+								{
+									Name: "vol2",
+								},
+							},
+							VolumeDevices: []v1.VolumeDevice{
+								{
+									Name: "vol3",
+								},
+								{
+									Name: "vol4",
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+						{
+							Name: "vol3",
+						},
+						{
+							Name: "vol4",
+						},
+					},
+				},
+			},
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
+		},
+		{
+			name: "pod with multiple containers",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name: "initContainer1",
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+							},
+						},
+						{
+							Name: "initContainer2",
+							VolumeDevices: []v1.VolumeDevice{
+								{
+									Name: "vol2",
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "container1",
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol3",
+								},
+							},
+						},
+						{
+							Name: "container2",
+							VolumeDevices: []v1.VolumeDevice{
+								{
+									Name: "vol4",
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+						{
+							Name: "vol3",
+						},
+						{
+							Name: "vol4",
+						},
+					},
+				},
+			},
+			expectedMounts:  sets.New[string]("vol1", "vol3"),
+			expectedDevices: sets.New[string]("vol2", "vol4"),
+		},
+		{
+			name: "pod with ephemeral containers",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "container1",
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								Name: "debugger",
+								VolumeMounts: []v1.VolumeMount{
+									{
+										Name: "vol1",
+									},
+									{
+										Name: "vol2",
+									},
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+					},
+				},
+			},
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string](),
+		},
+		{
+			name: "pod with SELinuxOptions",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						SELinuxOptions: &v1.SELinuxOptions{
+							Type:  "global_context_t",
+							Level: "s0:c1,c2",
+						},
+					},
+					InitContainers: []v1.Container{
+						{
+							Name: "initContainer1",
+							SecurityContext: &v1.SecurityContext{
+								SELinuxOptions: &v1.SELinuxOptions{
+									Type:  "initcontainer1_context_t",
+									Level: "s0:c3,c4",
+								},
+							},
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "container1",
+							SecurityContext: &v1.SecurityContext{
+								SELinuxOptions: &v1.SELinuxOptions{
+									Type:  "container1_context_t",
+									Level: "s0:c5,c6",
+								},
+							},
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+								{
+									Name: "vol2",
+								},
+							},
+						},
+						{
+							Name: "container2",
+							// No SELinux context, will be inherited from PodSecurityContext
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol2",
+								},
+								{
+									Name: "vol3",
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+						{
+							Name: "vol3",
+						},
+					},
+				},
+			},
+			expectedMounts: sets.New[string]("vol1", "vol2", "vol3"),
+			expectedSELinuxContexts: map[string][]*v1.SELinuxOptions{
+				"vol1": {
+					{
+						Type:  "initcontainer1_context_t",
+						Level: "s0:c3,c4",
+					},
+					{
+						Type:  "container1_context_t",
+						Level: "s0:c5,c6",
+					},
+				},
+				"vol2": {
+					{
+						Type:  "container1_context_t",
+						Level: "s0:c5,c6",
+					},
+					{
+						Type:  "global_context_t",
+						Level: "s0:c1,c2",
+					},
+				},
+				"vol3": {
+					{
+						Type:  "global_context_t",
+						Level: "s0:c1,c2",
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mounts, devices, contexts := GetPodVolumeNames(test.pod, true /* collectSELinuxOptions */)
+			if !mounts.Equal(test.expectedMounts) {
+				t.Errorf("Expected mounts: %q, got %q", sets.List[string](mounts), sets.List[string](test.expectedMounts))
+			}
+			if !devices.Equal(test.expectedDevices) {
+				t.Errorf("Expected devices: %q, got %q", sets.List[string](devices), sets.List[string](test.expectedDevices))
+			}
+			if len(contexts) == 0 {
+				contexts = nil
+			}
+			if !reflect.DeepEqual(test.expectedSELinuxContexts, contexts) {
+				t.Errorf("Expected SELinuxContexts: %+v\ngot: %+v", test.expectedSELinuxContexts, contexts)
+			}
+		})
+	}
+}
+
+func TestVolumeHealthConditionSetsEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a    []v1.VolumeHealthCondition
+		b    []v1.VolumeHealthCondition
+		want bool
+	}{
+		{
+			name: "nil and empty are equal",
+			a:    nil,
+			b:    []v1.VolumeHealthCondition{},
+			want: true,
+		},
+		{
+			name: "same condition different message is equal",
+			a: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "old message",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "new message",
+			}},
+			want: true,
+		},
+		{
+			name: "same set different order is equal",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
+				},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+			},
+			b: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "duplicates do not change set equality",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+			},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			want: true,
+		},
+		{
+			name: "different status is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDataLoss,
+				Reason: "DiskSlow",
+			}},
+			want: false,
+		},
+		{
+			name: "different reason is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "TargetPathNotFound",
+			}},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VolumeHealthConditionSetsEqual(tc.a, tc.b); got != tc.want {
+				t.Fatalf("VolumeHealthConditionSetsEqual() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVolumeHealthConditionSetsEqual_IgnoresMessageChanges(t *testing.T) {
+	a := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "first message",
+	}}
+	b := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "second message",
+	}}
+
+	if !VolumeHealthConditionSetsEqual(a, b) {
+		t.Fatal("expected same status/reason with different message to be equal")
 	}
 }

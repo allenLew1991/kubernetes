@@ -17,7 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"net"
 	"testing"
 )
 
@@ -46,24 +45,6 @@ func TestIPPart(t *testing.T) {
 			}
 		} else if ip != "" {
 			t.Errorf("Error did not occur for %s, expected: '%s' error", tc.endpoint, tc.expectedError)
-		}
-	}
-}
-
-func TestToCIDR(t *testing.T) {
-	testCases := []struct {
-		ip           string
-		expectedAddr string
-	}{
-		{"1.2.3.4", "1.2.3.4/32"},
-		{"2001:db8::1:1", "2001:db8::1:1/128"},
-	}
-
-	for _, tc := range testCases {
-		ip := net.ParseIP(tc.ip)
-		addr := ToCIDR(ip)
-		if addr != tc.expectedAddr {
-			t.Errorf("Unexpected host address for %s: Expected: %s, Got %s", tc.ip, tc.expectedAddr, addr)
 		}
 	}
 }

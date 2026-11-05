@@ -1,4 +1,4 @@
-// +build !freebsd,!linux,!windows,!darwin
+//go:build !freebsd && !linux && !windows && !darwin
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -20,14 +20,26 @@ package util
 
 import (
 	"fmt"
-	"net"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
-func CreateListener(endpoint string) (net.Listener, error) {
-	return nil, fmt.Errorf("CreateListener is unsupported in this build")
+// LockAndCheckSubPath empty implementation
+func LockAndCheckSubPath(volumePath, subPath string) ([]uintptr, error) {
+	return []uintptr{}, nil
 }
 
-func GetAddressAndDialer(endpoint string) (string, func(addr string, timeout time.Duration) (net.Conn, error), error) {
-	return "", nil, fmt.Errorf("GetAddressAndDialer is unsupported in this build")
+// UnlockPath empty implementation
+func UnlockPath(fileHandles []uintptr) {
+}
+
+// LocalEndpoint empty implementation
+func LocalEndpoint(path, file string) (string, error) {
+	return "", fmt.Errorf("LocalEndpoints are unsupported in this build")
+}
+
+// GetBootTime empty implementation
+func GetBootTime(klog.Logger) (time.Time, error) {
+	return time.Time{}, fmt.Errorf("GetBootTime is unsupported in this build")
 }

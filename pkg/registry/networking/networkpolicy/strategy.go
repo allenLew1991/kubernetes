@@ -17,11 +17,13 @@ limitations under the License.
 package networkpolicy
 
 import (
+	"context"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"reflect"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/networking"
@@ -30,12 +32,12 @@ import (
 
 // networkPolicyStrategy implements verification logic for NetworkPolicies
 type networkPolicyStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating NetworkPolicy objects.
-var Strategy = networkPolicyStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = networkPolicyStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped returns true because all NetworkPolicies need to be within a namespace.
 func (networkPolicyStrategy) NamespaceScoped() bool {
@@ -43,13 +45,13 @@ func (networkPolicyStrategy) NamespaceScoped() bool {
 }
 
 // PrepareForCreate clears the status of a NetworkPolicy before creation.
-func (networkPolicyStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+func (networkPolicyStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	networkPolicy := obj.(*networking.NetworkPolicy)
 	networkPolicy.Generation = 1
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (networkPolicyStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (networkPolicyStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newNetworkPolicy := obj.(*networking.NetworkPolicy)
 	oldNetworkPolicy := old.(*networking.NetworkPolicy)
 
@@ -62,27 +64,68 @@ func (networkPolicyStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj
 }
 
 // Validate validates a new NetworkPolicy.
-func (networkPolicyStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (networkPolicyStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	networkPolicy := obj.(*networking.NetworkPolicy)
-	return validation.ValidateNetworkPolicy(networkPolicy)
+	ops := validation.ValidationOptionsForNetworking(networkPolicy, nil)
+	return validation.ValidateNetworkPolicy(networkPolicy, ops)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (networkPolicyStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return networkPolicyWarnings(obj.(*networking.NetworkPolicy))
 }
 
 // Canonicalize normalizes the object after validation.
 func (networkPolicyStrategy) Canonicalize(obj runtime.Object) {}
 
 // AllowCreateOnUpdate is false for NetworkPolicy; this means POST is needed to create one.
-func (networkPolicyStrategy) AllowCreateOnUpdate() bool {
+func (networkPolicyStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (networkPolicyStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	validationErrorList := validation.ValidateNetworkPolicy(obj.(*networking.NetworkPolicy))
-	updateErrorList := validation.ValidateNetworkPolicyUpdate(obj.(*networking.NetworkPolicy), old.(*networking.NetworkPolicy))
-	return append(validationErrorList, updateErrorList...)
+func (networkPolicyStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	opts := validation.ValidationOptionsForNetworking(obj.(*networking.NetworkPolicy), old.(*networking.NetworkPolicy))
+	return validation.ValidateNetworkPolicyUpdate(obj.(*networking.NetworkPolicy), old.(*networking.NetworkPolicy), opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (networkPolicyStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return networkPolicyWarnings(obj.(*networking.NetworkPolicy))
 }
 
 // AllowUnconditionalUpdate is the default update policy for NetworkPolicy objects.
-func (networkPolicyStrategy) AllowUnconditionalUpdate() bool {
+func (networkPolicyStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
+}
+
+func networkPolicyWarnings(networkPolicy *networking.NetworkPolicy) []string {
+	var warnings []string
+	for i := range networkPolicy.Spec.Ingress {
+		for j := range networkPolicy.Spec.Ingress[i].From {
+			ipBlock := networkPolicy.Spec.Ingress[i].From[j].IPBlock
+			if ipBlock == nil {
+				continue
+			}
+			fldPath := field.NewPath("spec").Child("ingress").Index(i).Child("from").Index(j).Child("ipBlock")
+			warnings = append(warnings, utilvalidation.GetWarningsForCIDR(fldPath.Child("cidr"), ipBlock.CIDR)...)
+			for k, except := range ipBlock.Except {
+				warnings = append(warnings, utilvalidation.GetWarningsForCIDR(fldPath.Child("except").Index(k), except)...)
+			}
+		}
+	}
+	for i := range networkPolicy.Spec.Egress {
+		for j := range networkPolicy.Spec.Egress[i].To {
+			ipBlock := networkPolicy.Spec.Egress[i].To[j].IPBlock
+			if ipBlock == nil {
+				continue
+			}
+			fldPath := field.NewPath("spec").Child("egress").Index(i).Child("to").Index(j).Child("ipBlock")
+			warnings = append(warnings, utilvalidation.GetWarningsForCIDR(fldPath.Child("cidr"), ipBlock.CIDR)...)
+			for k, except := range ipBlock.Except {
+				warnings = append(warnings, utilvalidation.GetWarningsForCIDR(fldPath.Child("except").Index(k), except)...)
+			}
+		}
+	}
+	return warnings
 }

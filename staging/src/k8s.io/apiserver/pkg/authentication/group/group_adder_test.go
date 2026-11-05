@@ -26,25 +26,33 @@ import (
 )
 
 func TestGroupAdder(t *testing.T) {
+	capacity := make([]string, 0, 1024)
+	response := &authenticator.Response{User: &user.DefaultInfo{Name: "user", Groups: append(capacity, "original")}}
+	orig := toJson(response)
+
 	adder := authenticator.Request(
 		NewGroupAdder(
-			authenticator.RequestFunc(func(req *http.Request) (user.Info, bool, error) {
-				return &user.DefaultInfo{Name: "user", Groups: []string{"original"}}, true, nil
+			authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+				return response, true, nil
 			}),
 			[]string{"added"},
 		),
 	)
 
-	user, _, _ := adder.AuthenticateRequest(nil)
-	if !reflect.DeepEqual(user.GetGroups(), []string{"original", "added"}) {
-		t.Errorf("Expected original,added groups, got %#v", user.GetGroups())
+	r, _, _ := adder.AuthenticateRequest(nil)
+	if want := []string{"original", "added"}; !reflect.DeepEqual(r.User.GetGroups(), want) {
+		t.Errorf("Unexpected groups\ngot:\t%#v\nwant:\t%#v", r.User.GetGroups(), want)
+	}
+
+	if got := toJson(response); got != orig {
+		t.Errorf("Expected response from delegate to be unmodified: orig=%v got=%v", orig, got)
 	}
 }
 
 func TestAuthenticatedGroupAdder(t *testing.T) {
 	tests := []struct {
 		name         string
-		inputUser    user.Info
+		inputUser    *user.DefaultInfo
 		expectedUser user.Info
 	}{
 		{
@@ -94,17 +102,27 @@ func TestAuthenticatedGroupAdder(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		capacity := make([]string, 0, 1024)
+		user := test.inputUser
+		user.Groups = append(capacity, user.Groups...) // make sure there is capacity in the groups array to trigger potential mutation
+		response := &authenticator.Response{User: user}
+		orig := toJson(response)
+
 		adder := authenticator.Request(
 			NewAuthenticatedGroupAdder(
-				authenticator.RequestFunc(func(req *http.Request) (user.Info, bool, error) {
-					return test.inputUser, true, nil
+				authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+					return response, true, nil
 				}),
 			),
 		)
 
-		user, _, _ := adder.AuthenticateRequest(nil)
-		if !reflect.DeepEqual(user, test.expectedUser) {
-			t.Errorf("got %#v", user)
+		r, _, _ := adder.AuthenticateRequest(nil)
+		if !reflect.DeepEqual(r.User, test.expectedUser) {
+			t.Errorf("Unexpected user\ngot:\t%#v\nwant:\t%#v", r.User, test.expectedUser)
+		}
+
+		if got := toJson(response); got != orig {
+			t.Errorf("Expected response from delegate to be unmodified: orig=%v got=%v", orig, got)
 		}
 	}
 

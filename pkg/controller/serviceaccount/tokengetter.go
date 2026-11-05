@@ -17,85 +17,79 @@ limitations under the License.
 package serviceaccount
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/registry/generic"
-	"k8s.io/apiserver/pkg/storage/storagebackend"
 	clientset "k8s.io/client-go/kubernetes"
-	apiv1 "k8s.io/kubernetes/pkg/apis/core/v1"
-	"k8s.io/kubernetes/pkg/registry/core/secret"
-	secretstore "k8s.io/kubernetes/pkg/registry/core/secret/storage"
-	serviceaccountregistry "k8s.io/kubernetes/pkg/registry/core/serviceaccount"
-	serviceaccountstore "k8s.io/kubernetes/pkg/registry/core/serviceaccount/storage"
+	admissionregistrationv1listers "k8s.io/client-go/listers/admissionregistration/v1"
+	v1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 )
 
 // clientGetter implements ServiceAccountTokenGetter using a clientset.Interface
 type clientGetter struct {
-	client clientset.Interface
+	client                               clientset.Interface
+	secretLister                         v1listers.SecretLister
+	serviceAccountLister                 v1listers.ServiceAccountLister
+	podLister                            v1listers.PodLister
+	nodeLister                           v1listers.NodeLister
+	validatingWebhookConfigurationLister admissionregistrationv1listers.ValidatingWebhookConfigurationLister
+	mutatingWebhookConfigurationLister   admissionregistrationv1listers.MutatingWebhookConfigurationLister
 }
 
 // NewGetterFromClient returns a ServiceAccountTokenGetter that
-// uses the specified client to retrieve service accounts and secrets.
+// uses the specified client to retrieve service accounts, pods, secrets and nodes.
 // The client should NOT authenticate using a service account token
 // the returned getter will be used to retrieve, or recursion will result.
-func NewGetterFromClient(c clientset.Interface) serviceaccount.ServiceAccountTokenGetter {
-	return clientGetter{c}
-}
-func (c clientGetter) GetServiceAccount(namespace, name string) (*v1.ServiceAccount, error) {
-	return c.client.CoreV1().ServiceAccounts(namespace).Get(name, metav1.GetOptions{})
-}
-func (c clientGetter) GetSecret(namespace, name string) (*v1.Secret, error) {
-	return c.client.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+func NewGetterFromClient(c clientset.Interface, secretLister v1listers.SecretLister, serviceAccountLister v1listers.ServiceAccountLister, podLister v1listers.PodLister, nodeLister v1listers.NodeLister, validatingWebhookConfigurationLister admissionregistrationv1listers.ValidatingWebhookConfigurationLister, mutatingWebhookConfigurationLister admissionregistrationv1listers.MutatingWebhookConfigurationLister) serviceaccount.ServiceAccountTokenGetter {
+	return clientGetter{c, secretLister, serviceAccountLister, podLister, nodeLister, validatingWebhookConfigurationLister, mutatingWebhookConfigurationLister}
 }
 
-// registryGetter implements ServiceAccountTokenGetter using a service account and secret registry
-type registryGetter struct {
-	serviceAccounts serviceaccountregistry.Registry
-	secrets         secret.Registry
-}
-
-// NewGetterFromRegistries returns a ServiceAccountTokenGetter that
-// uses the specified registries to retrieve service accounts and secrets.
-func NewGetterFromRegistries(serviceAccounts serviceaccountregistry.Registry, secrets secret.Registry) serviceaccount.ServiceAccountTokenGetter {
-	return &registryGetter{serviceAccounts, secrets}
-}
-func (r *registryGetter) GetServiceAccount(namespace, name string) (*v1.ServiceAccount, error) {
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
-	internalServiceAccount, err := r.serviceAccounts.GetServiceAccount(ctx, name, &metav1.GetOptions{})
-	if err != nil {
-		return nil, err
+func (c clientGetter) GetServiceAccount(ctx context.Context, namespace, name string) (*v1.ServiceAccount, error) {
+	if serviceAccount, err := c.serviceAccountLister.ServiceAccounts(namespace).Get(name); err == nil {
+		return serviceAccount, nil
 	}
-	v1ServiceAccount := v1.ServiceAccount{}
-	err = apiv1.Convert_core_ServiceAccount_To_v1_ServiceAccount(internalServiceAccount, &v1ServiceAccount, nil)
-	return &v1ServiceAccount, err
-
+	return c.client.CoreV1().ServiceAccounts(namespace).Get(ctx, name, metav1.GetOptions{})
 }
-func (r *registryGetter) GetSecret(namespace, name string) (*v1.Secret, error) {
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
-	internalSecret, err := r.secrets.GetSecret(ctx, name, &metav1.GetOptions{})
-	if err != nil {
-		return nil, err
+
+func (c clientGetter) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
+	if pod, err := c.podLister.Pods(namespace).Get(name); err == nil {
+		return pod, nil
 	}
-	v1Secret := v1.Secret{}
-	err = apiv1.Convert_core_Secret_To_v1_Secret(internalSecret, &v1Secret, nil)
-	return &v1Secret, err
-
+	return c.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
-// NewGetterFromStorageInterface returns a ServiceAccountTokenGetter that
-// uses the specified storage to retrieve service accounts and secrets.
-func NewGetterFromStorageInterface(
-	saConfig *storagebackend.Config,
-	saPrefix string,
-	secretConfig *storagebackend.Config,
-	secretPrefix string) serviceaccount.ServiceAccountTokenGetter {
+func (c clientGetter) GetSecret(ctx context.Context, namespace, name string) (*v1.Secret, error) {
+	if secret, err := c.secretLister.Secrets(namespace).Get(name); err == nil {
+		return secret, nil
+	}
+	return c.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+}
 
-	saOpts := generic.RESTOptions{StorageConfig: saConfig, Decorator: generic.UndecoratedStorage, ResourcePrefix: saPrefix}
-	secretOpts := generic.RESTOptions{StorageConfig: secretConfig, Decorator: generic.UndecoratedStorage, ResourcePrefix: secretPrefix}
-	return NewGetterFromRegistries(
-		serviceaccountregistry.NewRegistry(serviceaccountstore.NewREST(saOpts)),
-		secret.NewRegistry(secretstore.NewREST(secretOpts)),
-	)
+func (c clientGetter) GetNode(ctx context.Context, name string) (*v1.Node, error) {
+	// handle the case where the node lister isn't set due to feature being disabled
+	if c.nodeLister == nil {
+		return nil, apierrors.NewNotFound(v1.Resource("nodes"), name)
+	}
+	if node, err := c.nodeLister.Get(name); err == nil {
+		return node, nil
+	}
+	return c.client.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+}
+
+func (c clientGetter) GetValidatingWebhookConfiguration(ctx context.Context, name string) (*admissionregistrationv1.ValidatingWebhookConfiguration, error) {
+	if validatingWebhookCfg, err := c.validatingWebhookConfigurationLister.Get(name); err == nil {
+		return validatingWebhookCfg, nil
+	}
+	return c.client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+}
+
+func (c clientGetter) GetMutatingWebhookConfiguration(ctx context.Context, name string) (*admissionregistrationv1.MutatingWebhookConfiguration, error) {
+	if mutatingWebhookCfg, err := c.mutatingWebhookConfigurationLister.Get(name); err == nil {
+		return mutatingWebhookCfg, nil
+	}
+	return c.client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
 }

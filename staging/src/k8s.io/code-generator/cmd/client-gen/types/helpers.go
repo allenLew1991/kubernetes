@@ -22,7 +22,7 @@ import (
 	"sort"
 	"strings"
 
-	"k8s.io/gengo/namer"
+	"k8s.io/gengo/v2/namer"
 )
 
 // ToGroupVersion turns "group/version" string into a GroupVersion struct. It reports error
@@ -73,7 +73,7 @@ func (a sortableSliceOfVersions) Less(i, j int) bool {
 }
 
 // Determine the default version among versions. If a user calls a group client
-// without specifying the version (e.g., c.Core(), instead of c.CoreV1()), the
+// without specifying the version (e.g., c.CoreV1(), instead of c.CoreV1()), the
 // default version will be returned.
 func defaultVersion(versions []PackageVersion) Version {
 	var versionStrings []string
@@ -88,14 +88,12 @@ func defaultVersion(versions []PackageVersion) Version {
 func ToGroupVersionInfo(groups []GroupVersions, groupGoNames map[GroupVersion]string) []GroupVersionInfo {
 	var groupVersionPackages []GroupVersionInfo
 	for _, group := range groups {
-		defaultVersion := defaultVersion(group.Versions)
 		for _, version := range group.Versions {
 			groupGoName := groupGoNames[GroupVersion{Group: group.Group, Version: version.Version}]
 			groupVersionPackages = append(groupVersionPackages, GroupVersionInfo{
 				Group:                Group(namer.IC(group.Group.NonEmpty())),
 				Version:              Version(namer.IC(version.Version.String())),
 				PackageAlias:         strings.ToLower(groupGoName + version.Version.NonEmpty()),
-				IsDefaultVersion:     version.Version == defaultVersion && version.Version != "",
 				GroupGoName:          groupGoName,
 				LowerCaseGroupGoName: namer.IL(groupGoName),
 			})
@@ -118,6 +116,6 @@ func ToGroupInstallPackages(groups []GroupVersions, groupGoNames map[GroupVersio
 }
 
 // NormalizeGroupVersion calls normalizes the GroupVersion.
-//func NormalizeGroupVersion(gv GroupVersion) GroupVersion {
-//	return GroupVersion{Group: gv.Group.NonEmpty(), Version: gv.Version, NonEmptyVersion: normalization.Version(gv.Version)}
-//}
+// func NormalizeGroupVersion(gv GroupVersion) GroupVersion {
+// 	 return GroupVersion{Group: gv.Group.NonEmpty(), Version: gv.Version, NonEmptyVersion: normalization.Version(gv.Version)}
+// }

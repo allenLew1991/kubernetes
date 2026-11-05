@@ -17,146 +17,31 @@ limitations under the License.
 package util
 
 import (
-	"sort"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"time"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/kubernetes/pkg/apis/scheduling"
-	"k8s.io/kubernetes/pkg/features"
+	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/klog/v2"
+	extenderv1 "k8s.io/kube-scheduler/extender/v1"
+	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 )
 
-const DefaultBindAllHostIP = "0.0.0.0"
-
-// ProtocolPort represents a protocol port pair, e.g. tcp:80.
-type ProtocolPort struct {
-	Protocol string
-	Port     int32
-}
-
-// NewProtocolPort creates a ProtocolPort instance.
-func NewProtocolPort(protocol string, port int32) *ProtocolPort {
-	pp := &ProtocolPort{
-		Protocol: protocol,
-		Port:     port,
-	}
-
-	if len(pp.Protocol) == 0 {
-		pp.Protocol = string(v1.ProtocolTCP)
-	}
-
-	return pp
-}
-
-// HostPortInfo stores mapping from ip to a set of ProtocolPort
-type HostPortInfo map[string]map[ProtocolPort]struct{}
-
-// Add adds (ip, protocol, port) to HostPortInfo
-func (h HostPortInfo) Add(ip, protocol string, port int32) {
-	if port <= 0 {
-		return
-	}
-
-	h.sanitize(&ip, &protocol)
-
-	pp := NewProtocolPort(protocol, port)
-	if _, ok := h[ip]; !ok {
-		h[ip] = map[ProtocolPort]struct{}{
-			*pp: {},
-		}
-		return
-	}
-
-	h[ip][*pp] = struct{}{}
-}
-
-// Remove removes (ip, protocol, port) from HostPortInfo
-func (h HostPortInfo) Remove(ip, protocol string, port int32) {
-	if port <= 0 {
-		return
-	}
-
-	h.sanitize(&ip, &protocol)
-
-	pp := NewProtocolPort(protocol, port)
-	if m, ok := h[ip]; ok {
-		delete(m, *pp)
-		if len(h[ip]) == 0 {
-			delete(h, ip)
-		}
-	}
-}
-
-// Len returns the total number of (ip, protocol, port) tuple in HostPortInfo
-func (h HostPortInfo) Len() int {
-	length := 0
-	for _, m := range h {
-		length += len(m)
-	}
-	return length
-}
-
-// CheckConflict checks if the input (ip, protocol, port) conflicts with the existing
-// ones in HostPortInfo.
-func (h HostPortInfo) CheckConflict(ip, protocol string, port int32) bool {
-	if port <= 0 {
-		return false
-	}
-
-	h.sanitize(&ip, &protocol)
-
-	pp := NewProtocolPort(protocol, port)
-
-	// If ip is 0.0.0.0 check all IP's (protocol, port) pair
-	if ip == DefaultBindAllHostIP {
-		for _, m := range h {
-			if _, ok := m[*pp]; ok {
-				return true
-			}
-		}
-		return false
-	}
-
-	// If ip isn't 0.0.0.0, only check IP and 0.0.0.0's (protocol, port) pair
-	for _, key := range []string{DefaultBindAllHostIP, ip} {
-		if m, ok := h[key]; ok {
-			if _, ok2 := m[*pp]; ok2 {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// sanitize the parameters
-func (h HostPortInfo) sanitize(ip, protocol *string) {
-	if len(*ip) == 0 {
-		*ip = DefaultBindAllHostIP
-	}
-	if len(*protocol) == 0 {
-		*protocol = string(v1.ProtocolTCP)
-	}
-}
-
-// GetContainerPorts returns the used host ports of Pods: if 'port' was used, a 'port:true' pair
-// will be in the result; but it does not resolve port conflict.
-func GetContainerPorts(pods ...*v1.Pod) []*v1.ContainerPort {
-	var ports []*v1.ContainerPort
-	for _, pod := range pods {
-		for j := range pod.Spec.Containers {
-			container := &pod.Spec.Containers[j]
-			for k := range container.Ports {
-				ports = append(ports, &container.Ports[k])
-			}
-		}
-	}
-	return ports
-}
-
-// PodPriorityEnabled indicates whether pod priority feature is enabled.
-func PodPriorityEnabled() bool {
-	return feature.DefaultFeatureGate.Enabled(features.PodPriority)
-}
+var maxPodStartTime = metav1.NewTime(time.Unix(0, math.MaxInt64).UTC())
 
 // GetPodFullName returns a name that uniquely identifies a pod.
 func GetPodFullName(pod *v1.Pod) string {
@@ -165,48 +50,277 @@ func GetPodFullName(pod *v1.Pod) string {
 	return pod.Name + "_" + pod.Namespace
 }
 
-// GetPodPriority return priority of the given pod.
-func GetPodPriority(pod *v1.Pod) int32 {
-	if pod.Spec.Priority != nil {
-		return *pod.Spec.Priority
+// GetPodStartTime returns start time of the given pod or a stable maximum timestamp
+// if it hasn't started yet.
+func GetPodStartTime(pod *v1.Pod) *metav1.Time {
+	if pod.Status.StartTime != nil {
+		return pod.Status.StartTime
 	}
-	// When priority of a running pod is nil, it means it was created at a time
-	// that there was no global default priority class and the priority class
-	// name of the pod was empty. So, we resolve to the static default priority.
-	return scheduling.DefaultPriorityWhenNoDefaultClassExists
+	// Assumed pods and bound pods that haven't started don't have a StartTime yet.
+	// Treat them as newer than started pods without generating a timestamp during
+	// sorting, which would break sort's strict weak ordering.
+	return &maxPodStartTime
 }
 
-// SortableList is a list that implements sort.Interface.
-type SortableList struct {
-	Items    []interface{}
-	CompFunc LessFunc
+// GetEarliestPodStartTime returns the earliest start time of all pods that
+// have the highest priority among all victims.
+func GetEarliestPodStartTime(victims *extenderv1.Victims) *metav1.Time {
+	if len(victims.Pods) == 0 {
+		// should not reach here.
+		klog.Background().Error(nil, "victims.Pods is empty. Should not reach here")
+		return nil
+	}
+
+	earliestPodStartTime := GetPodStartTime(victims.Pods[0])
+	maxPriority := corev1helpers.PodPriority(victims.Pods[0])
+
+	for _, pod := range victims.Pods {
+		if podPriority := corev1helpers.PodPriority(pod); podPriority == maxPriority {
+			if podStartTime := GetPodStartTime(pod); podStartTime.Before(earliestPodStartTime) {
+				earliestPodStartTime = podStartTime
+			}
+		} else if podPriority > maxPriority {
+			maxPriority = podPriority
+			earliestPodStartTime = GetPodStartTime(pod)
+		}
+	}
+
+	return earliestPodStartTime
 }
 
-// LessFunc is a function that receives two items and returns true if the first
-// item should be placed before the second one when the list is sorted.
-type LessFunc func(item1, item2 interface{}) bool
-
-var _ = sort.Interface(&SortableList{})
-
-func (l *SortableList) Len() int { return len(l.Items) }
-
-func (l *SortableList) Less(i, j int) bool {
-	return l.CompFunc(l.Items[i], l.Items[j])
+// MoreImportantPod return true when priority of the first pod is higher than
+// the second one. If two pods' priorities are equal, compare their StartTime,
+// treating the older pod as more important.
+func MoreImportantPod(pod1, pod2 *v1.Pod) bool {
+	p1 := corev1helpers.PodPriority(pod1)
+	p2 := corev1helpers.PodPriority(pod2)
+	if p1 != p2 {
+		return p1 > p2
+	}
+	return GetPodStartTime(pod1).Before(GetPodStartTime(pod2))
 }
 
-func (l *SortableList) Swap(i, j int) {
-	l.Items[i], l.Items[j] = l.Items[j], l.Items[i]
+// Retriable defines the retriable errors during a scheduling cycle.
+func Retriable(err error) bool {
+	return apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err) ||
+		net.IsConnectionRefused(err)
 }
 
-// Sort sorts the items in the list using the given CompFunc. Item1 is placed
-// before Item2 when CompFunc(Item1, Item2) returns true.
-func (l *SortableList) Sort() {
-	sort.Sort(l)
+// RetriableWithConflict defines the retriable errors during a scheduling cycle, including conflicts.
+func RetriableWithConflict(err error) bool {
+	return Retriable(err) || apierrors.IsConflict(err)
 }
 
-// HigherPriorityPod return true when priority of the first pod is higher than
-// the second one. It takes arguments of the type "interface{}" to be used with
-// SortableList, but expects those arguments to be *v1.Pod.
-func HigherPriorityPod(pod1, pod2 interface{}) bool {
-	return GetPodPriority(pod1.(*v1.Pod)) > GetPodPriority(pod2.(*v1.Pod))
+// BindPod binds a pod to a node with retry.
+func BindPod(ctx context.Context, cs kubernetes.Interface, binding *v1.Binding) error {
+	bindFn := func() error {
+		return cs.CoreV1().Pods(binding.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
+	}
+
+	return retry.OnError(retry.DefaultBackoff, Retriable, bindFn)
+}
+
+// PatchPodStatus calculates the delta bytes change from <old.Status> to <newStatus>,
+// and then submit a request to API server to patch the pod changes.
+func PatchPodStatus(ctx context.Context, cs kubernetes.Interface, name string, namespace string, oldStatus *v1.PodStatus, newStatus *v1.PodStatus) error {
+	if newStatus == nil {
+		return nil
+	}
+
+	if oldStatus == nil {
+		oldStatus = &v1.PodStatus{}
+	}
+
+	oldData, err := json.Marshal(v1.Pod{Status: *oldStatus})
+	if err != nil {
+		return err
+	}
+
+	newData, err := json.Marshal(v1.Pod{Status: *newStatus})
+	if err != nil {
+		return err
+	}
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, &v1.Pod{})
+	if err != nil {
+		return fmt.Errorf("failed to create merge patch for pod %q/%q: %w", namespace, name, err)
+	}
+
+	if "{}" == string(patchBytes) {
+		return nil
+	}
+
+	patchFn := func() error {
+		_, err := cs.CoreV1().Pods(namespace).Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
+		return err
+	}
+
+	return retry.OnError(retry.DefaultBackoff, RetriableWithConflict, patchFn)
+}
+
+// PatchPodGroupStatus calculates the delta bytes change from <old.Status> to <newStatus>,
+// and then submits a request to API server to patch the PodGroup status changes.
+func PatchPodGroupStatus(ctx context.Context, cs kubernetes.Interface, name string,
+	namespace string, oldStatus *schedulingv1beta1.PodGroupStatus,
+	newStatus *schedulingv1beta1.PodGroupStatus) error {
+	if newStatus == nil {
+		return nil
+	}
+
+	if oldStatus == nil {
+		oldStatus = &schedulingv1beta1.PodGroupStatus{}
+	}
+
+	oldData, err := json.Marshal(schedulingv1beta1.PodGroup{Status: *oldStatus})
+	if err != nil {
+		return err
+	}
+
+	newData, err := json.Marshal(schedulingv1beta1.PodGroup{Status: *newStatus})
+	if err != nil {
+		return err
+	}
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, &schedulingv1beta1.PodGroup{})
+	if err != nil {
+		return fmt.Errorf("failed to create merge patch for podgroup %q/%q: %w", namespace, name, err)
+	}
+
+	if string(patchBytes) == "{}" {
+		return nil
+	}
+
+	patchFn := func() error {
+		_, err := cs.SchedulingV1beta1().PodGroups(namespace).Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
+		return err
+	}
+
+	return retry.OnError(retry.DefaultBackoff, RetriableWithConflict, patchFn)
+}
+
+// PatchCompositePodGroupStatus calculates the delta bytes change from <old.Status> to <newStatus>,
+// and then submits a request to API server to patch the CompositePodGroup status changes.
+func PatchCompositePodGroupStatus(ctx context.Context, cs kubernetes.Interface, name string,
+	namespace string, oldStatus *schedulingv1beta1.CompositePodGroupStatus,
+	newStatus *schedulingv1beta1.CompositePodGroupStatus) error {
+	if newStatus == nil {
+		return nil
+	}
+
+	if oldStatus == nil {
+		oldStatus = &schedulingv1beta1.CompositePodGroupStatus{}
+	}
+
+	oldData, err := json.Marshal(schedulingv1beta1.CompositePodGroup{Status: *oldStatus})
+	if err != nil {
+		return err
+	}
+
+	newData, err := json.Marshal(schedulingv1beta1.CompositePodGroup{Status: *newStatus})
+	if err != nil {
+		return err
+	}
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, &schedulingv1beta1.CompositePodGroup{})
+	if err != nil {
+		return fmt.Errorf("failed to create merge patch for composite podgroup %q/%q: %w", namespace, name, err)
+	}
+
+	if string(patchBytes) == "{}" {
+		return nil
+	}
+
+	patchFn := func() error {
+		_, err := cs.SchedulingV1beta1().CompositePodGroups(namespace).Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
+		return err
+	}
+
+	return retry.OnError(retry.DefaultBackoff, RetriableWithConflict, patchFn)
+}
+
+// DeletePod deletes the given <pod> from API server
+func DeletePod(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error {
+	return cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+}
+
+// IsScalarResourceName validates the resource for Extended, Hugepages, Native and AttachableVolume resources
+func IsScalarResourceName(name v1.ResourceName) bool {
+	return v1helper.IsExtendedResourceName(name) || v1helper.IsHugePageResourceName(name) ||
+		v1helper.IsPrefixedNativeResource(name) || v1helper.IsAttachableVolumeResourceName(name)
+}
+
+// IsDRAExtendedResourceName returns true when name is an extended resource name, or an implicit extended resource name
+// derived from device class name with the format of deviceclass.resource.kubernetes.io/<device class name>
+func IsDRAExtendedResourceName(name v1.ResourceName) bool {
+	return v1helper.IsExtendedResourceName(name) || strings.HasPrefix(string(name), resourceapi.ResourceDeviceClassPrefix)
+}
+
+// As converts two objects to the given type.
+// Both objects must be of the same type. If not, an error is returned.
+// nil objects are allowed and will be converted to nil.
+// For oldObj, cache.DeletedFinalStateUnknown is handled and the
+// object stored in it will be converted instead.
+func As[T any](oldObj, newobj interface{}) (T, T, error) {
+	var oldTyped T
+	var newTyped T
+	var ok bool
+	if newobj != nil {
+		newTyped, ok = newobj.(T)
+		if !ok {
+			return oldTyped, newTyped, fmt.Errorf("expected %T, but got %T", newTyped, newobj)
+		}
+	}
+
+	if oldObj != nil {
+		if realOldObj, ok := oldObj.(cache.DeletedFinalStateUnknown); ok {
+			oldObj = realOldObj.Obj
+		}
+		oldTyped, ok = oldObj.(T)
+		if !ok {
+			return oldTyped, newTyped, fmt.Errorf("expected %T, but got %T", oldTyped, oldObj)
+		}
+	}
+	return oldTyped, newTyped, nil
+}
+
+// GetHostPorts returns the used host ports of pod containers and
+// initContainers with restartPolicy: Always.
+func GetHostPorts(pod *v1.Pod) []v1.ContainerPort {
+	var ports []v1.ContainerPort
+	if pod == nil {
+		return ports
+	}
+
+	hostPort := func(p v1.ContainerPort) bool {
+		return p.HostPort > 0
+	}
+
+	for _, c := range pod.Spec.InitContainers {
+		// Only consider initContainers that will be running the entire
+		// duration of the Pod.
+		if c.RestartPolicy == nil || *c.RestartPolicy != v1.ContainerRestartPolicyAlways {
+			continue
+		}
+		for _, p := range c.Ports {
+			if !hostPort(p) {
+				continue
+			}
+			ports = append(ports, p)
+		}
+	}
+	for _, c := range pod.Spec.Containers {
+		for _, p := range c.Ports {
+			if !hostPort(p) {
+				continue
+			}
+			ports = append(ports, p)
+		}
+	}
+	return ports
+}
+
+// PodPreemptionPolicy returns the PreemptionPolicy set in the pod, or the default policy
+// (PreemptLowerPriority) if not set.
+func PodPreemptionPolicy(pod *v1.Pod) v1.PreemptionPolicy {
+	if pod != nil && pod.Spec.PreemptionPolicy != nil {
+		return *pod.Spec.PreemptionPolicy
+	}
+	return v1.PreemptLowerPriority
 }

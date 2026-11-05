@@ -14,98 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package storage
+package storage_test
 
 import (
 	"math/rand"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apiserver/pkg/apis/example"
+	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
+	example2v1 "k8s.io/apiserver/pkg/apis/example2/v1"
+	"k8s.io/apiserver/pkg/storage"
 )
 
-func TestEtcdParseWatchResourceVersion(t *testing.T) {
-	testCases := []struct {
-		Version       string
-		ExpectVersion uint64
-		Err           bool
-	}{
-		{Version: "", ExpectVersion: 0},
-		{Version: "a", Err: true},
-		{Version: " ", Err: true},
-		{Version: "1", ExpectVersion: 1},
-		{Version: "10", ExpectVersion: 10},
-	}
-	for _, testCase := range testCases {
-		version, err := ParseWatchResourceVersion(testCase.Version)
-		switch {
-		case testCase.Err:
-			if err == nil {
-				t.Errorf("%s: unexpected non-error", testCase.Version)
-				continue
-			}
-			if !IsInvalidError(err) {
-				t.Errorf("%s: unexpected error: %v", testCase.Version, err)
-				continue
-			}
-		case !testCase.Err && err != nil:
-			t.Errorf("%s: unexpected error: %v", testCase.Version, err)
-			continue
-		}
-		if version != testCase.ExpectVersion {
-			t.Errorf("%s: expected version %d but was %d", testCase.Version, testCase.ExpectVersion, version)
-		}
-	}
-}
+var (
+	scheme = runtime.NewScheme()
+)
 
-func TestHasPathPrefix(t *testing.T) {
-	validTestcases := []struct {
-		s      string
-		prefix string
-	}{
-		// Exact matches
-		{"", ""},
-		{"a", "a"},
-		{"a/", "a/"},
-		{"a/../", "a/../"},
-
-		// Path prefix matches
-		{"a/b", "a"},
-		{"a/b", "a/"},
-		{"中文/", "中文"},
-	}
-	for i, tc := range validTestcases {
-		if !hasPathPrefix(tc.s, tc.prefix) {
-			t.Errorf(`%d: Expected hasPathPrefix("%s","%s") to be true`, i, tc.s, tc.prefix)
-		}
-	}
-
-	invalidTestcases := []struct {
-		s      string
-		prefix string
-	}{
-		// Mismatch
-		{"a", "b"},
-
-		// Dir requirement
-		{"a", "a/"},
-
-		// Prefix mismatch
-		{"ns2", "ns"},
-		{"ns2", "ns/"},
-		{"中文文", "中文"},
-
-		// Ensure no normalization is applied
-		{"a/c/../b/", "a/b/"},
-		{"a/", "a/b/.."},
-	}
-	for i, tc := range invalidTestcases {
-		if hasPathPrefix(tc.s, tc.prefix) {
-			t.Errorf(`%d: Expected hasPathPrefix("%s","%s") to be false`, i, tc.s, tc.prefix)
-		}
-	}
+func init() {
+	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
+	utilruntime.Must(example.AddToScheme(scheme))
+	utilruntime.Must(examplev1.AddToScheme(scheme))
+	utilruntime.Must(example2v1.AddToScheme(scheme))
 }
 
 func TestHighWaterMark(t *testing.T) {
-	var h HighWaterMark
+	var h storage.HighWaterMark
 
 	for i := int64(10); i < 20; i++ {
 		if !h.Update(i) {
@@ -132,5 +70,44 @@ func TestHighWaterMark(t *testing.T) {
 	wg.Wait()
 	if m != int64(h) {
 		t.Errorf("unexpected value, wanted %v, got %v", m, int64(h))
+	}
+}
+
+func TestHasInitialEventsEndBookmarkAnnotation(t *testing.T) {
+	createPod := func(name string) *example.Pod {
+		return &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	}
+	createAnnotatedPod := func(name, value string) *example.Pod {
+		p := createPod(name)
+		p.Annotations = map[string]string{}
+		p.Annotations[metav1.InitialEventsAnnotationKey] = value
+		return p
+	}
+	scenarios := []struct {
+		name             string
+		object           runtime.Object
+		expectAnnotation bool
+	}{
+		{
+			name:             "a standard obj with the initial-events-end annotation set to true",
+			object:           createAnnotatedPod("p1", "true"),
+			expectAnnotation: true,
+		},
+		{
+			name:   "a standard obj with the initial-events-end annotation set to false",
+			object: createAnnotatedPod("p1", "false"),
+		},
+		{
+			name:   "a standard obj without the annotation",
+			object: createPod("p1"),
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			hasAnnotation, err := storage.HasInitialEventsEndBookmarkAnnotation(scenario.object)
+			require.NoError(t, err)
+			require.Equal(t, scenario.expectAnnotation, hasAnnotation)
+		})
 	}
 }

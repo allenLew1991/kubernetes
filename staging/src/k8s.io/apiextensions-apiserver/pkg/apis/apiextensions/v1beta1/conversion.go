@@ -17,27 +17,16 @@ limitations under the License.
 package v1beta1
 
 import (
+	"bytes"
+
 	"k8s.io/apimachinery/pkg/conversion"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/json"
 
+	v1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 )
 
-func addConversionFuncs(scheme *runtime.Scheme) error {
-	// Add non-generated conversion functions
-	err := scheme.AddConversionFuncs(
-		Convert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps,
-		Convert_apiextensions_JSON_To_v1beta1_JSON,
-		Convert_v1beta1_JSON_To_apiextensions_JSON,
-	)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func Convert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps(in *apiextensions.JSONSchemaProps, out *JSONSchemaProps, s conversion.Scope) error {
+func Convert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps(in *apiextensions.JSONSchemaProps, out *v1beta1.JSONSchemaProps, s conversion.Scope) error {
 	if err := autoConvert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps(in, out, s); err != nil {
 		return err
 	}
@@ -50,24 +39,33 @@ func Convert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps(in *apiext
 	return nil
 }
 
-func Convert_apiextensions_JSON_To_v1beta1_JSON(in *apiextensions.JSON, out *JSON, s conversion.Scope) error {
+var nullLiteral = []byte(`null`)
+
+func Convert_apiextensions_JSON_To_v1beta1_JSON(in *apiextensions.JSON, out *v1beta1.JSON, s conversion.Scope) error {
 	raw, err := json.Marshal(*in)
 	if err != nil {
 		return err
 	}
-	out.Raw = raw
+	if len(raw) == 0 || bytes.Equal(raw, nullLiteral) {
+		// match JSON#UnmarshalJSON treatment of literal nulls
+		out.Raw = nil
+	} else {
+		out.Raw = raw
+	}
 	return nil
 }
 
-func Convert_v1beta1_JSON_To_apiextensions_JSON(in *JSON, out *apiextensions.JSON, s conversion.Scope) error {
+func Convert_v1beta1_JSON_To_apiextensions_JSON(in *v1beta1.JSON, out *apiextensions.JSON, s conversion.Scope) error {
 	if in != nil {
 		var i interface{}
-		if err := json.Unmarshal(in.Raw, &i); err != nil {
-			return err
+		if len(in.Raw) > 0 && !bytes.Equal(in.Raw, nullLiteral) {
+			if err := json.Unmarshal(in.Raw, &i); err != nil {
+				return err
+			}
 		}
 		*out = i
 	} else {
-		out = nil
+		*out = nil
 	}
 	return nil
 }

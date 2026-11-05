@@ -1,7 +1,7 @@
-// +build cgo,linux
+//go:build linux
 
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,47 +19,107 @@ limitations under the License.
 package cadvisor
 
 import (
-	"reflect"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
-	info "github.com/google/cadvisor/info/v1"
-	"github.com/google/cadvisor/metrics"
-	"k8s.io/kubernetes/pkg/kubelet/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/google/cadvisor/lib/container/crio"
+	cadvisorfs "github.com/google/cadvisor/lib/fs"
+	"github.com/opencontainers/cgroups"
+	"k8s.io/klog/v2"
 )
 
-func TestContainerLabels(t *testing.T) {
-	container := &info.ContainerInfo{
-		ContainerReference: info.ContainerReference{
-			Name:    "/docker/f81ad5335d390944e454ea19ab0924037d57337c19731524ad96eb26e74b6c6d",
-			Aliases: []string{"k8s_POD.639b2af2_foo-web-315473031-e40e2_foobar_a369ace2-5fa9-11e6-b10f-c81f66e5e84d_851a97fd"},
-		},
-		Spec: info.ContainerSpec{
-			Image: "qux/foo:latest",
-			Labels: map[string]string{
-				"io.kubernetes.container.hash":                   "639b2af2",
-				types.KubernetesContainerNameLabel:               "POD",
-				"io.kubernetes.container.restartCount":           "0",
-				"io.kubernetes.container.terminationMessagePath": "",
-				types.KubernetesPodNameLabel:                     "foo-web-315473031-e40e2",
-				types.KubernetesPodNamespaceLabel:                "foobar",
-				"io.kubernetes.pod.terminationGracePeriod":       "30",
-				types.KubernetesPodUIDLabel:                      "a369ace2-5fa9-11e6-b10f-c81f66e5e84d",
-			},
-			Envs: map[string]string{
-				"foo+env": "prod",
-			},
-		},
-	}
-	want := map[string]string{
-		metrics.LabelID:    "/docker/f81ad5335d390944e454ea19ab0924037d57337c19731524ad96eb26e74b6c6d",
-		metrics.LabelName:  "k8s_POD.639b2af2_foo-web-315473031-e40e2_foobar_a369ace2-5fa9-11e6-b10f-c81f66e5e84d_851a97fd",
-		metrics.LabelImage: "qux/foo:latest",
-		"namespace":        "foobar",
-		"container_name":   "POD",
-		"pod_name":         "foo-web-315473031-e40e2",
-	}
+func TestIsPsiEnabled(t *testing.T) {
+	testcases := []struct {
+		description   string
+		createPSIFile bool
+		expected      bool
+	}{{
+		description:   "PSI enabled when cgroup pressure file exists",
+		createPSIFile: true,
+		expected:      true,
+	}, {
+		description:   "PSI disabled when cgroup pressure file does not exist",
+		createPSIFile: false,
+		expected:      false,
+	}}
 
-	if have := containerLabels(container); !reflect.DeepEqual(want, have) {
-		t.Errorf("want %v, have %v", want, have)
+	cgroups.TestMode = true
+	defer func() { cgroups.TestMode = false }()
+
+	for _, tc := range testcases {
+		t.Run(tc.description, func(t *testing.T) {
+			tmpDir := t.TempDir()
+
+			if tc.createPSIFile {
+				err := os.WriteFile(filepath.Join(tmpDir, "cpu.pressure"), []byte("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"), 0644)
+				require.NoError(t, err)
+			}
+
+			result := isPsiEnabled(klog.Background(), tmpDir, "cpu.pressure")
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestImageFsInfoLabel(t *testing.T) {
+	testcases := []struct {
+		description     string
+		runtime         string
+		runtimeEndpoint string
+		expectedLabel   string
+		expectedError   error
+	}{{
+		description:     "LabelCrioImages should be returned",
+		runtimeEndpoint: crio.CrioSocket,
+		expectedLabel:   cadvisorfs.LabelCrioImages,
+		expectedError:   nil,
+	}, {
+		description:     "Cannot find valid imagefs label",
+		runtimeEndpoint: "",
+		expectedLabel:   "",
+		expectedError:   fmt.Errorf("no imagefs label for configured runtime"),
+	}}
+
+	for _, tc := range testcases {
+		t.Run(tc.description, func(t *testing.T) {
+			infoProvider := NewImageFsInfoProvider(tc.runtimeEndpoint)
+			label, err := infoProvider.ImageFsInfoLabel()
+			assert.Equal(t, tc.expectedLabel, label)
+			assert.Equal(t, tc.expectedError, err)
+		})
+	}
+}
+
+func TestContainerFsInfoLabel(t *testing.T) {
+	testcases := []struct {
+		description     string
+		runtime         string
+		runtimeEndpoint string
+		expectedLabel   string
+		expectedError   error
+	}{{
+		description:     "LabelCrioWriteableImages should be returned",
+		runtimeEndpoint: crio.CrioSocket,
+		expectedLabel:   cadvisorfs.LabelCrioContainers,
+		expectedError:   nil,
+	}, {
+		description:     "Cannot find valid imagefs label",
+		runtimeEndpoint: "",
+		expectedLabel:   "",
+		expectedError:   fmt.Errorf("no containerfs label for configured runtime"),
+	}}
+
+	for _, tc := range testcases {
+		t.Run(tc.description, func(t *testing.T) {
+			infoProvider := NewImageFsInfoProvider(tc.runtimeEndpoint)
+			label, err := infoProvider.ContainerFsInfoLabel()
+			assert.Equal(t, tc.expectedLabel, label)
+			assert.Equal(t, tc.expectedError, err)
+		})
 	}
 }

@@ -16,44 +16,77 @@ limitations under the License.
 
 package auth
 
-// This file tests authentication and (soon) authorization of HTTP requests to a master object.
+// This file tests authentication and (soon) authorization of HTTP requests to an API server object.
 // It does not use the client in pkg/client/... because authentication and authorization needs
 // to work for any client of the HTTP interface.
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
+	authenticationv1 "k8s.io/api/authentication/v1"
 	authenticationv1beta1 "k8s.io/api/authentication/v1beta1"
+	certificatesv1 "k8s.io/api/certificates/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/wait"
+	auditinternal "k8s.io/apiserver/pkg/apis/audit"
+	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/group"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/apiserver/pkg/authentication/token/cache"
+	"k8s.io/apiserver/pkg/authentication/token/tokenfile"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
-	"k8s.io/apiserver/plugin/pkg/authenticator/token/tokentest"
+	unionauthz "k8s.io/apiserver/pkg/authorization/union"
+	genericrequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/server"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	webhookutil "k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/webhook"
-	"k8s.io/client-go/tools/clientcmd/api/v1"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	v1 "k8s.io/client-go/tools/clientcmd/api/v1"
+	resttransport "k8s.io/client-go/transport"
+	utiltesting "k8s.io/client-go/util/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/extensions"
-	"k8s.io/kubernetes/pkg/auth/authorizer/abac"
-	"k8s.io/kubernetes/plugin/pkg/admission/admit"
+	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/test/integration"
+	"k8s.io/kubernetes/test/integration/authutil"
 	"k8s.io/kubernetes/test/integration/framework"
+	testutils "k8s.io/kubernetes/test/utils"
 )
 
 const (
@@ -62,19 +95,12 @@ const (
 	UnknownToken string = "qwerty" // Not present in token file.
 )
 
-func getTestTokenAuth() authenticator.Request {
-	tokenAuthenticator := tokentest.New()
-	tokenAuthenticator.Tokens[AliceToken] = &user.DefaultInfo{Name: "alice", UID: "1"}
-	tokenAuthenticator.Tokens[BobToken] = &user.DefaultInfo{Name: "bob", UID: "2"}
-	return group.NewGroupAdder(bearertoken.New(tokenAuthenticator), []string{user.AllAuthenticated})
-}
-
-func getTestWebhookTokenAuth(serverURL string) (authenticator.Request, error) {
-	kubecfgFile, err := ioutil.TempFile("", "webhook-kubecfg")
+func getTestWebhookTokenAuth(serverURL string, customDial utilnet.DialFunc) (authenticator.Request, error) {
+	kubecfgFile, err := os.CreateTemp("", "webhook-kubecfg")
 	if err != nil {
 		return nil, err
 	}
-	defer os.Remove(kubecfgFile.Name())
+	defer utiltesting.CloseAndRemove(&testing.T{}, kubecfgFile)
 	config := v1.Config{
 		Clusters: []v1.NamedCluster{
 			{
@@ -85,33 +111,74 @@ func getTestWebhookTokenAuth(serverURL string) (authenticator.Request, error) {
 	if err := json.NewEncoder(kubecfgFile).Encode(config); err != nil {
 		return nil, err
 	}
-	webhookTokenAuth, err := webhook.New(kubecfgFile.Name(), 2*time.Minute)
+
+	retryBackoff := wait.Backoff{
+		Duration: 500 * time.Millisecond,
+		Factor:   1.5,
+		Jitter:   0.2,
+		Steps:    5,
+	}
+
+	clientConfig, err := webhookutil.LoadKubeconfig(kubecfgFile.Name(), customDial)
 	if err != nil {
 		return nil, err
 	}
-	return bearertoken.New(webhookTokenAuth), nil
+
+	webhookTokenAuth, err := webhook.New(clientConfig, "v1beta1", nil, retryBackoff)
+	if err != nil {
+		return nil, err
+	}
+	return bearertoken.New(cache.New(webhookTokenAuth, false, 2*time.Minute, 2*time.Minute)), nil
+}
+
+func getTestWebhookTokenAuthCustomDialer(serverURL string) (authenticator.Request, error) {
+	customDial := http.DefaultTransport.(*http.Transport).DialContext
+
+	return getTestWebhookTokenAuth(serverURL, customDial)
 }
 
 func path(resource, namespace, name string) string {
-	return testapi.Default.ResourcePath(resource, namespace, name)
+	return pathWithPrefix("", resource, namespace, name)
 }
 
 func pathWithPrefix(prefix, resource, namespace, name string) string {
-	return testapi.Default.ResourcePathWithPrefix(prefix, resource, namespace, name)
+	path := "/api/v1"
+	if prefix != "" {
+		path = path + "/" + prefix
+	}
+	if namespace != "" {
+		path = path + "/namespaces/" + namespace
+	}
+	// Resource names are lower case.
+	resource = strings.ToLower(resource)
+	if resource != "" {
+		path = path + "/" + resource
+	}
+	if name != "" {
+		path = path + "/" + name
+	}
+	return path
+}
+
+func pathWithSubResource(resource, namespace, name, subresource string) string {
+	path := pathWithPrefix("", resource, namespace, name)
+	if subresource != "" {
+		path = path + "/" + subresource
+	}
+	return path
 }
 
 func timeoutPath(resource, namespace, name string) string {
-	return addTimeoutFlag(testapi.Default.ResourcePath(resource, namespace, name))
+	return addTimeoutFlag(path(resource, namespace, name))
 }
 
 // Bodies for requests used in subsequent tests.
-var aPod string = `
+var aPod = `
 {
   "kind": "Pod",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
-    "name": "a",
-    "creationTimestamp": null%s
+    "name": "a"%s
   },
   "spec": {
     "containers": [
@@ -123,10 +190,10 @@ var aPod string = `
   }
 }
 `
-var aRC string = `
+var aRC = `
 {
   "kind": "ReplicationController",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a",
     "labels": {
@@ -156,10 +223,10 @@ var aRC string = `
   }
 }
 `
-var aService string = `
+var aService = `
 {
   "kind": "Service",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a",
     "labels": {
@@ -180,10 +247,10 @@ var aService string = `
   }
 }
 `
-var aNode string = `
+var aNode = `
 {
   "kind": "Node",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a"%s
   },
@@ -197,7 +264,7 @@ func aEvent(namespace string) string {
 	return `
 {
   "kind": "Event",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a"%s
   },
@@ -211,10 +278,10 @@ func aEvent(namespace string) string {
 `
 }
 
-var aBinding string = `
+var aBinding = `
 {
   "kind": "Binding",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a"%s
   },
@@ -224,7 +291,7 @@ var aBinding string = `
 }
 `
 
-var emptyEndpoints string = `
+var emptyEndpoints = `
 {
   "kind": "Endpoints",
   "apiVersion": "v1",
@@ -234,10 +301,10 @@ var emptyEndpoints string = `
 }
 `
 
-var aEndpoints string = `
+var aEndpoints = `
 {
   "kind": "Endpoints",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "metadata": {
     "name": "a"%s
   },
@@ -259,10 +326,10 @@ var aEndpoints string = `
 }
 `
 
-var deleteNow string = `
+var deleteNow = `
 {
   "kind": "DeleteOptions",
-  "apiVersion": "` + testapi.Groups[api.GroupName].GroupVersion().String() + `",
+  "apiVersion": "v1",
   "gracePeriodSeconds": 0%s
 }
 `
@@ -276,18 +343,15 @@ func addTimeoutFlag(URLString string) string {
 	return u.String()
 }
 
-func getTestRequests(namespace string) []struct {
+type testRequest struct {
 	verb        string
 	URL         string
 	body        string
 	statusCodes map[int]bool // allowed status codes.
-} {
-	requests := []struct {
-		verb        string
-		URL         string
-		body        string
-		statusCodes map[int]bool // Set of expected resp.StatusCode if all goes well.
-	}{
+}
+
+func getTestRequests(namespace string) []testRequest {
+	requests := []testRequest{
 		// Normal methods on pods
 		{"GET", path("pods", "", ""), "", integration.Code200},
 		{"GET", path("pods", namespace, ""), "", integration.Code200},
@@ -326,7 +390,7 @@ func getTestRequests(namespace string) []struct {
 		// whenever a service is created, but this test does not run that controller)
 		{"POST", timeoutPath("endpoints", namespace, ""), emptyEndpoints, integration.Code201},
 		// Should return service unavailable when endpoint.subset is empty.
-		{"GET", pathWithPrefix("proxy", "services", namespace, "a") + "/", "", integration.Code503},
+		{"GET", pathWithSubResource("services", namespace, "a", "proxy") + "/", "", integration.Code503},
 		{"PUT", timeoutPath("services", namespace, "a"), aService, integration.Code200},
 		{"GET", path("services", namespace, "a"), "", integration.Code200},
 		{"DELETE", timeoutPath("endpoints", namespace, "a"), "", integration.Code200},
@@ -379,7 +443,7 @@ func getTestRequests(namespace string) []struct {
 		{"DELETE", timeoutPath("foo", namespace, ""), "", integration.Code404},
 
 		// Special verbs on nodes
-		{"GET", pathWithPrefix("proxy", "nodes", namespace, "a"), "", integration.Code404},
+		{"GET", pathWithSubResource("nodes", namespace, "a", "proxy"), "", integration.Code404},
 		{"GET", pathWithPrefix("redirect", "nodes", namespace, "a"), "", integration.Code404},
 		// TODO: test .../watch/..., which doesn't end before the test timeout.
 		// TODO: figure out how to create a node so that it can successfully proxy/redirect.
@@ -394,22 +458,30 @@ func getTestRequests(namespace string) []struct {
 	return requests
 }
 
-// The TestAuthMode* tests tests a large number of URLs and checks that they
+// The TestAuthMode* tests a large number of URLs and checks that they
 // are FORBIDDEN or not, depending on the mode.  They do not attempt to do
 // detailed verification of behaviour beyond authorization.  They are not
 // fuzz tests.
 //
 // TODO(etune): write a fuzz test of the REST API.
 func TestAuthModeAlwaysAllow(t *testing.T) {
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authorization.Modes = []string{"AlwaysAllow"}
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-always-allow", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-always-allow", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	previousResourceVersion := make(map[string]float64)
 
 	for _, r := range getTestRequests(ns.Name) {
@@ -427,7 +499,7 @@ func TestAuthModeAlwaysAllow(t *testing.T) {
 		}
 		r.body = bodyStr
 		bodyBytes := bytes.NewReader([]byte(bodyStr))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Logf("case %v", r)
 			t.Fatalf("unexpected error: %v", err)
@@ -437,12 +509,12 @@ func TestAuthModeAlwaysAllow(t *testing.T) {
 		}
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
-			b, _ := ioutil.ReadAll(resp.Body)
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
 			if _, ok := r.statusCodes[resp.StatusCode]; !ok {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status one of %v, but got %v", r.statusCodes, resp.StatusCode)
@@ -489,40 +561,49 @@ func parseResourceVersion(response []byte) (string, float64, error) {
 }
 
 func getPreviousResourceVersionKey(url, id string) string {
-	baseUrl := strings.Split(url, "?")[0]
-	key := baseUrl
+	baseURL := strings.Split(url, "?")[0]
+	key := baseURL
 	if id != "" {
-		key = fmt.Sprintf("%s/%v", baseUrl, id)
+		key = fmt.Sprintf("%s/%v", baseURL, id)
 	}
 	return key
 }
 
 func TestAuthModeAlwaysDeny(t *testing.T) {
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authorizer = authorizerfactory.NewAlwaysDenyAuthorizer()
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authorization.Modes = []string{"AlwaysDeny"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-always-deny", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-always-deny", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport = resttransport.NewBearerAuthRoundTripper(AliceToken, transport)
 
 	for _, r := range getTestRequests(ns.Name) {
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Logf("case %v", r)
 			t.Fatalf("unexpected error: %v", err)
 		}
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusForbidden {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status Forbidden but got status %v", resp.Status)
@@ -531,35 +612,29 @@ func TestAuthModeAlwaysDeny(t *testing.T) {
 	}
 }
 
-// Inject into master an authorizer that uses user info.
-// TODO(etune): remove this test once a more comprehensive built-in authorizer is implemented.
-type allowAliceAuthorizer struct{}
-
-func (allowAliceAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
-	if a.GetUser() != nil && a.GetUser().GetName() == "alice" {
-		return authorizer.DecisionAllow, "", nil
-	}
-	return authorizer.DecisionNoOpinion, "I can't allow that.  Go ask alice.", nil
-}
-
 // TestAliceNotForbiddenOrUnauthorized tests a user who is known to
 // the authentication system and authorized to do any actions.
 func TestAliceNotForbiddenOrUnauthorized(t *testing.T) {
-	// This file has alice and bob in it.
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.Modes = []string{"ABAC"}
+			opts.Authorization.PolicyFile = "testdata/allowalice.jsonl"
+		},
+	})
+	defer tearDownFn()
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = allowAliceAuthorizer{}
-	masterConfig.GenericConfig.AdmissionControl = admit.NewAlwaysAdmit()
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
-
-	ns := framework.CreateTestingNamespace("auth-alice-not-forbidden", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-alice-not-forbidden", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
 	previousResourceVersion := make(map[string]float64)
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, r := range getTestRequests(ns.Name) {
 		token := AliceToken
@@ -577,7 +652,7 @@ func TestAliceNotForbiddenOrUnauthorized(t *testing.T) {
 		}
 		r.body = bodyStr
 		bodyBytes := bytes.NewReader([]byte(bodyStr))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -588,12 +663,12 @@ func TestAliceNotForbiddenOrUnauthorized(t *testing.T) {
 
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
-			b, _ := ioutil.ReadAll(resp.Body)
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
 			if _, ok := r.statusCodes[resp.StatusCode]; !ok {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status one of %v, but got %v", r.statusCodes, resp.StatusCode)
@@ -617,22 +692,30 @@ func TestAliceNotForbiddenOrUnauthorized(t *testing.T) {
 // the authentication system but not authorized to do any actions
 // should receive "Forbidden".
 func TestBobIsForbidden(t *testing.T) {
-	// This file has alice and bob in it.
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = allowAliceAuthorizer{}
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.Modes = []string{"ABAC"}
+			opts.Authorization.PolicyFile = "testdata/allowalice.jsonl"
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-bob-forbidden", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-bob-forbidden", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, r := range getTestRequests(ns.Name) {
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -640,11 +723,11 @@ func TestBobIsForbidden(t *testing.T) {
 
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all of bob's actions to return Forbidden
 			if resp.StatusCode != http.StatusForbidden {
 				t.Logf("case %v", r)
@@ -659,40 +742,46 @@ func TestBobIsForbidden(t *testing.T) {
 // An authorization module is installed in this scenario for integration
 // test purposes, but requests aren't expected to reach it.
 func TestUnknownUserIsUnauthorized(t *testing.T) {
-	// This file has alice and bob in it.
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.Modes = []string{"ABAC"}
+			opts.Authorization.PolicyFile = "testdata/allowalice.jsonl"
+		},
+	})
+	defer tearDownFn()
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = allowAliceAuthorizer{}
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-unknown-unauthorized", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	ns := framework.CreateTestingNamespace("auth-unknown-unauthorized", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
-
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, r := range getTestRequests(ns.Name) {
 		token := UnknownToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all of unauthenticated user's request to be "Unauthorized"
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status %v, but got %v", http.StatusUnauthorized, resp.StatusCode)
-				b, _ := ioutil.ReadAll(resp.Body)
+				b, _ := io.ReadAll(resp.Body)
 				t.Errorf("Body: %v", string(b))
 			}
 		}()
@@ -702,7 +791,7 @@ func TestUnknownUserIsUnauthorized(t *testing.T) {
 type impersonateAuthorizer struct{}
 
 // alice can't act as anyone and bob can't do anything but act-as someone
-func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+func (impersonateAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	// alice can impersonate service accounts and do other actions
 	if a.GetUser() != nil && a.GetUser().GetName() == "alice" && a.GetVerb() == "impersonate" && a.GetResource() == "serviceaccounts" {
 		return authorizer.DecisionAllow, "", nil
@@ -710,9 +799,12 @@ func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Deci
 	if a.GetUser() != nil && a.GetUser().GetName() == "alice" && a.GetVerb() != "impersonate" {
 		return authorizer.DecisionAllow, "", nil
 	}
-	// bob can impersonate anyone, but that it
+	// bob can impersonate anyone, but that's it
 	if a.GetUser() != nil && a.GetUser().GetName() == "bob" && a.GetVerb() == "impersonate" {
 		return authorizer.DecisionAllow, "", nil
+	}
+	if a.GetUser() != nil && a.GetUser().GetName() == "bob" && a.GetVerb() != "impersonate" {
+		return authorizer.DecisionDeny, "", nil
 	}
 	// service accounts can do everything
 	if a.GetUser() != nil && strings.HasPrefix(a.GetUser().GetName(), serviceaccount.ServiceAccountUsernamePrefix) {
@@ -722,24 +814,51 @@ func (impersonateAuthorizer) Authorize(a authorizer.Attributes) (authorizer.Deci
 	return authorizer.DecisionNoOpinion, "I can't allow that.  Go ask alice.", nil
 }
 
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (i impersonateAuthorizer) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(i.Authorize(ctx, a))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (impersonateAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}
+
 func TestImpersonateIsForbidden(t *testing.T) {
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = impersonateAuthorizer{}
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			// Prepend an impersonation authorizer with specific opinions about alice and bob
+			authz, err := unionauthz.New(
+				unionauthz.NamedAuthorizer{AuthorizerName: "impersonate", Authorizer: impersonateAuthorizer{}},
+				unionauthz.NamedAuthorizer{AuthorizerName: "default", Authorizer: config.ControlPlane.Generic.Authorization.Authorizer},
+			)
+			if err != nil {
+				t.Fatalf("unionauthz.New: %v", err)
+			}
+			config.ControlPlane.Generic.Authorization.Authorizer = authz
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-impersonate-forbidden", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-impersonate-forbidden", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// bob can't perform actions himself
 	for _, r := range getTestRequests(ns.Name) {
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -747,15 +866,15 @@ func TestImpersonateIsForbidden(t *testing.T) {
 
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all of bob's actions to return Forbidden
 			if resp.StatusCode != http.StatusForbidden {
 				t.Logf("case %v", r)
-				t.Errorf("Expected not status Forbidden, but got %s", resp.Status)
+				t.Errorf("Expected status Forbidden, but got %s", resp.Status)
 			}
 		}()
 	}
@@ -764,7 +883,7 @@ func TestImpersonateIsForbidden(t *testing.T) {
 	for _, r := range getTestRequests(ns.Name) {
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -772,11 +891,11 @@ func TestImpersonateIsForbidden(t *testing.T) {
 		req.Header.Set("Impersonate-User", "alice")
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all the requests to be allowed, don't care what they actually do
 			if resp.StatusCode == http.StatusForbidden {
 				t.Logf("case %v", r)
@@ -789,7 +908,7 @@ func TestImpersonateIsForbidden(t *testing.T) {
 	for _, r := range getTestRequests(ns.Name) {
 		token := AliceToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -798,11 +917,11 @@ func TestImpersonateIsForbidden(t *testing.T) {
 
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all of bob's actions to return Forbidden
 			if resp.StatusCode != http.StatusForbidden {
 				t.Logf("case %v", r)
@@ -811,11 +930,11 @@ func TestImpersonateIsForbidden(t *testing.T) {
 		}()
 	}
 
-	// alice can impersonate a service account
+	// bob can impersonate a service account
 	for _, r := range getTestRequests(ns.Name) {
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -823,11 +942,11 @@ func TestImpersonateIsForbidden(t *testing.T) {
 		req.Header.Set("Impersonate-User", serviceaccount.MakeUsername("default", "default"))
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all the requests to be allowed, don't care what they actually do
 			if resp.StatusCode == http.StatusForbidden {
 				t.Logf("case %v", r)
@@ -838,49 +957,940 @@ func TestImpersonateIsForbidden(t *testing.T) {
 
 }
 
-func newAuthorizerWithContents(t *testing.T, contents string) authorizer.Authorizer {
-	f, err := ioutil.TempFile("", "auth_test")
-	if err != nil {
-		t.Fatalf("unexpected error creating policyfile: %v", err)
-	}
-	f.Close()
-	defer os.Remove(f.Name())
+func TestImpersonateWithUID(t *testing.T) {
+	auditPolicyFile, auditLogFile := setupImpersonationAuditFiles(t)
+	server := kubeapiservertesting.StartTestServerOrDie(
+		t,
+		nil,
+		[]string{
+			"--authorization-mode=RBAC",
+			"--anonymous-auth",
+			"--audit-policy-file", auditPolicyFile,
+			"--audit-log-path", auditLogFile,
+			"--audit-log-version", "audit.k8s.io/v1",
+			"--audit-log-mode", "blocking",
+		},
+		framework.SharedEtcd(),
+	)
+	t.Cleanup(server.TearDownFn)
 
-	if err := ioutil.WriteFile(f.Name(), []byte(contents), 0700); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	t.Run("impersonation with uid header", func(t *testing.T) {
+		adminClient := clientset.NewForConfigOrDie(server.ClientConfig)
+
+		authutil.GrantUserAuthorization(t, ctx, adminClient, "alice",
+			rbacv1.PolicyRule{
+				Verbs:     []string{"create"},
+				APIGroups: []string{"certificates.k8s.io"},
+				Resources: []string{"certificatesigningrequests"},
+			},
+		)
+
+		req := csrPEM(t)
+
+		clientConfig := rest.CopyConfig(server.ClientConfig)
+		clientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "alice",
+			UID:      "1234",
+		}
+
+		client := clientset.NewForConfigOrDie(clientConfig)
+		createdCsr, err := client.CertificatesV1().CertificateSigningRequests().Create(
+			ctx,
+			&certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					SignerName: "kubernetes.io/kube-apiserver-client",
+					Request:    req,
+					Usages:     []certificatesv1.KeyUsage{"client auth"},
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "impersonated-csr",
+				},
+			},
+			metav1.CreateOptions{},
+		)
+		if err != nil {
+			t.Fatalf("Unexpected error creating Certificate Signing Request: %v", err)
+		}
+
+		// require that all the original fields and the impersonated user's info
+		// is in the returned spec.
+		expectedCsrSpec := certificatesv1.CertificateSigningRequestSpec{
+			Groups:     []string{"system:authenticated"},
+			SignerName: "kubernetes.io/kube-apiserver-client",
+			Request:    req,
+			Usages:     []certificatesv1.KeyUsage{"client auth"},
+			Username:   "alice",
+			UID:        "1234",
+		}
+		actualCsrSpec := createdCsr.Spec
+
+		if diff := cmp.Diff(expectedCsrSpec, actualCsrSpec); diff != "" {
+			t.Fatalf("CSR spec was different than expected, -got, +want:\n %s", diff)
+		}
+
+		withUID := allowedImpersonationEvent("create", http.StatusCreated, "alice", "system:authenticated", "certificatesigningrequests", new("impersonate:user-info"))
+		withUID.ImpersonatedUID = "1234"
+		assertImpersonationAuditEventsNoLatency(t, auditLogFile, user.APIServerUser, withUID)
+	})
+
+	t.Run("impersonation with only UID fails", func(t *testing.T) {
+		clientConfig := rest.CopyConfig(server.ClientConfig)
+		clientConfig.Impersonate = rest.ImpersonationConfig{
+			UID: "1234",
+		}
+
+		client := clientset.NewForConfigOrDie(clientConfig)
+		_, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+
+		if !errors.IsBadRequest(err) {
+			t.Fatalf("expected bad request, got %T %v", err, err)
+		}
+		if diff := cmp.Diff(
+			`requested &user.DefaultInfo{Name:"", UID:"1234", Groups:[]string(nil), Extra:map[string][]string(nil)} without impersonating a user name`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("bad request different than expected, -got, +want:\n %s", diff)
+		}
+	})
+
+	t.Run("impersonating UID without authorization fails", func(t *testing.T) {
+		truncateAuditLog(t, auditLogFile)
+		adminClient := clientset.NewForConfigOrDie(server.ClientConfig)
+
+		authutil.GrantUserAuthorization(t, ctx, adminClient, "system:anonymous",
+			rbacv1.PolicyRule{
+				Verbs:         []string{"impersonate:user-info"},
+				APIGroups:     []string{"authentication.k8s.io"},
+				Resources:     []string{"users"},
+				ResourceNames: []string{"some-user-anonymous-can-impersonate"},
+			},
+		)
+		authutil.GrantUserAuthorization(t, ctx, adminClient, "system:anonymous",
+			rbacv1.PolicyRule{
+				Verbs:     []string{"impersonate-on:user-info:list"},
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+			},
+		)
+
+		clientConfig := rest.AnonymousClientConfig(server.ClientConfig)
+		clientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "some-user-anonymous-can-impersonate",
+			UID:      "1234",
+		}
+
+		client := clientset.NewForConfigOrDie(clientConfig)
+		_, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+		if diff := cmp.Diff(
+			`uids.authentication.k8s.io "1234" is forbidden: `+
+				`User "system:anonymous" cannot impersonate:user-info resource "uids" in API group "authentication.k8s.io" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		assertImpersonationAuditEventsNoLatency(t, auditLogFile, "system:anonymous",
+			deniedImpersonationEvent("list", `uids.authentication.k8s.io "1234" is forbidden: User "system:anonymous" cannot impersonate:user-info resource "uids" in API group "authentication.k8s.io" at the cluster scope`, "nodes"),
+		)
+	})
+}
+
+// TestConstrainedImpersonation tests the constrained impersonation feature.
+// It ensures that users can only perform actions on behalf of other users
+// if they have the appropriate permissions.
+// This test covers:
+// - A user attempting to impersonate another user.
+// - A user attempting to impersonate a node.
+// - A service account attempting to impersonate a node it is scheduled on.
+// - The fallback to legacy impersonation when the feature is enabled.
+func TestConstrainedImpersonation(t *testing.T) {
+	superUser := "admin/system:masters"
+
+	authenticator := group.NewAuthenticatedGroupAdder(bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
+		superUser: {Name: "admin", Groups: []string{"system:masters"}},
+		"bob":     {Name: "bob"},
+		"alice":   {Name: "alice"},
+		"node1":   {Name: "system:node:node1", Groups: []string{user.NodesGroup}},
+		"serviceaccount1": {Name: "system:serviceaccount:default:sa1", Extra: map[string][]string{
+			"authentication.kubernetes.io/node-name": {"node1"},
+		}},
+		"serviceaccount2": {Name: "system:serviceaccount:default:sa2", Extra: map[string][]string{
+			"authentication.kubernetes.io/node-name": {"node2"},
+		}},
+	})))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConstrainedImpersonation, true)
+	var auditLogFile string
+	_, kubeConfig, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			opts.Authorization.Modes = []string{"RBAC"}
+			auditLogFile = setupImpersonationAudit(t, opts)
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			config.ControlPlane.Generic.Authentication.Authenticator = authenticator
+			config.ControlPlane.Generic.RequestInfoResolver = &slowImpersonationRequests{
+				delegate: server.NewRequestInfoResolver(config.ControlPlane.Generic),
+			}
+		},
+	})
+	t.Cleanup(tearDownFn)
+
+	superuserClient, _ := clientsetForToken(superUser, kubeConfig)
+
+	// preset permissions for users to be impersonated
+	authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:node:node1", rbacv1.PolicyRule{
+		Verbs:     []string{"list"},
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+	})
+	authutil.GrantUserAuthorization(t, ctx, superuserClient, "alice", rbacv1.PolicyRule{
+		Verbs:     []string{"list"},
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+	})
+
+	t.Run("bob impersonating alice", func(t *testing.T) {
+		resetAllMetrics(t, ctx, superuserClient)
+		truncateAuditLog(t, auditLogFile)
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "bob"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "alice",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`pods is forbidden: User "bob" cannot impersonate-on:user-info:list resource "pods" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// with impersonation:user-info permission added, bob still cannot list pods
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:user-info"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"users"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`pods is forbidden: User "bob" cannot impersonate-on:user-info:list resource "pods" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// with impersonate-on:list permission added, bob can list but not watch pods.
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:user-info:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).Watch(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		assertImpersonationMetrics(t, ctx, superuserClient, []string{
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="allowed",mode="user-info"} 1`,
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="denied",mode=""} 3`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="allowed",mode="user-info"} FP`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="denied",mode=""} FP`,
+			`apiserver_impersonation_attempts_total{decision="allowed",mode="user-info"} 1`,
+			`apiserver_impersonation_attempts_total{decision="denied",mode=""} 3`,
+			`apiserver_impersonation_authorization_attempts_total{decision="allowed",mode="user-info"} 2`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="legacy"} 3`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="user-info"} 3`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="allowed",mode="user-info"} 2`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="legacy"} 3`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="user-info"} 3`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="allowed",mode="user-info"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="legacy"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="user-info"} FP`,
+		})
+		assertImpersonationAuditEvents(t, auditLogFile, "bob",
+			deniedImpersonationEvent("list", `pods is forbidden: User "bob" cannot impersonate-on:user-info:list resource "pods" in API group "" at the cluster scope`, "pods"),
+			deniedImpersonationEvent("list", `pods is forbidden: User "bob" cannot impersonate-on:user-info:list resource "pods" in API group "" at the cluster scope`, "pods"),
+			allowedImpersonationEvent("list", http.StatusOK, "alice", "system:authenticated", "pods", new("impersonate:user-info")),
+			deniedImpersonationEvent("watch", `pods is forbidden: User "bob" cannot impersonate-on:user-info:watch resource "pods" in API group "" at the cluster scope`, "pods"),
+		)
+	})
+
+	t.Run("bob impersonating a node", func(t *testing.T) {
+		resetAllMetrics(t, ctx, superuserClient)
+		truncateAuditLog(t, auditLogFile)
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "bob"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "system:node:node1",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`pods is forbidden: User "bob" cannot impersonate-on:arbitrary-node:list resource "pods" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// with permissions added, bob still cannot list pods since bob needs
+		// permission to impersonate node.
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:user-info"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"users"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:arbitrary-node:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`nodes.authentication.k8s.io "node1" is forbidden: User "bob" cannot impersonate:arbitrary-node resource "nodes" in API group "authentication.k8s.io" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:arbitrary-node"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"nodes"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		assertImpersonationMetrics(t, ctx, superuserClient, []string{
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="allowed",mode="arbitrary-node"} 1`,
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="denied",mode=""} 2`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="allowed",mode="arbitrary-node"} FP`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="denied",mode=""} FP`,
+			`apiserver_impersonation_attempts_total{decision="allowed",mode="arbitrary-node"} 1`,
+			`apiserver_impersonation_attempts_total{decision="denied",mode=""} 2`,
+			`apiserver_impersonation_authorization_attempts_total{decision="allowed",mode="arbitrary-node"} 3`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="arbitrary-node"} 2`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="legacy"} 2`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="allowed",mode="arbitrary-node"} 3`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="arbitrary-node"} 2`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="legacy"} 2`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="allowed",mode="arbitrary-node"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="arbitrary-node"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="legacy"} FP`,
+		})
+		assertImpersonationAuditEvents(t, auditLogFile, "bob",
+			deniedImpersonationEvent("list", `pods is forbidden: User "bob" cannot impersonate-on:arbitrary-node:list resource "pods" in API group "" at the cluster scope`, "pods"),
+			deniedImpersonationEvent("list", `nodes.authentication.k8s.io "node1" is forbidden: User "bob" cannot impersonate:arbitrary-node resource "nodes" in API group "authentication.k8s.io" at the cluster scope`, "pods"),
+			allowedImpersonationEvent("list", http.StatusOK, "system:node:node1", "system:authenticated,system:nodes", "pods", new("impersonate:arbitrary-node")),
+		)
+	})
+
+	t.Run("impersonating scheduled node", func(t *testing.T) {
+		resetAllMetrics(t, ctx, superuserClient)
+		truncateAuditLog(t, auditLogFile)
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "serviceaccount2"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "system:node:node1",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+
+		// with permissions added, it cannot list pods since sa on the node2 instead of node1.
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa2", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:associated-node"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"nodes"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa2", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:associated-node:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`pods is forbidden: User "system:serviceaccount:default:sa2" cannot impersonate-on:arbitrary-node:list resource "pods" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// change to service account1 which is at node1
+		impersonatorClientConfig.BearerToken = "serviceaccount1"
+
+		client = clientset.NewForConfigOrDie(impersonatorClientConfig)
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:associated-node"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"nodes"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:associated-node:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		assertImpersonationMetrics(t, ctx, superuserClient, []string{
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="allowed",mode="associated-node"} 1`,
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="denied",mode=""} 1`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="allowed",mode="associated-node"} FP`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="denied",mode=""} FP`,
+			`apiserver_impersonation_attempts_total{decision="allowed",mode="associated-node"} 1`,
+			`apiserver_impersonation_attempts_total{decision="denied",mode=""} 1`,
+			`apiserver_impersonation_authorization_attempts_total{decision="allowed",mode="associated-node"} 2`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="arbitrary-node"} 1`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="legacy"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="allowed",mode="associated-node"} 2`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="arbitrary-node"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="legacy"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="allowed",mode="associated-node"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="arbitrary-node"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="legacy"} FP`,
+		})
+		assertImpersonationAuditEvents(t, auditLogFile, "system:serviceaccount:default:sa2",
+			deniedImpersonationEvent("list", `pods is forbidden: User "system:serviceaccount:default:sa2" cannot impersonate-on:arbitrary-node:list resource "pods" in API group "" at the cluster scope`, "pods"),
+		)
+		assertImpersonationAuditEvents(t, auditLogFile, "system:serviceaccount:default:sa1",
+			allowedImpersonationEvent("list", http.StatusOK, "system:node:node1", "system:authenticated,system:nodes", "pods", new("impersonate:associated-node")),
+		)
+	})
+
+	t.Run("fallback to legacy impersonation", func(t *testing.T) {
+		resetAllMetrics(t, ctx, superuserClient)
+		truncateAuditLog(t, auditLogFile)
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "bob"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "alice",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+
+		// with legacy impersonation verb, bob can impersonate alice.
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate"},
+			APIGroups: []string{""},
+			Resources: []string{"users"},
+		})
+
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			LabelSelector: "app=panda", // force this request to have a different cache key than the earlier test
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		assertImpersonationMetrics(t, ctx, superuserClient, []string{
+			`apiserver_impersonation_attempts_duration_seconds_count{decision="allowed",mode="legacy"} 1`,
+			`apiserver_impersonation_attempts_duration_seconds_sum{decision="allowed",mode="legacy"} FP`,
+			`apiserver_impersonation_attempts_total{decision="allowed",mode="legacy"} 1`,
+			`apiserver_impersonation_authorization_attempts_total{decision="allowed",mode="legacy"} 1`,
+			`apiserver_impersonation_authorization_attempts_total{decision="denied",mode="user-info"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="allowed",mode="legacy"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_count{decision="denied",mode="user-info"} 1`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="allowed",mode="legacy"} FP`,
+			`apiserver_impersonation_authorization_attempts_duration_seconds_sum{decision="denied",mode="user-info"} FP`,
+		})
+		assertImpersonationAuditEvents(t, auditLogFile, "bob",
+			allowedImpersonationEvent("list", http.StatusOK, "alice", "system:authenticated", "pods", nil),
+		)
+	})
+}
+
+func resetAllMetrics(t *testing.T, ctx context.Context, client clientset.Interface) {
+	t.Helper()
+
+	if err := client.CoreV1().RESTClient().Delete().AbsPath("/metrics").Do(ctx).Error(); err != nil {
+		t.Fatalf("failed to reset metrics: %v", err)
+	}
+}
+
+func assertImpersonationMetrics(t *testing.T, ctx context.Context, client clientset.Interface, wantMetricStrings []string) {
+	t.Helper()
+
+	rc := client.CoreV1().RESTClient()
+
+	body, err := rc.Get().AbsPath("/metrics").DoRaw(ctx)
+	if err != nil {
+		t.Fatalf("failed to fetch metrics: %v", err)
+	}
+
+	var gotMetricStrings []string
+	trimFP := regexp.MustCompile(`(} )[\de.+-]+(.*)`)
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if !strings.HasPrefix(line, "apiserver_impersonation_") {
+			continue
+		}
+		// skip histogram bucket lines to keep assertions manageable
+		if strings.Contains(line, "_bucket{") {
+			continue
+		}
+		if strings.Contains(line, "_seconds_sum") {
+			line = trimFP.ReplaceAllString(line, "${1}FP")
+		}
+		gotMetricStrings = append(gotMetricStrings, line)
+	}
+	slices.Sort(gotMetricStrings)
+	slices.Sort(wantMetricStrings)
+
+	if diff := cmp.Diff(wantMetricStrings, gotMetricStrings); diff != "" {
+		t.Errorf("unexpected impersonation metrics diff (-want +got): %s", diff)
+	}
+}
+
+const impersonationAuditPolicy = `
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - "RequestReceived"
+rules:
+  - level: Metadata
+`
+
+func setupImpersonationAuditFiles(t *testing.T) (policyFilePath, logFilePath string) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	policyFilePath = filepath.Join(dir, "audit-policy.yaml")
+	if err := os.WriteFile(policyFilePath, []byte(impersonationAuditPolicy), 0644); err != nil {
+		t.Fatalf("failed to write audit policy: %v", err)
+	}
+
+	logFilePath = filepath.Join(dir, "audit.log")
+
+	return policyFilePath, logFilePath
+}
+
+func setupImpersonationAudit(t *testing.T, opts *options.ServerRunOptions) string {
+	t.Helper()
+
+	policyFilePath, logFilePath := setupImpersonationAuditFiles(t)
+	opts.Audit.PolicyFile = policyFilePath
+	opts.Audit.LogOptions.Path = logFilePath
+	opts.Audit.LogOptions.GroupVersionString = "audit.k8s.io/v1"
+	opts.Audit.LogOptions.BatchOptions.Mode = "blocking"
+
+	return logFilePath
+}
+
+func truncateAuditLog(t *testing.T, logFilePath string) {
+	t.Helper()
+	if err := os.Truncate(logFilePath, 0); err != nil {
+		t.Fatalf("failed to truncate audit log: %v", err)
+	}
+}
+
+func getAuditEvents(t *testing.T, logFilePath string) []testutils.AuditEvent {
+	t.Helper()
+	stream, err := os.Open(logFilePath)
+	if err != nil {
+		t.Fatalf("failed to open audit log: %v", err)
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("failed to close audit log: %v", err)
+		}
+	}()
+	report, err := testutils.CheckAuditLinesFiltered(stream, nil, auditv1.SchemeGroupVersion, func(_, _ string) bool {
+		return true // get all audit annotations
+	})
+	if err != nil {
+		t.Fatalf("failed to parse audit log: %v", err)
+	}
+	return report.AllEvents
+}
+
+func assertImpersonationAuditEvents(t *testing.T, logFilePath, wantUser string, wantEvents ...testutils.AuditEvent) {
+	t.Helper()
+	doAssertImpersonationAuditEvents(t, logFilePath, wantUser, false, wantEvents...)
+}
+
+func assertImpersonationAuditEventsNoLatency(t *testing.T, logFilePath, wantUser string, wantEvents ...testutils.AuditEvent) {
+	t.Helper()
+	doAssertImpersonationAuditEvents(t, logFilePath, wantUser, true, wantEvents...)
+}
+
+func doAssertImpersonationAuditEvents(t *testing.T, logFilePath, wantUser string, skipLatency bool, wantEvents ...testutils.AuditEvent) {
+	t.Helper()
+
+	latencyPattern := regexp.MustCompile("^[0-9.]+[µnm]s$")
+
+	var matched []testutils.AuditEvent
+	for _, event := range getAuditEvents(t, logFilePath) {
+		if event.Stage != auditinternal.StageResponseComplete {
+			continue
+		}
+		if event.User != wantUser {
+			continue
+		}
+		if len(event.ImpersonatedUser) == 0 && !strings.Contains(event.StatusMessage, "impersonate") {
+			continue
+		}
+		matched = append(matched, event)
+	}
+	if len(matched) != len(wantEvents) {
+		t.Fatalf("expected %d audit event(s) from user %q with impersonation, got %d: %v", len(wantEvents), wantUser, len(matched), matched)
+	}
+	for i, event := range matched {
+		got := testutils.AuditEvent{
+			Verb:                    event.Verb,
+			Code:                    event.Code,
+			StatusMessage:           event.StatusMessage,
+			ImpersonatedUser:        event.ImpersonatedUser,
+			ImpersonatedUID:         event.ImpersonatedUID,
+			ImpersonatedGroups:      event.ImpersonatedGroups,
+			Resource:                event.Resource,
+			Namespace:               event.Namespace,
+			AuthorizeDecision:       event.AuthorizeDecision,
+			ImpersonationConstraint: event.ImpersonationConstraint,
+		}
+		if diff := cmp.Diff(wantEvents[i], got); len(diff) > 0 {
+			t.Errorf("audit event[%d] mismatch (-want +got): %s", i, diff)
+		}
+		if !skipLatency && event.Verb != "watch" && utilfeature.DefaultFeatureGate.Enabled(features.ConstrainedImpersonation) {
+			latency := event.CustomAuditAnnotations["apiserver.latency.k8s.io/impersonation"]
+			if !latencyPattern.MatchString(latency) {
+				t.Errorf("audit event[%d] expected valid impersonation latency annotation, got %q", i, latency)
+			}
+		}
+	}
+}
+
+func allowedImpersonationEvent(verb string, code int32, impersonatedUser, impersonatedGroups, resource string, constraint *string) testutils.AuditEvent {
+	return testutils.AuditEvent{
+		Verb:                    verb,
+		Code:                    code,
+		ImpersonatedUser:        impersonatedUser,
+		ImpersonatedGroups:      impersonatedGroups,
+		Resource:                resource,
+		AuthorizeDecision:       "allow",
+		ImpersonationConstraint: constraint,
+	}
+}
+
+func deniedImpersonationEvent(verb, statusMessage, resource string) testutils.AuditEvent {
+	return testutils.AuditEvent{
+		Verb:          verb,
+		Code:          http.StatusForbidden,
+		StatusMessage: statusMessage,
+		Resource:      resource,
+	}
+}
+
+type slowImpersonationRequests struct {
+	delegate genericrequest.RequestInfoResolver
+}
+
+func (s *slowImpersonationRequests) NewRequestInfo(req *http.Request) (*genericrequest.RequestInfo, error) {
+	if len(req.Header.Get(authenticationv1.ImpersonateUserHeader)) > 0 {
+		time.Sleep(505 * time.Millisecond) // force latency audit annotations to be emitted for impersonation requests
+	}
+	return s.delegate.NewRequestInfo(req)
+}
+
+// TestConstrainedImpersonationDisabled tests the impersonation behavior when the
+// ConstrainedImpersonation feature gate is disabled. In this mode, the legacy
+// impersonation behavior is expected, where a user only needs the "impersonate"
+// permission on the user, group, or service account they are trying to
+// impersonate.
+func TestConstrainedImpersonationDisabled(t *testing.T) {
+	superUser := "admin/system:masters"
+
+	authenticator := group.NewAuthenticatedGroupAdder(bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
+		superUser: {Name: "admin", Groups: []string{"system:masters"}},
+		"bob":     {Name: "bob"},
+		"alice":   {Name: "alice"},
+		"node1":   {Name: "system:node:node1", Groups: []string{user.NodesGroup}},
+		"serviceaccount1": {Name: "system:serviceaccount:default:sa1", Extra: map[string][]string{
+			"authentication.kubernetes.io/node-name": {"node1"},
+		}},
+	})))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConstrainedImpersonation, false)
+	var auditLogFile string
+	_, kubeConfig, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			opts.Authorization.Modes = []string{"RBAC"}
+			auditLogFile = setupImpersonationAudit(t, opts)
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			config.ControlPlane.Generic.Authentication.Authenticator = authenticator
+		},
+	})
+	t.Cleanup(tearDownFn)
+
+	superuserClient, _ := clientsetForToken(superUser, kubeConfig)
+
+	// preset permissions for users to be impersonated
+	authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:node:node1", rbacv1.PolicyRule{
+		Verbs:     []string{"list"},
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+	})
+	authutil.GrantUserAuthorization(t, ctx, superuserClient, "alice", rbacv1.PolicyRule{
+		Verbs:     []string{"list"},
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+	})
+
+	t.Run("bob impersonating alice", func(t *testing.T) {
+		truncateAuditLog(t, auditLogFile)
+
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:user-info"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"users"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:user-info:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "bob"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "alice",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`users "alice" is forbidden: User "bob" cannot impersonate resource "users" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// with legacy impersonation permission added, bob can list pods
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "bob", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate"},
+			APIGroups: []string{""},
+			Resources: []string{"users"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		assertImpersonationAuditEvents(t, auditLogFile, "bob",
+			deniedImpersonationEvent("list", `users "alice" is forbidden: User "bob" cannot impersonate resource "users" in API group "" at the cluster scope`, "pods"),
+			allowedImpersonationEvent("list", http.StatusOK, "alice", "system:authenticated", "pods", nil),
+		)
+	})
+
+	t.Run("serviceaccount impersonating a node", func(t *testing.T) {
+		truncateAuditLog(t, auditLogFile)
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate:associated-node"},
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"nodes"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:     []string{"impersonate-on:associated-node:list"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+		})
+
+		impersonatorClientConfig := rest.CopyConfig(kubeConfig)
+		impersonatorClientConfig.BearerToken = "serviceaccount1"
+		impersonatorClientConfig.Impersonate = rest.ImpersonationConfig{
+			UserName: "system:node:node1",
+		}
+
+		client := clientset.NewForConfigOrDie(impersonatorClientConfig)
+		_, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if !errors.IsForbidden(err) {
+			t.Fatalf("expected forbidden error, got %T %v", err, err)
+		}
+
+		if diff := cmp.Diff(
+			`users "system:node:node1" is forbidden: User "system:serviceaccount:default:sa1" cannot impersonate resource "users" in API group "" at the cluster scope`,
+			err.Error(),
+		); diff != "" {
+			t.Fatalf("forbidden error different than expected, -got, +want:\n %s", diff)
+		}
+
+		// with legacy impersonation permission added, sa can list pods
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:         []string{"impersonate"},
+			APIGroups:     []string{""},
+			Resources:     []string{"users"},
+			ResourceNames: []string{"system:node:node1"},
+		})
+		authutil.GrantUserAuthorization(t, ctx, superuserClient, "system:serviceaccount:default:sa1", rbacv1.PolicyRule{
+			Verbs:         []string{"impersonate"},
+			APIGroups:     []string{""},
+			Resources:     []string{"groups"},
+			ResourceNames: []string{"system:nodes"},
+		})
+
+		_, err = client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("expected no error, got %T %v", err, err)
+		}
+
+		assertImpersonationAuditEvents(t, auditLogFile, "system:serviceaccount:default:sa1",
+			deniedImpersonationEvent("list", `users "system:node:node1" is forbidden: User "system:serviceaccount:default:sa1" cannot impersonate resource "users" in API group "" at the cluster scope`, "pods"),
+			allowedImpersonationEvent("list", http.StatusOK, "system:node:node1", "system:authenticated", "pods", nil),
+		)
+	})
+}
+
+func csrPEM(t *testing.T) []byte {
+	t.Helper()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Unexpected error generating ed25519 key: %v", err)
+	}
+
+	csrDER, err := x509.CreateCertificateRequest(
+		rand.Reader,
+		&x509.CertificateRequest{
+			Subject: pkix.Name{
+				Organization: []string{},
+			},
+		},
+		privateKey)
+	if err != nil {
+		t.Fatalf("Unexpected error creating x509 certificate request: %v", err)
+	}
+
+	csrPemBlock := &pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csrDER,
+	}
+
+	req := pem.EncodeToMemory(csrPemBlock)
+	if req == nil {
+		t.Fatalf("Failed to encode PEM to memory.")
+	}
+	return req
+}
+
+func newABACFileWithContents(t *testing.T, contents string) string {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "auth_test")
+	if err := os.WriteFile(file, []byte(contents), 0700); err != nil {
 		t.Fatalf("unexpected error writing policyfile: %v", err)
 	}
-
-	pl, err := abac.NewFromFile(f.Name())
-	if err != nil {
-		t.Fatalf("unexpected error creating authorizer from policyfile: %v", err)
-	}
-	return pl
+	return file
 }
 
 type trackingAuthorizer struct {
 	requestAttributes []authorizer.Attributes
 }
 
-func (a *trackingAuthorizer) Authorize(attributes authorizer.Attributes) (authorizer.Decision, string, error) {
+func (a *trackingAuthorizer) Authorize(ctx context.Context, attributes authorizer.Attributes) (authorizer.Decision, string, error) {
 	a.requestAttributes = append(a.requestAttributes, attributes)
 	return authorizer.DecisionAllow, "", nil
 }
 
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (a *trackingAuthorizer) ConditionsAwareAuthorize(ctx context.Context, attributes authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(a.Authorize(ctx, attributes))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (a *trackingAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}
+
 // TestAuthorizationAttributeDetermination tests that authorization attributes are built correctly
 func TestAuthorizationAttributeDetermination(t *testing.T) {
+	tCtx := ktesting.Init(t)
+
 	trackingAuthorizer := &trackingAuthorizer{}
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = trackingAuthorizer
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			authz, err := unionauthz.New(
+				unionauthz.NamedAuthorizer{AuthorizerName: "default", Authorizer: config.ControlPlane.Generic.Authorization.Authorizer},
+				unionauthz.NamedAuthorizer{AuthorizerName: "tracking", Authorizer: trackingAuthorizer},
+			)
+			if err != nil {
+				t.Fatalf("unionauthz.New: %v", err)
+			}
+			config.ControlPlane.Generic.Authorization.Authorizer = authz
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-attribute-determination", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-attribute-determination", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	requests := map[string]struct {
 		verb               string
@@ -896,7 +1906,7 @@ func TestAuthorizationAttributeDetermination(t *testing.T) {
 
 	for testName, r := range requests {
 		token := BobToken
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, nil)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, nil)
 		if err != nil {
 			t.Logf("case %v", testName)
 			t.Fatalf("unexpected error: %v", err)
@@ -904,11 +1914,11 @@ func TestAuthorizationAttributeDetermination(t *testing.T) {
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 
 			found := false
 			for i := currentAuthorizationAttributesIndex; i < len(trackingAuthorizer.requestAttributes); i++ {
@@ -932,22 +1942,27 @@ func TestAuthorizationAttributeDetermination(t *testing.T) {
 // TestNamespaceAuthorization tests that authorization can be controlled
 // by namespace.
 func TestNamespaceAuthorization(t *testing.T) {
-	// This file has alice and bob in it.
-	a := newAuthorizerWithContents(t, `{"namespace": "auth-namespace"}
-`)
+	tCtx := ktesting.Init(t)
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = a
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.PolicyFile = newABACFileWithContents(t, `{"namespace": "auth-namespace"}`)
+			opts.Authorization.Modes = []string{"ABAC"}
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-namespace", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-namespace", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
 	previousResourceVersion := make(map[string]float64)
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	requests := []struct {
 		verb        string
@@ -994,7 +2009,7 @@ func TestNamespaceAuthorization(t *testing.T) {
 		}
 		r.body = bodyStr
 		bodyBytes := bytes.NewReader([]byte(bodyStr))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Logf("case %v", r)
 			t.Fatalf("unexpected error: %v", err)
@@ -1002,12 +2017,12 @@ func TestNamespaceAuthorization(t *testing.T) {
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
-			b, _ := ioutil.ReadAll(resp.Body)
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
 			if _, ok := r.statusCodes[resp.StatusCode]; !ok {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status one of %v, but got %v", r.statusCodes, resp.StatusCode)
@@ -1030,29 +2045,29 @@ func TestNamespaceAuthorization(t *testing.T) {
 // TestKindAuthorization tests that authorization can be controlled
 // by namespace.
 func TestKindAuthorization(t *testing.T) {
-	// This file has alice and bob in it.
-	a := newAuthorizerWithContents(t, `{"resource": "services"}
-`)
+	tCtx := ktesting.Init(t)
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = a
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.PolicyFile = newABACFileWithContents(t, `{"resource": "services"}`)
+			opts.Authorization.Modes = []string{"ABAC"}
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-kind", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-kind", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
 	previousResourceVersion := make(map[string]float64)
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	requests := []struct {
-		verb        string
-		URL         string
-		body        string
-		statusCodes map[int]bool // allowed status codes.
-	}{
+	requests := []testRequest{
 		{"POST", timeoutPath("services", ns.Name, ""), aService, integration.Code201},
 		{"GET", path("services", ns.Name, ""), "", integration.Code200},
 		{"GET", path("services", ns.Name, "a"), "", integration.Code200},
@@ -1072,27 +2087,27 @@ func TestKindAuthorization(t *testing.T) {
 			if r.verb == "PUT" && r.body != "" {
 				// For update operations, insert previous resource version
 				if resVersion := previousResourceVersion[getPreviousResourceVersionKey(r.URL, "")]; resVersion != 0 {
-					resourceVersionJson := fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
-					bodyStr = fmt.Sprintf(r.body, resourceVersionJson)
+					resourceVersionJSON := fmt.Sprintf(",\r\n\"resourceVersion\": \"%v\"", resVersion)
+					bodyStr = fmt.Sprintf(r.body, resourceVersionJSON)
 				}
 			}
 		}
 		r.body = bodyStr
 		bodyBytes := bytes.NewReader([]byte(bodyStr))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Logf("case %v", r)
 			t.Fatalf("unexpected error: %v", err)
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-		{
+		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
-			b, _ := ioutil.ReadAll(resp.Body)
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
 			if _, ok := r.statusCodes[resp.StatusCode]; !ok {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status one of %v, but got %v", r.statusCodes, resp.StatusCode)
@@ -1108,34 +2123,34 @@ func TestKindAuthorization(t *testing.T) {
 				}
 			}
 
-		}
+		}()
 	}
 }
 
 // TestReadOnlyAuthorization tests that authorization can be controlled
 // by namespace.
 func TestReadOnlyAuthorization(t *testing.T) {
-	// This file has alice and bob in it.
-	a := newAuthorizerWithContents(t, `{"readonly": true}`)
+	tCtx := ktesting.Init(t)
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authentication.TokenFile.TokenFile = "testdata/tokens.csv"
+			opts.Authorization.PolicyFile = newABACFileWithContents(t, `{"readonly": true}`)
+			opts.Authorization.Modes = []string{"ABAC"}
+		},
+	})
+	defer tearDownFn()
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = getTestTokenAuth()
-	masterConfig.GenericConfig.Authorizer = a
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-read-only", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	ns := framework.CreateTestingNamespace("auth-read-only", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	transport := http.DefaultTransport
-
-	requests := []struct {
-		verb        string
-		URL         string
-		body        string
-		statusCodes map[int]bool // allowed status codes.
-	}{
+	requests := []testRequest{
 		{"POST", path("pods", ns.Name, ""), aPod, integration.Code403},
 		{"GET", path("pods", ns.Name, ""), "", integration.Code200},
 		{"GET", path("pods", metav1.NamespaceDefault, "a"), "", integration.Code404},
@@ -1144,56 +2159,86 @@ func TestReadOnlyAuthorization(t *testing.T) {
 	for _, r := range requests {
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			if _, ok := r.statusCodes[resp.StatusCode]; !ok {
 				t.Logf("case %v", r)
 				t.Errorf("Expected status one of %v, but got %v", r.statusCodes, resp.StatusCode)
-				b, _ := ioutil.ReadAll(resp.Body)
+				b, _ := io.ReadAll(resp.Body)
 				t.Errorf("Body: %v", string(b))
 			}
 		}()
 	}
 }
 
-// TestWebhookTokenAuthenticator tests that a master can use the webhook token
+// TestWebhookTokenAuthenticator tests that a control plane can use the webhook token
 // authenticator to call out to a remote web server for authentication
 // decisions.
 func TestWebhookTokenAuthenticator(t *testing.T) {
+	testWebhookTokenAuthenticator(false, t)
+}
+
+// TestWebhookTokenAuthenticatorCustomDial is the same as TestWebhookTokenAuthenticator, but uses a
+// custom dialer
+func TestWebhookTokenAuthenticatorCustomDial(t *testing.T) {
+	testWebhookTokenAuthenticator(true, t)
+}
+
+func testWebhookTokenAuthenticator(customDialer bool, t *testing.T) {
+	tCtx := ktesting.Init(t)
 	authServer := newTestWebhookTokenAuthServer()
 	defer authServer.Close()
-	authenticator, err := getTestWebhookTokenAuth(authServer.URL)
+	var authenticator authenticator.Request
+	var err error
+
+	if customDialer == false {
+		authenticator, err = getTestWebhookTokenAuth(authServer.URL, nil)
+	} else {
+		authenticator, err = getTestWebhookTokenAuthCustomDialer(authServer.URL)
+	}
+
 	if err != nil {
 		t.Fatalf("error starting webhook token authenticator server: %v", err)
 	}
 
-	// Set up a master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authenticator = authenticator
-	masterConfig.GenericConfig.Authorizer = allowAliceAuthorizer{}
-	_, s, closeFn := framework.RunAMaster(masterConfig)
-	defer closeFn()
+	kubeClient, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Authorization.Modes = []string{"ABAC"}
+			opts.Authorization.PolicyFile = "testdata/allowalice.jsonl"
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			config.ControlPlane.Generic.Authentication.Authenticator = group.NewAuthenticatedGroupAdder(authenticator)
+			// Disable checking API audiences that is set by testserver by default.
+			config.ControlPlane.Generic.Authentication.APIAudiences = nil
+		},
+	})
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("auth-webhook-token", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(kubeClient, "auth-webhook-token", t)
+	defer framework.DeleteNamespaceOrDie(kubeClient, ns, t)
 
-	transport := http.DefaultTransport
+	transport, err := rest.TransportFor(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, r := range getTestRequests(ns.Name) {
 		// Expect Bob's requests to all fail.
 		token := BobToken
 		bodyBytes := bytes.NewReader([]byte(r.body))
-		req, err := http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err := http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1201,11 +2246,11 @@ func TestWebhookTokenAuthenticator(t *testing.T) {
 
 		func() {
 			resp, err := transport.RoundTrip(req)
-			defer resp.Body.Close()
 			if err != nil {
 				t.Logf("case %v", r)
 				t.Fatalf("unexpected error: %v", err)
 			}
+			defer resp.Body.Close()
 			// Expect all of Bob's actions to return Forbidden
 			if resp.StatusCode != http.StatusForbidden {
 				t.Logf("case %v", r)
@@ -1215,7 +2260,7 @@ func TestWebhookTokenAuthenticator(t *testing.T) {
 		// Expect Alice's requests to succeed.
 		token = AliceToken
 		bodyBytes = bytes.NewReader([]byte(r.body))
-		req, err = http.NewRequest(r.verb, s.URL+r.URL, bodyBytes)
+		req, err = http.NewRequest(r.verb, kubeConfig.Host+r.URL, bodyBytes)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1283,4 +2328,49 @@ func newTestWebhookTokenAuthServer() *httptest.Server {
 	server := httptest.NewUnstartedServer(http.HandlerFunc(serveHTTP))
 	server.Start()
 	return server
+}
+
+func TestSloppySANCertificates(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	_, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// append to opts.Authentication.ClientCert.ClientCA
+			fmt.Println(opts.Authentication.ClientCert.ClientCA)
+			caData, err := os.ReadFile(opts.Authentication.ClientCert.ClientCA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sloppyCAData, err := os.ReadFile("testdata/sloppy-san-root.pem")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = os.WriteFile(opts.Authentication.ClientCert.ClientCA, []byte(string(caData)+"\n"+string(sloppyCAData)), os.FileMode(0644))
+			if err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	defer tearDownFn()
+
+	var err error
+	kubeConfig = rest.AnonymousClientConfig(kubeConfig)
+	kubeConfig.CertData, err = os.ReadFile("testdata/sloppy-san-client.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kubeConfig.KeyData, err = os.ReadFile("testdata/sloppy-san-client-key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := clientset.NewForConfig(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.AuthenticationV1().SelfSubjectReviews().Create(tCtx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.UserInfo.Username != "sloppy-san-client" {
+		t.Fatalf("expected sloppy-san-client, got %#v", r.Status.UserInfo)
+	}
 }

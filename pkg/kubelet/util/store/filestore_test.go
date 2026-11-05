@@ -17,7 +17,6 @@ limitations under the License.
 package store
 
 import (
-	"io/ioutil"
 	"sort"
 	"testing"
 
@@ -27,15 +26,7 @@ import (
 )
 
 func TestFileStore(t *testing.T) {
-	path, err := ioutil.TempDir("", "FileStore")
-	assert.NoError(t, err)
-	store, err := NewFileStore(path, filesystem.DefaultFs{})
-	assert.NoError(t, err)
-	testStore(t, store)
-}
-
-func TestFakeFileStore(t *testing.T) {
-	store, err := NewFileStore("/tmp/test-fake-file-store", filesystem.NewFakeFs())
+	store, err := NewFileStore("/FileStore", filesystem.NewTempFs())
 	assert.NoError(t, err)
 	testStore(t, store)
 }
@@ -101,7 +92,7 @@ func testStore(t *testing.T, store Store) {
 	keys, err := store.List()
 	assert.NoError(t, err)
 	sort.Strings(keys)
-	assert.Equal(t, keys, []string{"id1", "id2"})
+	assert.Equal(t, []string{"id1", "id2"}, keys)
 
 	// Test Delete data
 	for _, c := range testCases {
@@ -122,5 +113,5 @@ func testStore(t *testing.T, store Store) {
 	// Test list keys.
 	keys, err = store.List()
 	require.NoError(t, err)
-	assert.Equal(t, len(keys), 0)
+	assert.Empty(t, keys)
 }

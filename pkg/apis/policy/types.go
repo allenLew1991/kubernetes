@@ -41,13 +41,58 @@ type PodDisruptionBudgetSpec struct {
 	// by specifying 0. This is a mutually exclusive setting with "minAvailable".
 	// +optional
 	MaxUnavailable *intstr.IntOrString
+
+	// UnhealthyPodEvictionPolicy defines the criteria for when unhealthy pods
+	// should be considered for eviction. Current implementation considers healthy pods,
+	// as pods that have status.conditions item with type="Ready",status="True".
+	//
+	// Valid policies are IfHealthyBudget and AlwaysAllow.
+	// If no policy is specified, the default behavior will be used,
+	// which corresponds to the IfHealthyBudget policy.
+	//
+	// IfHealthyBudget policy means that running pods (status.phase="Running"),
+	// but not yet healthy can be evicted only if the guarded application is not
+	// disrupted (status.currentHealthy is at least equal to status.desiredHealthy).
+	// Healthy pods will be subject to the PDB for eviction.
+	//
+	// AlwaysAllow policy means that all running pods (status.phase="Running"),
+	// but not yet healthy are considered disrupted and can be evicted regardless
+	// of whether the criteria in a PDB is met. This means perspective running
+	// pods of a disrupted application might not get a chance to become healthy.
+	// Healthy pods will be subject to the PDB for eviction.
+	//
+	// Additional policies may be added in the future.
+	// Clients making eviction decisions should disallow eviction of unhealthy pods
+	// if they encounter an unrecognized policy in this field.
+	// +optional
+	UnhealthyPodEvictionPolicy *UnhealthyPodEvictionPolicyType
 }
+
+// UnhealthyPodEvictionPolicyType defines the criteria for when unhealthy pods
+// should be considered for eviction.
+// +enum
+type UnhealthyPodEvictionPolicyType string
+
+const (
+	// IfHealthyBudget policy means that running pods (status.phase="Running"),
+	// but not yet healthy can be evicted only if the guarded application is not
+	// disrupted (status.currentHealthy is at least equal to status.desiredHealthy).
+	// Healthy pods will be subject to the PDB for eviction.
+	IfHealthyBudget UnhealthyPodEvictionPolicyType = "IfHealthyBudget"
+
+	// AlwaysAllow policy means that all running pods (status.phase="Running"),
+	// but not yet healthy are considered disrupted and can be evicted regardless
+	// of whether the criteria in a PDB is met. This means perspective running
+	// pods of a disrupted application might not get a chance to become healthy.
+	// Healthy pods will be subject to the PDB for eviction.
+	AlwaysAllow UnhealthyPodEvictionPolicyType = "AlwaysAllow"
+)
 
 // PodDisruptionBudgetStatus represents information about the status of a
 // PodDisruptionBudget. Status may trail the actual state of a system.
 type PodDisruptionBudgetStatus struct {
-	// Most recent generation observed when updating this PDB status. PodDisruptionsAllowed and other
-	// status informatio is valid only if observedGeneration equals to PDB's object generation.
+	// Most recent generation observed when updating this PDB status. DisruptionsAllowed and other
+	// status information is valid only if observedGeneration equals to PDB's object generation.
 	// +optional
 	ObservedGeneration int64
 
@@ -62,10 +107,11 @@ type PodDisruptionBudgetStatus struct {
 	// the list automatically by PodDisruptionBudget controller after some time.
 	// If everything goes smooth this map should be empty for the most of the time.
 	// Large number of entries in the map may indicate problems with pod deletions.
+	// +optional
 	DisruptedPods map[string]metav1.Time
 
 	// Number of pod disruptions that are currently allowed.
-	PodDisruptionsAllowed int32
+	DisruptionsAllowed int32
 
 	// current number of healthy pods
 	CurrentHealthy int32
@@ -75,9 +121,12 @@ type PodDisruptionBudgetStatus struct {
 
 	// total number of pods counted by this disruption budget
 	ExpectedPods int32
+
+	// Conditions contain conditions for PDB
+	// +optional
+	Conditions []metav1.Condition
 }
 
-// +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // PodDisruptionBudget is an object to define the max disruption that can be caused to a collection of pods
@@ -104,8 +153,6 @@ type PodDisruptionBudgetList struct {
 	Items []PodDisruptionBudget
 }
 
-// +genclient
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Eviction evicts a pod from its node subject to certain policies and safety constraints.

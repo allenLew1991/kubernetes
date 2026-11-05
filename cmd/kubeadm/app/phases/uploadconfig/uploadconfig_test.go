@@ -17,26 +17,24 @@ limitations under the License.
 package uploadconfig
 
 import (
+	"context"
+	"reflect"
 	"testing"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
-	core "k8s.io/client-go/testing"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
+	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 )
 
 func TestUploadConfiguration(t *testing.T) {
 	tests := []struct {
 		name           string
-		errOnCreate    error
-		errOnUpdate    error
 		updateExisting bool
-		errExpected    bool
 		verifyResult   bool
 	}{
 		{
@@ -48,70 +46,52 @@ func TestUploadConfiguration(t *testing.T) {
 			updateExisting: true,
 			verifyResult:   true,
 		},
-		{
-			name:        "unexpected errors for create should be returned",
-			errOnCreate: apierrors.NewUnauthorized(""),
-			errExpected: true,
-		},
-		{
-			name:           "update existing show report error if unexpected error for update is returned",
-			errOnUpdate:    apierrors.NewUnauthorized(""),
-			updateExisting: true,
-			errExpected:    true,
-		},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &kubeadmapi.MasterConfiguration{
-				KubernetesVersion: "1.7.3",
-				Token:             "1234567",
+		t.Run(tt.name, func(t2 *testing.T) {
+			cfg, err := configutil.DefaultedStaticInitConfiguration()
+			if err != nil {
+				t2.Fatalf("UploadConfiguration() error = %v", err)
 			}
+			cfg.ComponentConfigs = kubeadmapi.ComponentConfigMap{}
+			cfg.ClusterConfiguration.KubernetesVersion = kubeadmconstants.MinimumControlPlaneVersion.WithPatch(10).String()
+			cfg.NodeRegistration.Name = "node-foo"
+			cfg.NodeRegistration.CRISocket = kubeadmconstants.DefaultCRISocket
+
 			client := clientsetfake.NewSimpleClientset()
-			if tt.errOnCreate != nil {
-				client.PrependReactor("create", "configmaps", func(action core.Action) (bool, runtime.Object, error) {
-					return true, nil, tt.errOnCreate
-				})
-			}
 			// For idempotent test, we check the result of the second call.
-			if err := UploadConfiguration(cfg, client); !tt.updateExisting && (err != nil) != tt.errExpected {
-				t.Errorf("UploadConfiguration() error = %v, wantErr %v", err, tt.errExpected)
+			if err := UploadConfiguration(cfg, client); err != nil {
+				t2.Fatalf("UploadConfiguration() error = %v", err)
 			}
 			if tt.updateExisting {
-				if tt.errOnUpdate != nil {
-					client.PrependReactor("update", "configmaps", func(action core.Action) (bool, runtime.Object, error) {
-						return true, nil, tt.errOnUpdate
-					})
-				}
-				if err := UploadConfiguration(cfg, client); (err != nil) != tt.errExpected {
-					t.Errorf("UploadConfiguration() error = %v", err)
+				if err := UploadConfiguration(cfg, client); err != nil {
+					t2.Fatalf("UploadConfiguration() error = %v", err)
 				}
 			}
 			if tt.verifyResult {
-				masterCfg, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(kubeadmconstants.MasterConfigurationConfigMap, metav1.GetOptions{})
+				controlPlaneCfg, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(context.TODO(), kubeadmconstants.KubeadmConfigConfigMap, metav1.GetOptions{})
 				if err != nil {
-					t.Errorf("Fail to query ConfigMap error = %v", err)
+					t2.Fatalf("Fail to query ConfigMap error = %v", err)
 				}
-				configData := masterCfg.Data[kubeadmconstants.MasterConfigurationConfigMapKey]
+				configData := controlPlaneCfg.Data[kubeadmconstants.ClusterConfigurationConfigMapKey]
 				if configData == "" {
-					t.Errorf("Fail to find ConfigMap key")
+					t2.Fatal("Fail to find ClusterConfigurationConfigMapKey key")
 				}
 
-				decodedExtCfg := &kubeadmapiext.MasterConfiguration{}
-				decodedCfg := &kubeadmapi.MasterConfiguration{}
-
-				if err := runtime.DecodeInto(legacyscheme.Codecs.UniversalDecoder(), []byte(configData), decodedExtCfg); err != nil {
-					t.Errorf("unable to decode config from bytes: %v", err)
-				}
-				// Default and convert to the internal version
-				legacyscheme.Scheme.Default(decodedExtCfg)
-				legacyscheme.Scheme.Convert(decodedExtCfg, decodedCfg, nil)
-
-				if decodedCfg.KubernetesVersion != cfg.KubernetesVersion {
-					t.Errorf("Decoded value doesn't match, decoded = %#v, expected = %#v", decodedCfg.KubernetesVersion, cfg.KubernetesVersion)
+				decodedCfg := &kubeadmapi.ClusterConfiguration{}
+				if err := runtime.DecodeInto(kubeadmscheme.Codecs.UniversalDecoder(), []byte(configData), decodedCfg); err != nil {
+					t2.Fatalf("unable to decode config from bytes: %v", err)
 				}
 
-				if decodedCfg.Token != "" {
-					t.Errorf("Decoded value contains token (sensitive info), decoded = %#v, expected = empty", decodedCfg.Token)
+				if len(decodedCfg.ComponentConfigs) != 0 {
+					t2.Errorf("unexpected component configs in decodedCfg: %d", len(decodedCfg.ComponentConfigs))
+				}
+
+				// Force initialize with an empty map so that reflect.DeepEqual works
+				decodedCfg.ComponentConfigs = kubeadmapi.ComponentConfigMap{}
+
+				if !reflect.DeepEqual(decodedCfg, &cfg.ClusterConfiguration) {
+					t2.Errorf("the initial and decoded ClusterConfiguration didn't match:\n%#v\n===\n%#v", decodedCfg, &cfg.ClusterConfiguration)
 				}
 			}
 		})

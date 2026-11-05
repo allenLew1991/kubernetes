@@ -19,161 +19,142 @@ package validation
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/util/validation/field"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestValidateResourceRequirements(t *testing.T) {
+func TestValidatePodLogOptions(t *testing.T) {
+
+	var (
+		positiveLine             = int64(8)
+		negativeLine             = int64(-8)
+		limitBytesGreaterThan1   = int64(12)
+		limitBytesLessThan1      = int64(0)
+		sinceSecondsGreaterThan1 = int64(10)
+		sinceSecondsLessThan1    = int64(0)
+		timestamp                = metav1.Now()
+		stdoutStream             = v1.LogStreamStdout
+		stderrStream             = v1.LogStreamStderr
+		allStream                = v1.LogStreamAll
+		invalidStream            = "invalid"
+	)
+
 	successCase := []struct {
-		Name         string
-		requirements v1.ResourceRequirements
-	}{
-		{
-			Name: "GPU only setting Limits",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-			},
+		name          string
+		podLogOptions v1.PodLogOptions
+	}{{
+		name:          "Empty PodLogOptions",
+		podLogOptions: v1.PodLogOptions{},
+	}, {
+		name: "PodLogOptions with TailLines",
+		podLogOptions: v1.PodLogOptions{
+			TailLines: &positiveLine,
 		},
-		{
-			Name: "GPU setting Limits equals Requests",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-			},
+	}, {
+		name: "PodLogOptions with LimitBytes",
+		podLogOptions: v1.PodLogOptions{
+			LimitBytes: &limitBytesGreaterThan1,
 		},
-		{
-			Name: "Resources with GPU with Requests",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):       resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory):    resource.MustParse("10G"),
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("1"),
-				},
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):       resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory):    resource.MustParse("10G"),
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("1"),
-				},
-			},
+	}, {
+		name: "PodLogOptions with only sinceSeconds",
+		podLogOptions: v1.PodLogOptions{
+			SinceSeconds: &sinceSecondsGreaterThan1,
 		},
-		{
-			Name: "Resources with only Limits",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("10"),
-				},
-			},
+	}, {
+		name: "PodLogOptions with LimitBytes with TailLines",
+		podLogOptions: v1.PodLogOptions{
+			LimitBytes: &limitBytesGreaterThan1,
+			TailLines:  &positiveLine,
 		},
-		{
-			Name: "Resources with only Requests",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("10"),
-				},
-			},
+	}, {
+		name: "PodLogOptions with LimitBytes with TailLines with SinceSeconds",
+		podLogOptions: v1.PodLogOptions{
+			LimitBytes:   &limitBytesGreaterThan1,
+			TailLines:    &positiveLine,
+			SinceSeconds: &sinceSecondsGreaterThan1,
 		},
-		{
-			Name: "Resources with Requests Less Than Limits",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("9"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("9G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("9"),
-				},
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("9"),
-				},
-			},
+	}, {
+		name: "PodLogOptions with stdout Stream",
+		podLogOptions: v1.PodLogOptions{
+			Stream: &stdoutStream,
 		},
-	}
+	}, {
+		name: "PodLogOptions with stderr Stream and Follow",
+		podLogOptions: v1.PodLogOptions{
+			Stream: &stderrStream,
+			Follow: true,
+		},
+	}, {
+		name: "PodLogOptions with All Stream, TailLines and LimitBytes",
+		podLogOptions: v1.PodLogOptions{
+			Stream:     &allStream,
+			TailLines:  &positiveLine,
+			LimitBytes: &limitBytesGreaterThan1,
+		},
+	}}
 	for _, tc := range successCase {
-		if errs := ValidateResourceRequirements(&tc.requirements, field.NewPath("resources")); len(errs) != 0 {
-			t.Errorf("%q unexpected error: %v", tc.Name, errs)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if errs := ValidatePodLogOptions(&tc.podLogOptions); len(errs) != 0 {
+				t.Errorf("unexpected error: %v", errs)
+			}
+		})
 	}
 
 	errorCase := []struct {
-		Name         string
-		requirements v1.ResourceRequirements
-	}{
-		{
-			Name: "GPU only setting Requests",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-			},
+		name          string
+		podLogOptions v1.PodLogOptions
+	}{{
+		name: "Invalid podLogOptions with Negative TailLines",
+		podLogOptions: v1.PodLogOptions{
+			TailLines:    &negativeLine,
+			LimitBytes:   &limitBytesGreaterThan1,
+			SinceSeconds: &sinceSecondsGreaterThan1,
 		},
-		{
-			Name: "GPU setting Limits less than Requests",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("11"),
-				},
-			},
+	}, {
+		name: "Invalid podLogOptions with zero or negative LimitBytes",
+		podLogOptions: v1.PodLogOptions{
+			TailLines:    &positiveLine,
+			LimitBytes:   &limitBytesLessThan1,
+			SinceSeconds: &sinceSecondsGreaterThan1,
 		},
-		{
-			Name: "GPU setting Limits larger than Requests",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("10"),
-				},
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceNvidiaGPU): resource.MustParse("9"),
-				},
-			},
+	}, {
+		name: "Invalid podLogOptions with zero or negative SinceSeconds",
+		podLogOptions: v1.PodLogOptions{
+			TailLines:    &negativeLine,
+			LimitBytes:   &limitBytesGreaterThan1,
+			SinceSeconds: &sinceSecondsLessThan1,
 		},
-		{
-			Name: "Resources with Requests Larger Than Limits",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("10m"),
-				},
-				Limits: v1.ResourceList{
-					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("9"),
-					v1.ResourceName(v1.ResourceMemory): resource.MustParse("9G"),
-					v1.ResourceName("my.org/resource"): resource.MustParse("9m"),
-				},
-			},
+	}, {
+		name: "Invalid podLogOptions with both SinceSeconds and SinceTime set",
+		podLogOptions: v1.PodLogOptions{
+			TailLines:    &negativeLine,
+			LimitBytes:   &limitBytesGreaterThan1,
+			SinceSeconds: &sinceSecondsGreaterThan1,
+			SinceTime:    &timestamp,
 		},
-		{
-			Name: "Invalid Resources with Requests",
-			requirements: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceName("my.org"): resource.MustParse("10m"),
-				},
-			},
+	}, {
+		name: "Invalid podLogOptions with invalid Stream",
+		podLogOptions: v1.PodLogOptions{
+			Stream: &invalidStream,
 		},
-		{
-			Name: "Invalid Resources with Limits",
-			requirements: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					v1.ResourceName("my.org"): resource.MustParse("9m"),
-				},
-			},
+	}, {
+		name: "Invalid podLogOptions with stdout Stream and TailLines set",
+		podLogOptions: v1.PodLogOptions{
+			Stream:    &stdoutStream,
+			TailLines: &positiveLine,
 		},
-	}
+	}, {
+		name: "Invalid podLogOptions with stderr Stream and TailLines set",
+		podLogOptions: v1.PodLogOptions{
+			Stream:    &stderrStream,
+			TailLines: &positiveLine,
+		},
+	}}
 	for _, tc := range errorCase {
-		if errs := ValidateResourceRequirements(&tc.requirements, field.NewPath("resources")); len(errs) == 0 {
-			t.Errorf("%q expected error", tc.Name)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if errs := ValidatePodLogOptions(&tc.podLogOptions); len(errs) == 0 {
+				t.Errorf("expected error")
+			}
+		})
 	}
 }

@@ -17,10 +17,9 @@ limitations under the License.
 package discovery
 
 import (
-	"errors"
 	"net/http"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,31 +27,26 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
-	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 // legacyRootAPIHandler creates a webservice serving api group discovery.
 type legacyRootAPIHandler struct {
 	// addresses is used to build cluster IPs for discovery.
-	addresses     Addresses
-	apiPrefix     string
-	serializer    runtime.NegotiatedSerializer
-	apiVersions   []string
-	contextMapper request.RequestContextMapper
+	addresses  Addresses
+	apiPrefix  string
+	serializer runtime.NegotiatedSerializer
 }
 
-func NewLegacyRootAPIHandler(addresses Addresses, serializer runtime.NegotiatedSerializer, apiPrefix string, apiVersions []string, contextMapper request.RequestContextMapper) *legacyRootAPIHandler {
+func NewLegacyRootAPIHandler(addresses Addresses, serializer runtime.NegotiatedSerializer, apiPrefix string) *legacyRootAPIHandler {
 	// Because in release 1.1, /apis returns response with empty APIVersion, we
 	// use stripVersionNegotiatedSerializer to keep the response backwards
 	// compatible.
 	serializer = stripVersionNegotiatedSerializer{serializer}
 
 	return &legacyRootAPIHandler{
-		addresses:     addresses,
-		apiPrefix:     apiPrefix,
-		serializer:    serializer,
-		apiVersions:   apiVersions,
-		contextMapper: contextMapper,
+		addresses:  addresses,
+		apiPrefix:  apiPrefix,
+		serializer: serializer,
 	}
 }
 
@@ -62,7 +56,7 @@ func (s *legacyRootAPIHandler) WebService() *restful.WebService {
 	ws := new(restful.WebService)
 	ws.Path(s.apiPrefix)
 	ws.Doc("get available API versions")
-	ws.Route(ws.GET("/").To(s.handle).
+	ws.Route(ws.GET("/").To(s.restfulHandle).
 		Doc("get available API versions").
 		Operation("getAPIVersions").
 		Produces(mediaTypes...).
@@ -71,18 +65,16 @@ func (s *legacyRootAPIHandler) WebService() *restful.WebService {
 	return ws
 }
 
-func (s *legacyRootAPIHandler) handle(req *restful.Request, resp *restful.Response) {
-	ctx, ok := s.contextMapper.Get(req.Request)
-	if !ok {
-		responsewriters.InternalError(resp.ResponseWriter, req.Request, errors.New("no context found for request"))
-		return
-	}
+func (s *legacyRootAPIHandler) restfulHandle(req *restful.Request, resp *restful.Response) {
+	s.ServeHTTP(resp.ResponseWriter, req.Request)
+}
 
-	clientIP := utilnet.GetClientIP(req.Request)
+func (s *legacyRootAPIHandler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
+	clientIP := utilnet.GetClientIP(req)
 	apiVersions := &metav1.APIVersions{
 		ServerAddressByClientCIDRs: s.addresses.ServerAddressByClientCIDRs(clientIP),
-		Versions:                   s.apiVersions,
+		Versions:                   []string{"v1"},
 	}
 
-	responsewriters.WriteObjectNegotiated(ctx, s.serializer, schema.GroupVersion{}, resp.ResponseWriter, req.Request, http.StatusOK, apiVersions)
+	responsewriters.WriteObjectNegotiated(s.serializer, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, resp, req, http.StatusOK, apiVersions, false)
 }

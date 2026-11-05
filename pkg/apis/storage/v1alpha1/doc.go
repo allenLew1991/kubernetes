@@ -18,5 +18,8 @@ limitations under the License.
 // +k8s:conversion-gen-external-types=k8s.io/api/storage/v1alpha1
 // +groupName=storage.k8s.io
 // +k8s:defaulter-gen=TypeMeta
-// +k8s:defaulter-gen-input=../../../../vendor/k8s.io/api/storage/v1alpha1
-package v1alpha1 // import "k8s.io/kubernetes/pkg/apis/storage/v1alpha1"
+// +k8s:defaulter-gen-input=k8s.io/api/storage/v1alpha1
+// +k8s:validation-gen=TypesWithField=TypeMeta
+// +k8s:validation-gen-input=k8s.io/api/storage/v1alpha1
+
+package v1alpha1

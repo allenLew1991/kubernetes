@@ -21,13 +21,12 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -39,11 +38,21 @@ const (
 )
 
 type fileStore struct {
+	logger         klog.Logger
 	pairNamePrefix string
 	certDirectory  string
 	keyDirectory   string
 	certFile       string
 	keyFile        string
+}
+
+// FileStore is a store that provides certificate retrieval as well as
+// the path on disk of the current PEM.
+type FileStore interface {
+	Store
+	// CurrentPath returns the path on disk of the current certificate/key
+	// pair encoded as PEM files.
+	CurrentPath() string
 }
 
 // NewFileStore returns a concrete implementation of a Store that is based on
@@ -59,14 +68,30 @@ type fileStore struct {
 // updates will be written to the ${certDirectory} directory and
 // ${certDirectory}/${pairNamePrefix}-current.pem will be created as a soft
 // link to the currently selected cert/key pair.
+//
+// Contextual logging: NewFileStoreWithLogger should be used instead of NewFileStore in code which supports contextual logging.
 func NewFileStore(
 	pairNamePrefix string,
 	certDirectory string,
 	keyDirectory string,
 	certFile string,
-	keyFile string) (Store, error) {
+	keyFile string) (FileStore, error) {
+	return NewFileStoreWithLogger(klog.Background(), pairNamePrefix, certDirectory, keyDirectory, certFile, keyFile)
+}
+
+// NewFileStoreWithLogger is a variant of NewFileStore where the caller is in
+// control of logging. All log messages get emitted with logger.Info, so
+// pass e.g. logger.V(3) to make logging less verbose.
+func NewFileStoreWithLogger(
+	logger klog.Logger,
+	pairNamePrefix string,
+	certDirectory string,
+	keyDirectory string,
+	certFile string,
+	keyFile string) (FileStore, error) {
 
 	s := fileStore{
+		logger:         logger,
 		pairNamePrefix: pairNamePrefix,
 		certDirectory:  certDirectory,
 		keyDirectory:   keyDirectory,
@@ -77,6 +102,11 @@ func NewFileStore(
 		return nil, err
 	}
 	return &s, nil
+}
+
+// CurrentPath returns the path to the current version of these certificates.
+func (s *fileStore) CurrentPath() string {
+	return filepath.Join(s.certDirectory, s.filename(currentPair))
 }
 
 // recover checks if there is a certificate rotation that was interrupted while
@@ -114,7 +144,7 @@ func (s *fileStore) Current() (*tls.Certificate, error) {
 	if pairFileExists, err := fileExists(pairFile); err != nil {
 		return nil, err
 	} else if pairFileExists {
-		glog.Infof("Loading cert/key pair from %q.", pairFile)
+		s.logger.Info("Loading cert/key pair from a file", "filePath", pairFile)
 		return loadFile(pairFile)
 	}
 
@@ -127,7 +157,7 @@ func (s *fileStore) Current() (*tls.Certificate, error) {
 		return nil, err
 	}
 	if certFileExists && keyFileExists {
-		glog.Infof("Loading cert/key pair from (%q, %q).", s.certFile, s.keyFile)
+		s.logger.Info("Loading cert/key pair", "certFile", s.certFile, "keyFile", s.keyFile)
 		return loadX509KeyPair(s.certFile, s.keyFile)
 	}
 
@@ -142,7 +172,7 @@ func (s *fileStore) Current() (*tls.Certificate, error) {
 		return nil, err
 	}
 	if certFileExists && keyFileExists {
-		glog.Infof("Loading cert/key pair from (%q, %q).", c, k)
+		s.logger.Info("Loading cert/key pair", "certFile", c, "keyFile", k)
 		return loadX509KeyPair(c, k)
 	}
 
@@ -157,11 +187,9 @@ func (s *fileStore) Current() (*tls.Certificate, error) {
 }
 
 func loadFile(pairFile string) (*tls.Certificate, error) {
-	certBlock, keyBlock, err := loadCertKeyBlocks(pairFile)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.X509KeyPair(pem.EncodeToMemory(certBlock), pem.EncodeToMemory(keyBlock))
+	// LoadX509KeyPair knows how to parse combined cert and private key from
+	// the same file.
+	cert, err := tls.LoadX509KeyPair(pairFile, pairFile)
 	if err != nil {
 		return nil, fmt.Errorf("could not convert data from %q into cert/key pair: %v", pairFile, err)
 	}
@@ -171,22 +199,6 @@ func loadFile(pairFile string) (*tls.Certificate, error) {
 	}
 	cert.Leaf = certs[0]
 	return &cert, nil
-}
-
-func loadCertKeyBlocks(pairFile string) (cert *pem.Block, key *pem.Block, err error) {
-	data, err := ioutil.ReadFile(pairFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not load cert/key pair from %q: %v", pairFile, err)
-	}
-	certBlock, rest := pem.Decode(data)
-	if certBlock == nil {
-		return nil, nil, fmt.Errorf("could not decode the first block from %q from expected PEM format", pairFile)
-	}
-	keyBlock, _ := pem.Decode(rest)
-	if keyBlock == nil {
-		return nil, nil, fmt.Errorf("could not decode the second block from %q from expected PEM format", pairFile)
-	}
-	return certBlock, keyBlock, nil
 }
 
 func (s *fileStore) Update(certData, keyData []byte) (*tls.Certificate, error) {
@@ -203,16 +215,26 @@ func (s *fileStore) Update(certData, keyData []byte) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("could not open %q: %v", certPath, err)
 	}
 	defer f.Close()
-	certBlock, _ := pem.Decode(certData)
-	if certBlock == nil {
-		return nil, fmt.Errorf("invalid certificate data")
+
+	// First cert is leaf, remainder are intermediates
+	certs, err := certutil.ParseCertsPEM(certData)
+	if err != nil {
+		return nil, fmt.Errorf("invalid certificate data: %v", err)
 	}
-	pem.Encode(f, certBlock)
+	for _, c := range certs {
+		pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})
+	}
+
 	keyBlock, _ := pem.Decode(keyData)
 	if keyBlock == nil {
 		return nil, fmt.Errorf("invalid key data")
 	}
 	pem.Encode(f, keyBlock)
+
+	// Ensure data is written to disk
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("failed to sync certificate data to disk: %w (file: %q)", err, certPath)
+	}
 
 	cert, err := loadFile(certPath)
 	if err != nil {
@@ -292,12 +314,6 @@ func (s *fileStore) updateSymlink(filename string) error {
 
 func (s *fileStore) filename(qualifier string) string {
 	return s.pairNamePrefix + "-" + qualifier + pemExtension
-}
-
-// withoutExt returns the given filename after removing the extension. The
-// extension to remove will be the result of filepath.Ext().
-func withoutExt(filename string) string {
-	return strings.TrimSuffix(filename, filepath.Ext(filename))
 }
 
 func loadX509KeyPair(certFile, keyFile string) (*tls.Certificate, error) {

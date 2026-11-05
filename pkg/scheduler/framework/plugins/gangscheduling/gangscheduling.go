@@ -1,0 +1,250 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package gangscheduling
+
+import (
+	"context"
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	"k8s.io/kubernetes/pkg/scheduler/util"
+)
+
+const (
+	// Name is the name of the plugin used in the plugin registry and configurations.
+	Name = names.GangScheduling
+)
+
+// GangScheduling is a plugin that enforces "all-or-nothing" scheduling for pods
+// belonging to a PodGroup with a Gang scheduling policy.
+type GangScheduling struct {
+	isCompositePodGroupEnabled bool
+	hierarchyTracker           fwk.PodGroupHierarchyTracker
+}
+
+var _ fwk.EnqueueExtensions = &GangScheduling{}
+var _ fwk.PreEnqueuePlugin = &GangScheduling{}
+var _ fwk.PlacementFeasiblePlugin = &GangScheduling{}
+
+// New initializes a new plugin and returns it.
+func New(_ context.Context, _ runtime.Object, fh fwk.Handle, fts feature.Features) (fwk.Plugin, error) {
+	return &GangScheduling{
+		isCompositePodGroupEnabled: fts.EnableCompositePodGroup,
+		hierarchyTracker:           fh.SharedPodGroupHierarchyTracker(),
+	}, nil
+}
+
+// Name returns name of the plugin.
+func (pl *GangScheduling) Name() string {
+	return Name
+}
+
+// EventsToRegister returns the possible events that may make a Pod failed by this plugin schedulable.
+func (pl *GangScheduling) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	events := []fwk.ClusterEventWithHint{
+		// A new pod (either unscheduled or pre-bound) being added might be the one that completes a gang, meeting its MinCount requirement.
+		// PodSchedulingGroup field is immutable, so there is no need to subscribe on Pod/Update event.
+		{Event: fwk.ClusterEvent{Resource: fwk.UnscheduledPod, ActionType: fwk.Add}, QueueingHintFn: pl.isSchedulableAfterPodAdded},
+		{Event: fwk.ClusterEvent{Resource: fwk.AssignedPod, ActionType: fwk.Add}, QueueingHintFn: pl.isSchedulableAfterPodAdded},
+		// A PodGroup being added can be making a waiting gang schedulable.
+		{Event: fwk.ClusterEvent{Resource: fwk.PodGroup, ActionType: fwk.Add}, QueueingHintFn: pl.isSchedulableAfterPodGroupAdded},
+		// A PodGroup update to MinCount may make it schedulable
+		{Event: fwk.ClusterEvent{Resource: fwk.PodGroup, ActionType: fwk.Update}, QueueingHintFn: pl.isSchedulableAfterPodGroupUpdated},
+	}
+
+	if pl.isCompositePodGroupEnabled {
+		// A CompositePodGroup being added can be making a waiting gang schedulable.
+		events = append(events, fwk.ClusterEventWithHint{Event: fwk.ClusterEvent{Resource: fwk.CompositePodGroup, ActionType: fwk.Add}, QueueingHintFn: pl.isSchedulableAfterCompositePodGroupAdded})
+		// A CompositePodGroup update to MinGroupCount may make it schedulable.
+		events = append(events, fwk.ClusterEventWithHint{Event: fwk.ClusterEvent{Resource: fwk.CompositePodGroup, ActionType: fwk.Update}, QueueingHintFn: pl.isSchedulableAfterCompositePodGroupUpdated})
+	}
+
+	return events, nil
+}
+
+// isSchedulableAfterPodAdded checks whether a newly added pod (either unscheduled or pre-bound)
+// could make a previously unschedulable pod schedulable by completing the gang's MinCount.
+func (pl *GangScheduling) isSchedulableAfterPodAdded(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	_, addedPod, err := util.As[*v1.Pod](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	if pod.Spec.SchedulingGroup == nil || addedPod.Spec.SchedulingGroup == nil {
+		return fwk.QueueSkip, nil
+	}
+	addedPodGroupKey := fwk.PodGroupKey(addedPod.Namespace, *addedPod.Spec.SchedulingGroup.PodGroupName)
+	if pl.areSameHierarchy(logger, pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName, addedPodGroupKey) {
+		return fwk.Queue, nil
+	}
+	return fwk.QueueSkip, nil
+}
+
+// isSchedulableAfterPodGroupUpdated triggers re-enqueueing of the group's pods if the minCount requirement has decreased.
+func (pl *GangScheduling) isSchedulableAfterPodGroupUpdated(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	oldPodGroup, newPodGroup, err := util.As[*schedulingv1beta1.PodGroup](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+	// Updates to non-gang policies will not make the waiting pods schedulable.
+	if pod.Spec.SchedulingGroup == nil || newPodGroup.Spec.SchedulingPolicy.Gang == nil {
+		return fwk.QueueSkip, nil
+	}
+	return pl.isSchedulableAfterGenericPodGroupUpdated(
+		logger, pod,
+		fwk.PodGroupKey(newPodGroup.Namespace, newPodGroup.Name),
+		oldPodGroup.Spec.SchedulingPolicy.Gang.MinCount,
+		newPodGroup.Spec.SchedulingPolicy.Gang.MinCount,
+	)
+}
+
+func (pl *GangScheduling) isSchedulableAfterPodGroupAdded(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	_, addedPodGroup, err := util.As[*schedulingv1beta1.PodGroup](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+	if pod.Spec.SchedulingGroup == nil {
+		return fwk.QueueSkip, nil
+	}
+	return pl.isSchedulableAfterGenericPodGroupAdded(logger, pod, fwk.PodGroupKey(addedPodGroup.Namespace, addedPodGroup.Name))
+}
+
+func (pl *GangScheduling) isSchedulableAfterCompositePodGroupAdded(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	_, addedCPG, err := util.As[*schedulingv1beta1.CompositePodGroup](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+	if pod.Spec.SchedulingGroup == nil {
+		return fwk.QueueSkip, nil
+	}
+	return pl.isSchedulableAfterGenericPodGroupAdded(logger, pod, fwk.CompositePodGroupKey(addedCPG.Namespace, addedCPG.Name))
+}
+
+// isSchedulableAfterCompositePodGroupUpdated triggers re-enqueueing of the group's pods if the minGroupCount requirement has decreased.
+func (pl *GangScheduling) isSchedulableAfterCompositePodGroupUpdated(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	oldCPG, newCPG, err := util.As[*schedulingv1beta1.CompositePodGroup](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+	// Updates to non-gang policies will not make the waiting pods schedulable.
+	if pod.Spec.SchedulingGroup == nil || newCPG.Spec.SchedulingPolicy.Gang == nil {
+		return fwk.QueueSkip, nil
+	}
+	return pl.isSchedulableAfterGenericPodGroupUpdated(
+		logger, pod,
+		fwk.CompositePodGroupKey(newCPG.Namespace, newCPG.Name),
+		oldCPG.Spec.SchedulingPolicy.Gang.MinGroupCount,
+		newCPG.Spec.SchedulingPolicy.Gang.MinGroupCount,
+	)
+}
+
+func (pl *GangScheduling) isSchedulableAfterGenericPodGroupAdded(logger klog.Logger, pod *v1.Pod, addedGroupKey fwk.EntityKey) (fwk.QueueingHint, error) {
+	if pl.areSameHierarchy(logger, pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName, addedGroupKey) {
+		return fwk.Queue, nil
+	}
+	return fwk.QueueSkip, nil
+}
+
+func (pl *GangScheduling) isSchedulableAfterGenericPodGroupUpdated(logger klog.Logger, pod *v1.Pod, groupKey fwk.EntityKey, oldMinCount, newMinCount int32) (fwk.QueueingHint, error) {
+	// If the gang scheduling policy minCount/minGroupCount did not decrease, it will not make the waiting pods schedulable.
+	if newMinCount >= oldMinCount {
+		logger.V(5).Info("Group minCount did not decrease, skipping", "pod", klog.KObj(pod), "groupType", groupKey.GetType(), "group", klog.KRef(groupKey.GetNamespace(), groupKey.GetName()), "oldMinCount", oldMinCount, "newMinCount", newMinCount)
+		return fwk.QueueSkip, nil
+	}
+
+	if !pl.areSameHierarchy(logger, pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName, groupKey) {
+		logger.V(5).Info("Group was updated, but not in the same hierarchy, skipping", "pod", klog.KObj(pod), "groupType", groupKey.GetType(), "group", klog.KRef(groupKey.GetNamespace(), groupKey.GetName()))
+		return fwk.QueueSkip, nil
+	}
+
+	logger.V(5).Info("Group was updated and minCount decreased, enqueuing pod", "pod", klog.KObj(pod), "groupType", groupKey.GetType(), "group", klog.KRef(groupKey.GetNamespace(), groupKey.GetName()), "oldMinCount", oldMinCount, "newMinCount", newMinCount)
+	return fwk.Queue, nil
+}
+
+// areSameHierarchy checks if the given pod group is in the same hierarchy as the target key.
+func (pl *GangScheduling) areSameHierarchy(logger klog.Logger, namespace, podGroupName string, targetKey fwk.EntityKey) bool {
+	if !pl.isCompositePodGroupEnabled {
+		return fwk.PodGroupKey(namespace, podGroupName) == targetKey
+	}
+
+	podGroupKey := fwk.PodGroupKey(namespace, podGroupName)
+	same, err := pl.hierarchyTracker.AreSameHierarchy(podGroupKey, targetKey)
+	if err != nil {
+		utilruntime.HandleErrorWithLogger(logger, err, "Failed to check if keys are in the same hierarchy", "key1", podGroupKey, "key2", targetKey)
+		return false
+	}
+	return same
+}
+
+// PreEnqueue checks if the pod belongs to a scheduling group and, if so, whether its group or composite pod group hierarchy
+// satisfies readiness quorum (such as MinCount for standalone gangs or MinGroupCount across child groups).
+// If quorum is not met, the pod is rejected from entering the active scheduling queue until more pods or child groups arrive.
+func (pl *GangScheduling) PreEnqueue(ctx context.Context, pod *v1.Pod) *fwk.Status {
+	if pod.Spec.SchedulingGroup == nil {
+		return nil
+	}
+
+	pgKey := fwk.PodGroupKey(pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName)
+	rootReadiness, err := pl.hierarchyTracker.FindRootGroupReadiness(pgKey)
+	if err != nil {
+		return fwk.AsStatus(err)
+	}
+	if rootReadiness == nil || rootReadiness.RootGroup == nil {
+		// The pod is unschedulable until its pod group and all parent groups in its hierarchy are created.
+		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("pod group %q or one of its composite pod group ancestors has not been created yet", *pod.Spec.SchedulingGroup.PodGroupName))
+	}
+
+	if rootReadiness.IsReady {
+		return nil
+	}
+
+	rootGroup := rootReadiness.RootGroup
+	if rootGroup.IsBasic() {
+		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("waiting for %s tree to have at least one ready child group", rootGroup.GetKey()))
+	}
+	return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("waiting for %s to meet its quorum", rootGroup.GetKey()))
+}
+
+// PlacementFeasible is responsible for enforcing the scheduling policy's minimum threshold in the pod group scheduling cycle.
+// The function will only return success once the gang's MinCount (or MinGroupCount) is satisfied, or at least one pod (or child group) is scheduled for the basic scheduling policy.
+// In case there are not enough remaining pods or child groups to satisfy the minimum threshold, it returns Unschedulable which will terminate the pod group scheduling cycle early.
+func (pl *GangScheduling) PlacementFeasible(ctx context.Context, placementCycleState fwk.PlacementCycleState, podGroupInfo fwk.PodGroupInfo, args fwk.PlacementProgress) *fwk.Status {
+	minCount := podGroupInfo.GetMinCount()
+	remaining := args.Remaining
+	scheduled := args.Scheduled
+	unschedulable := args.Unschedulable
+
+	if remaining+scheduled < minCount {
+		// minCount can't be satisfied because there are not enough remaining pods.
+		return fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("scheduling policy's minimum threshold (%d) cannot be satisfied: %d scheduled, %d unschedulable, %d not-evaluated", minCount, scheduled, unschedulable, remaining))
+	}
+
+	if scheduled < minCount {
+		// minCount might be satisfied once more remaining pods are evaluated.
+		return fwk.NewStatus(fwk.Wait, fmt.Sprintf("scheduling policy's minimum threshold (%d) is not yet satisfied: %d scheduled, %d unschedulable, %d not-evaluated", minCount, scheduled, unschedulable, remaining))
+	}
+
+	// minCount is satisfied.
+	return nil
+}

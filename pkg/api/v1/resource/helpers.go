@@ -20,85 +20,60 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	resourcehelper "k8s.io/component-helpers/resource"
+	"k8s.io/kubernetes/pkg/features"
 )
 
-// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
-// containers of the pod.
-func PodRequestsAndLimits(pod *v1.Pod) (reqs map[v1.ResourceName]resource.Quantity, limits map[v1.ResourceName]resource.Quantity) {
-	reqs, limits = map[v1.ResourceName]resource.Quantity{}, map[v1.ResourceName]resource.Quantity{}
-	for _, container := range pod.Spec.Containers {
-		for name, quantity := range container.Resources.Requests {
-			if value, ok := reqs[name]; !ok {
-				reqs[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				reqs[name] = value
-			}
-		}
-		for name, quantity := range container.Resources.Limits {
-			if value, ok := limits[name]; !ok {
-				limits[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				limits[name] = value
-			}
+// GetResourceRequestQuantity finds and returns the request quantity for a specific resource.
+func GetResourceRequestQuantity(pod *v1.Pod, resourceName v1.ResourceName) resource.Quantity {
+	requestQuantity := resource.Quantity{}
+
+	switch resourceName {
+	case v1.ResourceCPU:
+		requestQuantity = resource.Quantity{Format: resource.DecimalSI}
+	case v1.ResourceMemory, v1.ResourceStorage, v1.ResourceEphemeralStorage:
+		requestQuantity = resource.Quantity{Format: resource.BinarySI}
+	default:
+		requestQuantity = resource.Quantity{Format: resource.DecimalSI}
+	}
+
+	// Supported pod level resources will be used instead of container level ones when available
+	hasPodLevelResources := utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod)
+
+	// TODO(pravk03): considering DRA Node Allocatable resources for eviction ranking.
+	if rQuantity, ok := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{SkipContainerLevelResources: hasPodLevelResources, ExcludeOverhead: true})[resourceName]; ok {
+		requestQuantity.Add(rQuantity)
+	}
+
+	// Add overhead for running a pod
+	// to the total requests if the resource total is non-zero
+	if pod.Spec.Overhead != nil {
+		if podOverhead, ok := pod.Spec.Overhead[resourceName]; ok && !requestQuantity.IsZero() {
+			requestQuantity.Add(podOverhead)
 		}
 	}
-	// init containers define the minimum of any resource
-	for _, container := range pod.Spec.InitContainers {
-		for name, quantity := range container.Resources.Requests {
-			value, ok := reqs[name]
-			if !ok {
-				reqs[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				reqs[name] = *quantity.Copy()
-			}
-		}
-		for name, quantity := range container.Resources.Limits {
-			value, ok := limits[name]
-			if !ok {
-				limits[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				limits[name] = *quantity.Copy()
-			}
-		}
-	}
-	return
+
+	return requestQuantity
 }
 
-// finds and returns the request for a specific resource.
+// GetResourceRequest finds and returns the request value for a specific resource.
 func GetResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	if resource == v1.ResourcePods {
 		return 1
 	}
-	totalResources := int64(0)
-	for _, container := range pod.Spec.Containers {
-		if rQuantity, ok := container.Resources.Requests[resource]; ok {
-			if resource == v1.ResourceCPU {
-				totalResources += rQuantity.MilliValue()
-			} else {
-				totalResources += rQuantity.Value()
-			}
-		}
+
+	requestQuantity := GetResourceRequestQuantity(pod, resource)
+
+	if resource == v1.ResourceCPU {
+		return requestQuantity.MilliValue()
 	}
-	// take max_resource(sum_pod, any_init_container)
-	for _, container := range pod.Spec.InitContainers {
-		if rQuantity, ok := container.Resources.Requests[resource]; ok {
-			if resource == v1.ResourceCPU && rQuantity.MilliValue() > totalResources {
-				totalResources = rQuantity.MilliValue()
-			} else if rQuantity.Value() > totalResources {
-				totalResources = rQuantity.Value()
-			}
-		}
-	}
-	return totalResources
+
+	return requestQuantity.Value()
 }
 
 // ExtractResourceValueByContainerName extracts the value of a resource
@@ -150,8 +125,21 @@ func ExtractContainerResourceValue(fs *v1.ResourceFieldSelector, container *v1.C
 	case "requests.ephemeral-storage":
 		return convertResourceEphemeralStorageToString(container.Resources.Requests.StorageEphemeral(), divisor)
 	}
-
-	return "", fmt.Errorf("Unsupported container resource : %v", fs.Resource)
+	// handle extended standard resources with dynamic names
+	// example: requests.hugepages-<pageSize> or limits.hugepages-<pageSize>
+	if strings.HasPrefix(fs.Resource, "requests.") {
+		resourceName := v1.ResourceName(strings.TrimPrefix(fs.Resource, "requests."))
+		if IsHugePageResourceName(resourceName) {
+			return convertResourceHugePagesToString(container.Resources.Requests.Name(resourceName, resource.BinarySI), divisor)
+		}
+	}
+	if strings.HasPrefix(fs.Resource, "limits.") {
+		resourceName := v1.ResourceName(strings.TrimPrefix(fs.Resource, "limits."))
+		if IsHugePageResourceName(resourceName) {
+			return convertResourceHugePagesToString(container.Resources.Limits.Name(resourceName, resource.BinarySI), divisor)
+		}
+	}
+	return "", fmt.Errorf("unsupported container resource : %v", fs.Resource)
 }
 
 // convertResourceCPUToString converts cpu value to the format of divisor and returns
@@ -165,6 +153,13 @@ func convertResourceCPUToString(cpu *resource.Quantity, divisor resource.Quantit
 // ceiling of the value.
 func convertResourceMemoryToString(memory *resource.Quantity, divisor resource.Quantity) (string, error) {
 	m := int64(math.Ceil(float64(memory.Value()) / float64(divisor.Value())))
+	return strconv.FormatInt(m, 10), nil
+}
+
+// convertResourceHugePagesToString converts hugepages value to the format of divisor and returns
+// ceiling of the value.
+func convertResourceHugePagesToString(hugePages *resource.Quantity, divisor resource.Quantity) (string, error) {
+	m := int64(math.Ceil(float64(hugePages.Value()) / float64(divisor.Value())))
 	return strconv.FormatInt(m, 10), nil
 }
 
@@ -182,6 +177,11 @@ func findContainerInPod(pod *v1.Pod, containerName string) (*v1.Container, error
 			return &container, nil
 		}
 	}
+	for _, container := range pod.Spec.InitContainers {
+		if container.Name == containerName {
+			return &container, nil
+		}
+	}
 	return nil, fmt.Errorf("container %s not found", containerName)
 }
 
@@ -192,11 +192,19 @@ func MergeContainerResourceLimits(container *v1.Container,
 	if container.Resources.Limits == nil {
 		container.Resources.Limits = make(v1.ResourceList)
 	}
+	// NOTE: we exclude hugepages-* resources because hugepages are never overcommitted.
+	// This means that the container always has a limit specified.
 	for _, resource := range []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory, v1.ResourceEphemeralStorage} {
 		if quantity, exists := container.Resources.Limits[resource]; !exists || quantity.IsZero() {
 			if cap, exists := allocatable[resource]; exists {
-				container.Resources.Limits[resource] = *cap.Copy()
+				container.Resources.Limits[resource] = cap.DeepCopy()
 			}
 		}
 	}
+}
+
+// IsHugePageResourceName returns true if the resource name has the huge page
+// resource prefix.
+func IsHugePageResourceName(name v1.ResourceName) bool {
+	return strings.HasPrefix(string(name), v1.ResourceHugePagesPrefix)
 }

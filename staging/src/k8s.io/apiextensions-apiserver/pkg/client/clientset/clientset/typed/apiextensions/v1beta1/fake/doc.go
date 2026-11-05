@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,5 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package fake has the automatically generated clients.
+// Package fake contains deprecated aliases of
+// k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1beta1/fake.
+//
+// Deprecated: use k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1beta1/fake directly.
 package fake

@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # metrics
 
 Kubernetes metrics API type definitions and clients.
@@ -14,9 +19,7 @@ library when implementing their API servers.
 
 ## APIs
 
-This repository contains types and clients for several APIs.  For more
-details on implemenations of these apis, see
-[IMPLEMENTATIONS.md](IMPLEMENTATIONS.md).
+This repository contains types and clients for several APIs.
 
 ### Custom Metrics API
 
@@ -26,8 +29,8 @@ Kubernetes resources.
 The API is intended to be implemented by monitoring pipeline vendors, on
 top of their metrics storage solutions.
 
-If you want to implement this an API server for this API, please see the
-[kubernetes-incubator/custom-metrics-apiserver](https://github.com/kubernetes-incubator/custom-metrics-apiserver)
+If you want to implement this as an API server for this API, please see the
+[kubernetes-sigs/custom-metrics-apiserver](https://github.com/kubernetes-sigs/custom-metrics-apiserver)
 library, which contains the basic infrastructure required to set up such
 an API server.
 
@@ -38,9 +41,7 @@ Import Path: `k8s.io/metrics/pkg/apis/custom_metrics`.
 This API allows consumers to access resource metrics (CPU and memory) for
 pods and nodes.
 
-The API is implemented by Heapster
-(https://github.com/kubernetes/heapster) and metrics-server
-(https://github.com/kubernetes-incubator/metrics-server).
+The API is implemented by [metrics-server](https://github.com/kubernetes-sigs/metrics-server) and [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter).
 
 Import Path: `k8s.io/metrics/pkg/apis/metrics`.
 
@@ -56,10 +57,9 @@ page](http://kubernetes.io/community/).
 
 You can reach the maintainers of this repository at:
 
-- Slack: #sig-instrumention (on https://kubernetes.slack.com -- get an
-  invite at slack.kubernetes.io)
-- Mailing List:
-  https://groups.google.com/forum/#!forum/kubernetes-sig-instrumentation
+- Slack: [#sig-instrumentation channel](https://kubernetes.slack.com/messages/sig-instrumentation), you can get an
+  invite at [slack.kubernetes.io](https://slack.kubernetes.io).
+- [Mailing List](https://groups.google.com/forum/#!forum/kubernetes-sig-instrumentation)
 
 ### Code of Conduct
 
@@ -69,3 +69,4 @@ Code of Conduct](code-of-conduct.md).
 ### Contibution Guidelines
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for more information.
+

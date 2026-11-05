@@ -21,11 +21,12 @@ import (
 	"testing"
 
 	api "k8s.io/kubernetes/pkg/apis/core"
-	netsets "k8s.io/kubernetes/pkg/util/net/sets"
+	utilnet "k8s.io/utils/net"
 )
 
 func TestGetLoadBalancerSourceRanges(t *testing.T) {
 	checkError := func(v string) {
+		t.Helper()
 		annotations := make(map[string]string)
 		annotations[api.AnnotationLoadBalancerSourceRangesKey] = v
 		svc := api.Service{}
@@ -48,18 +49,19 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 	checkError("10.0.0.1/32, ")
 	checkError("10.0.0.1")
 
-	checkOK := func(v string) netsets.IPNet {
+	checkOK := func(v string) utilnet.IPNetSet {
+		t.Helper()
 		annotations := make(map[string]string)
 		annotations[api.AnnotationLoadBalancerSourceRangesKey] = v
 		svc := api.Service{}
 		svc.Annotations = annotations
-		cidrs, err := GetLoadBalancerSourceRanges(&svc)
+		_, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
 		svc = api.Service{}
 		svc.Spec.LoadBalancerSourceRanges = strings.Split(v, ",")
-		cidrs, err = GetLoadBalancerSourceRanges(&svc)
+		cidrs, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
@@ -112,7 +114,8 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 
 func TestAllowAll(t *testing.T) {
 	checkAllowAll := func(allowAll bool, cidrs ...string) {
-		ipnets, err := netsets.ParseIPNets(cidrs...)
+		t.Helper()
+		ipnets, err := utilnet.ParseIPNets(cidrs...)
 		if err != nil {
 			t.Errorf("Unexpected error parsing cidrs: %v", cidrs)
 		}
@@ -129,8 +132,53 @@ func TestAllowAll(t *testing.T) {
 	checkAllowAll(true, "192.168.0.1/32", "0.0.0.0/0")
 }
 
+func TestExternallyAccessible(t *testing.T) {
+	checkExternallyAccessible := func(expect bool, service *api.Service) {
+		t.Helper()
+		res := ExternallyAccessible(service)
+		if res != expect {
+			t.Errorf("Expected ExternallyAccessible = %v, got %v", expect, res)
+		}
+	}
+
+	checkExternallyAccessible(false, &api.Service{})
+	checkExternallyAccessible(false, &api.Service{
+		Spec: api.ServiceSpec{
+			Type: api.ServiceTypeClusterIP,
+		},
+	})
+	checkExternallyAccessible(true, &api.Service{
+		Spec: api.ServiceSpec{
+			Type:        api.ServiceTypeClusterIP,
+			ExternalIPs: []string{"1.2.3.4"},
+		},
+	})
+	checkExternallyAccessible(true, &api.Service{
+		Spec: api.ServiceSpec{
+			Type: api.ServiceTypeLoadBalancer,
+		},
+	})
+	checkExternallyAccessible(true, &api.Service{
+		Spec: api.ServiceSpec{
+			Type: api.ServiceTypeNodePort,
+		},
+	})
+	checkExternallyAccessible(false, &api.Service{
+		Spec: api.ServiceSpec{
+			Type: api.ServiceTypeExternalName,
+		},
+	})
+	checkExternallyAccessible(false, &api.Service{
+		Spec: api.ServiceSpec{
+			Type:        api.ServiceTypeExternalName,
+			ExternalIPs: []string{"1.2.3.4"},
+		},
+	})
+}
+
 func TestRequestsOnlyLocalTraffic(t *testing.T) {
 	checkRequestsOnlyLocalTraffic := func(requestsOnlyLocalTraffic bool, service *api.Service) {
+		t.Helper()
 		res := RequestsOnlyLocalTraffic(service)
 		if res != requestsOnlyLocalTraffic {
 			t.Errorf("Expected requests OnlyLocal traffic = %v, got %v",
@@ -151,32 +199,33 @@ func TestRequestsOnlyLocalTraffic(t *testing.T) {
 	})
 	checkRequestsOnlyLocalTraffic(false, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeNodePort,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeCluster,
+			Type:                  api.ServiceTypeNodePort,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(true, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeNodePort,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeLocal,
+			Type:                  api.ServiceTypeNodePort,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(false, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeCluster,
+			Type:                  api.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(true, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeLocal,
+			Type:                  api.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 }
 
 func TestNeedsHealthCheck(t *testing.T) {
 	checkNeedsHealthCheck := func(needsHealthCheck bool, service *api.Service) {
+		t.Helper()
 		res := NeedsHealthCheck(service)
 		if res != needsHealthCheck {
 			t.Errorf("Expected needs health check = %v, got %v",
@@ -191,26 +240,26 @@ func TestNeedsHealthCheck(t *testing.T) {
 	})
 	checkNeedsHealthCheck(false, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeNodePort,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeCluster,
+			Type:                  api.ServiceTypeNodePort,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkNeedsHealthCheck(false, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeNodePort,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeLocal,
+			Type:                  api.ServiceTypeNodePort,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 	checkNeedsHealthCheck(false, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeCluster,
+			Type:                  api.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkNeedsHealthCheck(true, &api.Service{
 		Spec: api.ServiceSpec{
-			Type: api.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyTypeLocal,
+			Type:                  api.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: api.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 }

@@ -17,23 +17,26 @@ limitations under the License.
 package factory
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"path"
 	"path/filepath"
 	"testing"
 
-	"github.com/coreos/etcd/integration"
-	"github.com/coreos/etcd/pkg/transport"
-	"golang.org/x/net/context"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/server/v3/embed"
+	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 
-	apitesting "k8s.io/apimachinery/pkg/api/testing"
+	apitesting "k8s.io/apimachinery/pkg/api/apitesting"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
-	"k8s.io/apiserver/pkg/storage/etcd/testing/testingcert"
+	"k8s.io/apiserver/pkg/storage/etcd3/testing/testingcert"
+	"k8s.io/apiserver/pkg/storage/etcd3/testserver"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 )
 
@@ -42,8 +45,8 @@ var codecs = serializer.NewCodecFactory(scheme)
 
 func init() {
 	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
-	example.AddToScheme(scheme)
-	examplev1.AddToScheme(scheme)
+	utilruntime.Must(example.AddToScheme(scheme))
+	utilruntime.Must(examplev1.AddToScheme(scheme))
 }
 
 func TestTLSConnection(t *testing.T) {
@@ -52,32 +55,37 @@ func TestTLSConnection(t *testing.T) {
 	certFile, keyFile, caFile := configureTLSCerts(t)
 	defer os.RemoveAll(filepath.Dir(certFile))
 
-	tlsInfo := &transport.TLSInfo{
-		CertFile: certFile,
-		KeyFile:  keyFile,
-		CAFile:   caFile,
-	}
-
-	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{
-		Size:      1,
-		ClientTLS: tlsInfo,
+	client := testserver.RunEtcd(t, func(etcdConfig *embed.Config) {
+		// override server config to be TLS-enabled
+		etcdConfig.ClientTLSInfo = transport.TLSInfo{
+			CertFile:      certFile,
+			KeyFile:       keyFile,
+			TrustedCAFile: caFile,
+		}
+		for i := range etcdConfig.ListenClientUrls {
+			etcdConfig.ListenClientUrls[i].Scheme = "https"
+		}
+		for i := range etcdConfig.AdvertiseClientUrls {
+			etcdConfig.AdvertiseClientUrls[i].Scheme = "https"
+		}
 	})
-	defer cluster.Terminate(t)
-
 	cfg := storagebackend.Config{
-		Type:       storagebackend.StorageTypeETCD3,
-		ServerList: []string{cluster.Members[0].GRPCAddr()},
-		CertFile:   certFile,
-		KeyFile:    keyFile,
-		CAFile:     caFile,
-		Codec:      codec,
+		Type: storagebackend.StorageTypeETCD3,
+		Transport: storagebackend.TransportConfig{
+			ServerList:     client.Endpoints(),
+			CertFile:       certFile,
+			KeyFile:        keyFile,
+			TrustedCAFile:  caFile,
+			TracerProvider: noopoteltrace.NewTracerProvider(),
+		},
+		Codec: codec,
 	}
-	storage, destroyFunc, err := newETCD3Storage(cfg)
+	storage, destroyFunc, err := newETCD3Storage(*cfg.ForResource(schema.GroupResource{Resource: "pods"}), nil, nil, nil, "/pods")
 	defer destroyFunc()
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = storage.Create(context.TODO(), "/abc", &example.Pod{}, nil, 0)
+	err = storage.Create(context.TODO(), "/pods/abc", &example.Pod{}, nil, 0)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -85,20 +93,20 @@ func TestTLSConnection(t *testing.T) {
 
 func configureTLSCerts(t *testing.T) (certFile, keyFile, caFile string) {
 	baseDir := os.TempDir()
-	tempDir, err := ioutil.TempDir(baseDir, "etcd_certificates")
+	tempDir, err := os.MkdirTemp(baseDir, "etcd_certificates")
 	if err != nil {
 		t.Fatal(err)
 	}
 	certFile = path.Join(tempDir, "etcdcert.pem")
-	if err := ioutil.WriteFile(certFile, []byte(testingcert.CertFileContent), 0644); err != nil {
+	if err := os.WriteFile(certFile, []byte(testingcert.CertFileContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	keyFile = path.Join(tempDir, "etcdkey.pem")
-	if err := ioutil.WriteFile(keyFile, []byte(testingcert.KeyFileContent), 0644); err != nil {
+	if err := os.WriteFile(keyFile, []byte(testingcert.KeyFileContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	caFile = path.Join(tempDir, "ca.pem")
-	if err := ioutil.WriteFile(caFile, []byte(testingcert.CAFileContent), 0644); err != nil {
+	if err := os.WriteFile(caFile, []byte(testingcert.CAFileContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	return certFile, keyFile, caFile

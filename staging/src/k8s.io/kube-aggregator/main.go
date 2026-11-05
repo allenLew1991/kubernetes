@@ -17,36 +17,24 @@ limitations under the License.
 package main
 
 import (
-	"flag"
 	"os"
-	"runtime"
 
-	"github.com/golang/glog"
-
-	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/apiserver/pkg/server/signals"
+	"k8s.io/component-base/cli"
 	"k8s.io/kube-aggregator/pkg/cmd/server"
 
 	// force compilation of packages we'll later rely upon
 	_ "k8s.io/kube-aggregator/pkg/apis/apiregistration/install"
 	_ "k8s.io/kube-aggregator/pkg/apis/apiregistration/validation"
-	_ "k8s.io/kube-aggregator/pkg/client/clientset_generated/internalclientset"
-	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/internalversion"
+	_ "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1beta1"
 )
 
 func main() {
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if len(os.Getenv("GOMAXPROCS")) == 0 {
-		runtime.GOMAXPROCS(runtime.NumCPU())
-	}
-
-	stopCh := genericapiserver.SetupSignalHandler()
-	cmd := server.NewCommandStartAggregator(os.Stdout, os.Stderr, stopCh)
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
-	if err := cmd.Execute(); err != nil {
-		glog.Fatal(err)
-	}
+	ctx := signals.SetupSignalContext()
+	options := server.NewDefaultOptions(os.Stdout, os.Stderr)
+	cmd := server.NewCommandStartAggregator(ctx, options)
+	code := cli.Run(cmd)
+	os.Exit(code)
 }

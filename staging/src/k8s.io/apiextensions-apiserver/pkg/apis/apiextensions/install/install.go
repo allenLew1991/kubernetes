@@ -17,27 +17,19 @@ limitations under the License.
 package install
 
 import (
+	v1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	v1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/apimachinery/pkg/apimachinery/announced"
-	"k8s.io/apimachinery/pkg/apimachinery/registered"
+	v1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	v1beta1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
 // Install registers the API group and adds types to a scheme
-func Install(groupFactoryRegistry announced.APIGroupFactoryRegistry, registry *registered.APIRegistrationManager, scheme *runtime.Scheme) {
-	if err := announced.NewGroupMetaFactory(
-		&announced.GroupMetaFactoryArgs{
-			GroupName:                  apiextensions.GroupName,
-			RootScopedKinds:            sets.NewString("CustomResourceDefinition"),
-			VersionPreferenceOrder:     []string{v1beta1.SchemeGroupVersion.Version},
-			AddInternalObjectsToScheme: apiextensions.AddToScheme,
-		},
-		announced.VersionToSchemeFunc{
-			v1beta1.SchemeGroupVersion.Version: v1beta1.AddToScheme,
-		},
-	).Announce(groupFactoryRegistry).RegisterAndEnable(registry, scheme); err != nil {
-		panic(err)
-	}
+func Install(scheme *runtime.Scheme) {
+	utilruntime.Must(apiextensions.AddToScheme(scheme))
+	utilruntime.Must(v1beta1conversion.AddToScheme(scheme))
+	utilruntime.Must(v1conversion.AddToScheme(scheme))
+	utilruntime.Must(scheme.SetVersionPriority(v1.SchemeGroupVersion, v1beta1.SchemeGroupVersion))
 }

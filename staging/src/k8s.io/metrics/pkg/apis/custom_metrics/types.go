@@ -22,11 +22,21 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+type MetricIdentifier struct {
+	// name is the name of the given metric
+	Name string
+	// selector represents the label selector that could be used to select
+	// this metric, and will generally just be the selector passed in to
+	// the query used to fetch this metric.
+	// +optional
+	Selector *metav1.LabelSelector
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // a list of values for a given metric for some set of objects
 type MetricValueList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	metav1.ListMeta `json:"metadata,omitempty"`
 
 	// the value of the metric across the described objects
@@ -37,30 +47,45 @@ type MetricValueList struct {
 
 // a metric value for some object
 type MetricValue struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta
 
 	// a reference to the described object
-	DescribedObject ObjectReference `json:"describedObject"`
+	DescribedObject ObjectReference
 
-	// the name of the metric
-	MetricName string `json:"metricName"`
+	Metric MetricIdentifier
 
 	// indicates the time at which the metrics were produced
-	Timestamp metav1.Time `json:"timestamp"`
+	Timestamp metav1.Time
 
 	// indicates the window ([Timestamp-Window, Timestamp]) from
 	// which these metrics were calculated, when returning rate
 	// metrics calculated from cumulative metrics (or zero for
 	// non-calculated instantaneous metrics).
-	WindowSeconds *int64 `json:"window,omitempty"`
+	WindowSeconds *int64
 
 	// the value of the metric for this
-	Value resource.Quantity `json:"value"`
+	Value resource.Quantity
 }
 
 // allObjects is a wildcard used to select metrics
 // for all objects matching the given label selector
 const AllObjects = "*"
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// MetricListOptions is used to select metrics by their label selectors
+type MetricListOptions struct {
+	metav1.TypeMeta
+
+	// A selector to restrict the list of returned objects by their labels.
+	// Defaults to everything.
+	// +optional
+	LabelSelector string
+
+	// A selector to restrict the list of returned metrics by their labels
+	// +optional
+	MetricLabelSelector string
+}
 
 // NOTE: ObjectReference is copied from k8s.io/kubernetes/pkg/api/types.go. We
 // cannot depend on k8s.io/kubernetes/pkg/api because that creates cyclic

@@ -17,37 +17,37 @@ limitations under the License.
 package validation
 
 import (
-	"reflect"
+	"regexp"
 
+	policyapiv1beta1 "k8s.io/api/policy/v1beta1"
 	unversionedvalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	appsvalidation "k8s.io/kubernetes/pkg/apis/apps/validation"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
-	extensionsvalidation "k8s.io/kubernetes/pkg/apis/extensions/validation"
 	"k8s.io/kubernetes/pkg/apis/policy"
 )
 
-func ValidatePodDisruptionBudget(pdb *policy.PodDisruptionBudget) field.ErrorList {
-	allErrs := ValidatePodDisruptionBudgetSpec(pdb.Spec, field.NewPath("spec"))
-	allErrs = append(allErrs, ValidatePodDisruptionBudgetStatus(pdb.Status, field.NewPath("status"))...)
+var supportedUnhealthyPodEvictionPolicies = sets.NewString(
+	string(policy.IfHealthyBudget),
+	string(policy.AlwaysAllow),
+)
+
+type PodDisruptionBudgetValidationOptions struct {
+	AllowInvalidLabelValueInSelector bool
+}
+
+// ValidatePodDisruptionBudget validates a PodDisruptionBudget and returns an ErrorList
+// with any errors.
+func ValidatePodDisruptionBudget(pdb *policy.PodDisruptionBudget, opts PodDisruptionBudgetValidationOptions) field.ErrorList {
+	allErrs := ValidatePodDisruptionBudgetSpec(pdb.Spec, opts, field.NewPath("spec"))
 	return allErrs
 }
 
-func ValidatePodDisruptionBudgetUpdate(pdb, oldPdb *policy.PodDisruptionBudget) field.ErrorList {
-	allErrs := field.ErrorList{}
-
-	restoreGeneration := pdb.Generation
-	pdb.Generation = oldPdb.Generation
-
-	if !reflect.DeepEqual(pdb.Spec, oldPdb.Spec) {
-		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "updates to poddisruptionbudget spec are forbidden."))
-	}
-	allErrs = append(allErrs, ValidatePodDisruptionBudgetStatus(pdb.Status, field.NewPath("status"))...)
-
-	pdb.Generation = restoreGeneration
-	return allErrs
-}
-
-func ValidatePodDisruptionBudgetSpec(spec policy.PodDisruptionBudgetSpec, fldPath *field.Path) field.ErrorList {
+// ValidatePodDisruptionBudgetSpec validates a PodDisruptionBudgetSpec and returns an ErrorList
+// with any errors.
+func ValidatePodDisruptionBudgetSpec(spec policy.PodDisruptionBudgetSpec, opts PodDisruptionBudgetValidationOptions, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
 	if spec.MinAvailable != nil && spec.MaxUnavailable != nil {
@@ -55,25 +55,59 @@ func ValidatePodDisruptionBudgetSpec(spec policy.PodDisruptionBudgetSpec, fldPat
 	}
 
 	if spec.MinAvailable != nil {
-		allErrs = append(allErrs, extensionsvalidation.ValidatePositiveIntOrPercent(*spec.MinAvailable, fldPath.Child("minAvailable"))...)
-		allErrs = append(allErrs, extensionsvalidation.IsNotMoreThan100Percent(*spec.MinAvailable, fldPath.Child("minAvailable"))...)
+		allErrs = append(allErrs, appsvalidation.ValidatePositiveIntOrPercent(*spec.MinAvailable, fldPath.Child("minAvailable"))...)
+		allErrs = append(allErrs, appsvalidation.IsNotMoreThan100Percent(*spec.MinAvailable, fldPath.Child("minAvailable"))...)
 	}
 
 	if spec.MaxUnavailable != nil {
-		allErrs = append(allErrs, extensionsvalidation.ValidatePositiveIntOrPercent(*spec.MaxUnavailable, fldPath.Child("maxUnavailable"))...)
-		allErrs = append(allErrs, extensionsvalidation.IsNotMoreThan100Percent(*spec.MaxUnavailable, fldPath.Child("maxUnavailable"))...)
+		allErrs = append(allErrs, appsvalidation.ValidatePositiveIntOrPercent(*spec.MaxUnavailable, fldPath.Child("maxUnavailable"))...)
+		allErrs = append(allErrs, appsvalidation.IsNotMoreThan100Percent(*spec.MaxUnavailable, fldPath.Child("maxUnavailable"))...)
 	}
 
-	allErrs = append(allErrs, unversionedvalidation.ValidateLabelSelector(spec.Selector, fldPath.Child("selector"))...)
+	labelSelectorValidationOptions := unversionedvalidation.LabelSelectorValidationOptions{AllowInvalidLabelValueInSelector: opts.AllowInvalidLabelValueInSelector}
+
+	allErrs = append(allErrs, unversionedvalidation.ValidateLabelSelector(spec.Selector, labelSelectorValidationOptions, fldPath.Child("selector"))...)
+
+	if spec.UnhealthyPodEvictionPolicy != nil && !supportedUnhealthyPodEvictionPolicies.Has(string(*spec.UnhealthyPodEvictionPolicy)) {
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("unhealthyPodEvictionPolicy"), *spec.UnhealthyPodEvictionPolicy, supportedUnhealthyPodEvictionPolicies.List()))
+	}
 
 	return allErrs
 }
 
-func ValidatePodDisruptionBudgetStatus(status policy.PodDisruptionBudgetStatus, fldPath *field.Path) field.ErrorList {
+// ValidatePodDisruptionBudgetStatusUpdate validates a PodDisruptionBudgetStatus and returns an ErrorList
+// with any errors.
+func ValidatePodDisruptionBudgetStatusUpdate(status, oldStatus policy.PodDisruptionBudgetStatus, fldPath *field.Path, apiVersion schema.GroupVersion) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.PodDisruptionsAllowed), fldPath.Child("podDisruptionsAllowed"))...)
+	allErrs = append(allErrs, unversionedvalidation.ValidateConditions(status.Conditions, fldPath.Child("conditions"))...)
+	// Don't run other validations for v1beta1 since we don't want to introduce
+	// new validations retroactively.
+	if apiVersion == policyapiv1beta1.SchemeGroupVersion {
+		return allErrs
+	}
+	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.DisruptionsAllowed), fldPath.Child("disruptionsAllowed"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.CurrentHealthy), fldPath.Child("currentHealthy"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.DesiredHealthy), fldPath.Child("desiredHealthy"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.ExpectedPods), fldPath.Child("expectedPods"))...)
 	return allErrs
+}
+
+const sysctlPatternSegmentFmt string = "([a-z0-9][-_a-z0-9]*)?[a-z0-9*]"
+
+// SysctlContainSlashPatternFmt is a regex that contains a slash used for matching valid sysctl patterns.
+const SysctlContainSlashPatternFmt string = "(" + apivalidation.SysctlSegmentFmt + "[\\./])*" + sysctlPatternSegmentFmt
+
+var sysctlContainSlashPatternRegexp = regexp.MustCompile("^" + SysctlContainSlashPatternFmt + "$")
+
+// IsValidSysctlPattern checks if name is a valid sysctl pattern.
+// i.e. matches sysctlContainSlashPatternRegexp.
+// More info:
+//
+//	https://man7.org/linux/man-pages/man8/sysctl.8.html
+//	https://man7.org/linux/man-pages/man5/sysctl.d.5.html
+func IsValidSysctlPattern(name string) bool {
+	if len(name) > apivalidation.SysctlMaxLength {
+		return false
+	}
+	return sysctlContainSlashPatternRegexp.MatchString(name)
 }

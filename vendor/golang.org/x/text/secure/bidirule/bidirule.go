@@ -10,6 +10,7 @@ package bidirule
 
 import (
 	"errors"
+	"sync"
 	"unicode/utf8"
 
 	"golang.org/x/text/transform"
@@ -155,6 +156,7 @@ func DirectionString(s string) bidi.Direction {
 		e, sz := bidi.LookupString(s[i:])
 		if sz == 0 {
 			i++
+			continue
 		}
 		c := e.Class()
 		if c == bidi.R || c == bidi.AL || c == bidi.AN {
@@ -202,13 +204,6 @@ func (t *Transformer) isRTL() bool {
 	return t.seen&isRTL != 0
 }
 
-func (t *Transformer) isFinal() bool {
-	if !t.isRTL() {
-		return true
-	}
-	return t.state == ruleLTRFinal || t.state == ruleRTLFinal || t.state == ruleInitial
-}
-
 // Reset implements transform.Transformer.
 func (t *Transformer) Reset() { *t = Transformer{} }
 
@@ -252,8 +247,9 @@ func (t *Transformer) Span(src []byte, atEOF bool) (n int, err error) {
 // Precomputing the ASCII values decreases running time for the ASCII fast path
 // by about 30%.
 var asciiTable [128]bidi.Properties
+var asciiTableOnce sync.Once
 
-func init() {
+func initASCIITable() {
 	for i := range asciiTable {
 		p, _ := bidi.LookupRune(rune(i))
 		asciiTable[i] = p
@@ -261,6 +257,8 @@ func init() {
 }
 
 func (t *Transformer) advance(s []byte) (n int, ok bool) {
+	asciiTableOnce.Do(initASCIITable)
+
 	var e bidi.Properties
 	var sz int
 	for n < len(s) {
@@ -303,6 +301,8 @@ func (t *Transformer) advance(s []byte) (n int, ok bool) {
 }
 
 func (t *Transformer) advanceString(s string) (n int, ok bool) {
+	asciiTableOnce.Do(initASCIITable)
+
 	var e bidi.Properties
 	var sz int
 	for n < len(s) {
@@ -339,4 +339,8 @@ func (t *Transformer) advanceString(s string) (n int, ok bool) {
 		n += sz
 	}
 	return n, true
+}
+
+func (t *Transformer) isFinal() bool {
+	return t.state == ruleLTRFinal || t.state == ruleRTLFinal || t.state == ruleInitial
 }

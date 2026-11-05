@@ -19,68 +19,21 @@ package removeall
 import (
 	"errors"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	utiltesting "k8s.io/client-go/util/testing"
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/mount-utils"
 )
 
-type fakeMounter struct{}
-
-var _ mount.Interface = &fakeMounter{}
-
-func (mounter *fakeMounter) Mount(source string, target string, fstype string, options []string) error {
-	return errors.New("not implemented")
+type fakeMounter struct {
+	mount.FakeMounter
 }
 
-func (mounter *fakeMounter) Unmount(target string) error {
-	return errors.New("not implemented")
-}
-
-func (mounter *fakeMounter) List() ([]mount.MountPoint, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (mounter fakeMounter) DeviceOpened(pathname string) (bool, error) {
-	return false, errors.New("not implemented")
-}
-
-func (mounter *fakeMounter) PathIsDevice(pathname string) (bool, error) {
-	return false, errors.New("not implemented")
-}
-
-func (mounter *fakeMounter) GetDeviceNameFromMount(mountPath, pluginDir string) (string, error) {
-	return "", errors.New("not implemented")
-}
-
-func (mounter *fakeMounter) IsMountPointMatch(mp mount.MountPoint, dir string) bool {
-	return mp.Path == dir
-}
-
-func (mounter *fakeMounter) IsNotMountPoint(dir string) (bool, error) {
-	return mount.IsNotMountPoint(mounter, dir)
-}
-
-func (mounter *fakeMounter) GetFileType(pathname string) (mount.FileType, error) {
-	return mount.FileType("fake"), errors.New("not implemented")
-}
-
-func (mounter *fakeMounter) MakeDir(pathname string) error {
-	return nil
-}
-
-func (mounter *fakeMounter) MakeFile(pathname string) error {
-	return nil
-}
-
-func (mounter *fakeMounter) ExistsPath(pathname string) bool {
-	return true
-}
-
-func (mounter *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
-	name := path.Base(file)
+// IsLikelyNotMountPoint overrides mount.FakeMounter.IsLikelyNotMountPoint for our use.
+func (f *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
+	name := filepath.Base(file)
 	if strings.HasPrefix(name, "mount") {
 		return false, nil
 	}
@@ -88,10 +41,6 @@ func (mounter *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
 		return false, errors.New("mock error")
 	}
 	return true, nil
-}
-
-func (mounter *fakeMounter) MakeRShared(path string) error {
-	return nil
 }
 
 func TestRemoveAllOneFilesystem(t *testing.T) {
@@ -167,11 +116,11 @@ func TestRemoveAllOneFilesystem(t *testing.T) {
 		for _, item := range test.items {
 			if strings.HasSuffix(item, "/") {
 				item = strings.TrimRight(item, "/")
-				if err = os.Mkdir(path.Join(tmpDir, item), 0777); err != nil {
+				if err = os.Mkdir(filepath.Join(tmpDir, item), 0777); err != nil {
 					t.Fatalf("error creating %s: %v", item, err)
 				}
 			} else {
-				f, err := os.Create(path.Join(tmpDir, item))
+				f, err := os.Create(filepath.Join(tmpDir, item))
 				if err != nil {
 					t.Fatalf("error creating %s: %v", item, err)
 				}
@@ -181,6 +130,126 @@ func TestRemoveAllOneFilesystem(t *testing.T) {
 
 		mounter := &fakeMounter{}
 		err = RemoveAllOneFilesystem(mounter, tmpDir)
+		if err == nil && test.expectError {
+			t.Errorf("test %q failed: expected error and got none", test.name)
+		}
+		if err != nil && !test.expectError {
+			t.Errorf("test %q failed: unexpected error: %v", test.name, err)
+		}
+	}
+}
+
+func TestRemoveDirsOneFilesystem(t *testing.T) {
+	tests := []struct {
+		name string
+		// Items of the test directory. Directories end with "/".
+		// Directories starting with "mount" are considered to be mount points.
+		// Directories starting with "err" will cause an error in
+		// IsLikelyNotMountPoint.
+		items       []string
+		expectError bool
+	}{
+		{
+			"empty dir",
+			[]string{},
+			false,
+		},
+		{
+			"non-mount-no-files",
+			[]string{
+				"dir/",
+				"dir/subdir1/",
+				"dir2/",
+				"dir2/subdir2/",
+				"dir2/subdir2/subdir3/",
+				"dir3/",
+			},
+			false,
+		},
+		{
+			"non-mount-with-files",
+			[]string{
+				"dir/",
+				"dir/file",
+				"dir2/",
+				"file2",
+			},
+			true,
+		},
+		{
+			"mount-no-files",
+			[]string{
+				"dir/",
+				"dir/subdir1/",
+				"dir2/",
+				"dir2/subdir2/",
+				"dir2/subdir2/subdir3/",
+				"mount/",
+				"mount/dir3/",
+			},
+			true,
+		},
+		{
+			"mount-with-files",
+			[]string{
+				"dir/",
+				"dir/file",
+				"dir2/",
+				"file2",
+				"mount/",
+				"mount/file3",
+			},
+			true,
+		},
+		{
+			"innermount",
+			[]string{
+				"dir/",
+				"dir/subdir1/",
+				"dir/dir2/",
+				"dir/dir2/subdir2/",
+				"dir/dir2/mount/",
+				"dir/dir2/mount/subdir3/",
+			},
+			true,
+		},
+		{
+			"error",
+			[]string{
+				"dir/",
+				"dir/subdir1/",
+				"dir2/",
+				"err/",
+				"err/subdir3/",
+			},
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		tmpDir, err := utiltesting.MkTmpdir("removeall-" + test.name + "-")
+		if err != nil {
+			t.Fatalf("Can't make a tmp dir: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+		// Create the directory structure
+		for _, item := range test.items {
+			if strings.HasSuffix(item, "/") {
+				item = strings.TrimRight(item, "/")
+				if err = os.Mkdir(filepath.Join(tmpDir, item), 0777); err != nil {
+					t.Fatalf("error creating %s: %v", item, err)
+				}
+			} else {
+				f, err := os.Create(filepath.Join(tmpDir, item))
+				if err != nil {
+					t.Fatalf("error creating %s: %v", item, err)
+				}
+				f.Close()
+			}
+		}
+
+		mounter := &fakeMounter{}
+		err = RemoveDirsOneFilesystem(mounter, tmpDir)
 		if err == nil && test.expectError {
 			t.Errorf("test %q failed: expected error and got none", test.name)
 		}

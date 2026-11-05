@@ -17,11 +17,15 @@ limitations under the License.
 package pod
 
 import (
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"context"
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
@@ -32,10 +36,16 @@ type MirrorClient interface {
 	// pod or returns an error.  The mirror pod will have the same annotations
 	// as the given pod as well as an extra annotation containing the hash of
 	// the static pod.
-	CreateMirrorPod(pod *v1.Pod) error
+	CreateMirrorPod(ctx context.Context, pod *v1.Pod) error
 	// DeleteMirrorPod deletes the mirror pod with the given full name from
 	// the API server or returns an error.
-	DeleteMirrorPod(podFullName string) error
+	DeleteMirrorPod(ctx context.Context, podFullName string, uid *types.UID) (bool, error)
+}
+
+// nodeGetter is a subset of NodeLister, simplified for testing.
+type nodeGetter interface {
+	// Get retrieves the Node for a given name.
+	Get(name string) (*v1.Node, error)
 }
 
 // basicMirrorClient is a functional MirrorClient.  Mirror pods are stored in
@@ -43,14 +53,20 @@ type MirrorClient interface {
 // pods.
 type basicMirrorClient struct {
 	apiserverClient clientset.Interface
+	nodeGetter      nodeGetter
+	nodeName        string
 }
 
 // NewBasicMirrorClient returns a new MirrorClient.
-func NewBasicMirrorClient(apiserverClient clientset.Interface) MirrorClient {
-	return &basicMirrorClient{apiserverClient: apiserverClient}
+func NewBasicMirrorClient(apiserverClient clientset.Interface, nodeName string, nodeGetter nodeGetter) MirrorClient {
+	return &basicMirrorClient{
+		apiserverClient: apiserverClient,
+		nodeName:        nodeName,
+		nodeGetter:      nodeGetter,
+	}
 }
 
-func (mc *basicMirrorClient) CreateMirrorPod(pod *v1.Pod) error {
+func (mc *basicMirrorClient) CreateMirrorPod(ctx context.Context, pod *v1.Pod) error {
 	if mc.apiserverClient == nil {
 		return nil
 	}
@@ -63,8 +79,25 @@ func (mc *basicMirrorClient) CreateMirrorPod(pod *v1.Pod) error {
 	}
 	hash := getPodHash(pod)
 	copyPod.Annotations[kubetypes.ConfigMirrorAnnotationKey] = hash
-	apiPod, err := mc.apiserverClient.CoreV1().Pods(copyPod.Namespace).Create(&copyPod)
-	if err != nil && errors.IsAlreadyExists(err) {
+
+	// With the MirrorPodNodeRestriction feature, mirror pods are required to have an owner reference
+	// to the owning node.
+	// See https://git.k8s.io/enhancements/keps/sig-auth/1314-node-restriction-pods/README.md
+	nodeUID, err := mc.getNodeUID()
+	if err != nil {
+		return fmt.Errorf("failed to get node UID: %v", err)
+	}
+	controller := true
+	copyPod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "Node",
+		Name:       mc.nodeName,
+		UID:        nodeUID,
+		Controller: &controller,
+	}}
+
+	apiPod, err := mc.apiserverClient.CoreV1().Pods(copyPod.Namespace).Create(ctx, &copyPod, metav1.CreateOptions{})
+	if err != nil && apierrors.IsAlreadyExists(err) {
 		// Check if the existing pod is the same as the pod we want to create.
 		if h, ok := apiPod.Annotations[kubetypes.ConfigMirrorAnnotationKey]; ok && h == hash {
 			return nil
@@ -73,31 +106,52 @@ func (mc *basicMirrorClient) CreateMirrorPod(pod *v1.Pod) error {
 	return err
 }
 
-func (mc *basicMirrorClient) DeleteMirrorPod(podFullName string) error {
+// DeleteMirrorPod deletes a mirror pod.
+// It takes the full name of the pod and optionally a UID.  If the UID
+// is non-nil, the pod is deleted only if its UID matches the supplied UID.
+// It returns whether the pod was actually deleted, and any error returned
+// while parsing the name of the pod.
+// Non-existence of the pod or UID mismatch is not treated as an error; the
+// routine simply returns false in that case.
+func (mc *basicMirrorClient) DeleteMirrorPod(ctx context.Context, podFullName string, uid *types.UID) (bool, error) {
 	if mc.apiserverClient == nil {
-		return nil
+		return false, nil
 	}
+	logger := klog.FromContext(ctx)
 	name, namespace, err := kubecontainer.ParsePodFullName(podFullName)
 	if err != nil {
-		glog.Errorf("Failed to parse a pod full name %q", podFullName)
-		return err
+		logger.Error(err, "Failed to parse a pod full name", "podFullName", podFullName)
+		return false, err
 	}
-	glog.V(2).Infof("Deleting a mirror pod %q", podFullName)
-	// TODO(random-liu): Delete the mirror pod with uid precondition in mirror pod manager
-	if err := mc.apiserverClient.CoreV1().Pods(namespace).Delete(name, metav1.NewDeleteOptions(0)); err != nil && !errors.IsNotFound(err) {
-		glog.Errorf("Failed deleting a mirror pod %q: %v", podFullName, err)
+
+	var uidValue types.UID
+	if uid != nil {
+		uidValue = *uid
 	}
-	return nil
+	logger.V(2).Info("Deleting a mirror pod", "pod", klog.KRef(namespace, name), "podUID", uidValue)
+
+	var GracePeriodSeconds int64
+	if err := mc.apiserverClient.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &GracePeriodSeconds, Preconditions: &metav1.Preconditions{UID: uid}}); err != nil {
+		// Unfortunately, there's no generic error for failing a precondition
+		if !(apierrors.IsNotFound(err) || apierrors.IsConflict(err)) {
+			// We should return the error here, but historically this routine does
+			// not return an error unless it can't parse the pod name
+			logger.Error(err, "Failed deleting a mirror pod", "pod", klog.KRef(namespace, name))
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
-func IsStaticPod(pod *v1.Pod) bool {
-	source, err := kubetypes.GetPodSource(pod)
-	return err == nil && source != kubetypes.ApiserverSource
-}
-
-func IsMirrorPod(pod *v1.Pod) bool {
-	_, ok := pod.Annotations[kubetypes.ConfigMirrorAnnotationKey]
-	return ok
+func (mc *basicMirrorClient) getNodeUID() (types.UID, error) {
+	node, err := mc.nodeGetter.Get(mc.nodeName)
+	if err != nil {
+		return "", err
+	}
+	if node.UID == "" {
+		return "", fmt.Errorf("UID unset for node %s", mc.nodeName)
+	}
+	return node.UID, nil
 }
 
 func getHashFromMirrorPod(pod *v1.Pod) (string, bool) {

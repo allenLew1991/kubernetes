@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/conversion/queryparams"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 )
 
 type namedString string
@@ -70,6 +71,7 @@ type childStructs struct {
 	Follow         bool         `json:"follow,omitempty"`
 	Previous       bool         `json:"previous,omitempty"`
 	SinceSeconds   *int64       `json:"sinceSeconds,omitempty"`
+	TailLines      *int64       `json:"tailLines,omitempty"`
 	SinceTime      *metav1.Time `json:"sinceTime,omitempty"`
 	EmptyTime      *metav1.Time `json:"emptyTime"`
 	NonPointerTime metav1.Time  `json:"nonPointerTime"`
@@ -99,6 +101,7 @@ func validateResult(t *testing.T, input interface{}, actual, expected url.Values
 
 func TestConvert(t *testing.T) {
 	sinceSeconds := int64(123)
+	tailLines := int64(0)
 	sinceTime := metav1.Date(2000, 1, 1, 12, 34, 56, 0, time.UTC)
 
 	tests := []struct {
@@ -159,20 +162,20 @@ func TestConvert(t *testing.T) {
 		},
 		{
 			input: &baz{
-				Ptr:  intp(5),
-				Bptr: boolp(true),
+				Ptr:  ptr.To(5),
+				Bptr: ptr.To(true),
 			},
 			expected: url.Values{"ptr": {"5"}, "bptr": {"true"}},
 		},
 		{
 			input: &baz{
-				Bptr: boolp(true),
+				Bptr: ptr.To(true),
 			},
 			expected: url.Values{"ptr": {""}, "bptr": {"true"}},
 		},
 		{
 			input: &baz{
-				Ptr: intp(5),
+				Ptr: ptr.To(5),
 			},
 			expected: url.Values{"ptr": {"5"}},
 		},
@@ -182,6 +185,7 @@ func TestConvert(t *testing.T) {
 				Follow:         true,
 				Previous:       true,
 				SinceSeconds:   &sinceSeconds,
+				TailLines:      nil,
 				SinceTime:      &sinceTime, // test a custom marshaller
 				EmptyTime:      nil,        // test a nil custom marshaller without omitempty
 				NonPointerTime: sinceTime,
@@ -194,10 +198,11 @@ func TestConvert(t *testing.T) {
 				Follow:         true,
 				Previous:       true,
 				SinceSeconds:   &sinceSeconds,
+				TailLines:      &tailLines,
 				SinceTime:      nil, // test a nil custom marshaller with omitempty
 				NonPointerTime: sinceTime,
 			},
-			expected: url.Values{"container": {"mycontainer"}, "follow": {"true"}, "previous": {"true"}, "sinceSeconds": {"123"}, "emptyTime": {""}, "nonPointerTime": {"2000-01-01T12:34:56Z"}},
+			expected: url.Values{"container": {"mycontainer"}, "follow": {"true"}, "previous": {"true"}, "sinceSeconds": {"123"}, "tailLines": {"0"}, "emptyTime": {""}, "nonPointerTime": {"2000-01-01T12:34:56Z"}},
 		},
 	}
 
@@ -209,7 +214,3 @@ func TestConvert(t *testing.T) {
 		validateResult(t, test.input, result, test.expected)
 	}
 }
-
-func intp(n int) *int { return &n }
-
-func boolp(b bool) *bool { return &b }

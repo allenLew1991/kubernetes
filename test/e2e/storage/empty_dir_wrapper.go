@@ -17,21 +17,25 @@ limitations under the License.
 package storage
 
 import (
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/kubernetes/test/e2e/framework"
-	imageutils "k8s.io/kubernetes/test/utils/image"
-
+	"context"
 	"fmt"
 	"strconv"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/test/e2e/framework"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
+
+	"github.com/onsi/ginkgo/v2"
 )
 
 const (
@@ -55,8 +59,14 @@ const (
 
 var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 	f := framework.NewDefaultFramework("emptydir-wrapper")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	It("should not conflict", func() {
+	/*
+		Release: v1.13
+		Testname: EmptyDir Wrapper Volume, Secret and ConfigMap volumes, no conflict
+		Description: Secret volume and ConfigMap volume is created with data. Pod MUST be able to start with Secret and ConfigMap volumes mounted into the container.
+	*/
+	framework.ConformanceIt("should not conflict", func(ctx context.Context) {
 		name := "emptydir-wrapper-test-" + string(uuid.NewUUID())
 		volumeName := "secret-volume"
 		volumeMountPath := "/etc/secret-volume"
@@ -72,14 +82,26 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 		}
 
 		var err error
-		if secret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(secret); err != nil {
+		if secret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
 			framework.Failf("unable to create test secret %s: %v", secret.Name, err)
 		}
 
-		gitVolumeName := "git-volume"
-		gitVolumeMountPath := "/etc/git-volume"
-		gitURL, gitRepo, gitCleanup := createGitServer(f)
-		defer gitCleanup()
+		configMapVolumeName := "configmap-volume"
+		configMapVolumeMountPath := "/etc/configmap-volume"
+
+		configMap := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace.Name,
+				Name:      name,
+			},
+			BinaryData: map[string][]byte{
+				"data-1": []byte("value-1\n"),
+			},
+		}
+
+		if configMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, configMap, metav1.CreateOptions{}); err != nil {
+			framework.Failf("unable to create test configMap %s: %v", configMap.Name, err)
+		}
 
 		pod := &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -96,11 +118,12 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 						},
 					},
 					{
-						Name: gitVolumeName,
+						Name: configMapVolumeName,
 						VolumeSource: v1.VolumeSource{
-							GitRepo: &v1.GitRepoVolumeSource{
-								Repository: gitURL,
-								Directory:  gitRepo,
+							ConfigMap: &v1.ConfigMapVolumeSource{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: name,
+								},
 							},
 						},
 					},
@@ -108,7 +131,8 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 				Containers: []v1.Container{
 					{
 						Name:  "secret-test",
-						Image: imageutils.GetE2EImage(imageutils.TestWebserver),
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
+						Args:  []string{"test-webserver"},
 						VolumeMounts: []v1.VolumeMount{
 							{
 								Name:      volumeName,
@@ -116,26 +140,29 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 								ReadOnly:  true,
 							},
 							{
-								Name:      gitVolumeName,
-								MountPath: gitVolumeMountPath,
+								Name:      configMapVolumeName,
+								MountPath: configMapVolumeMountPath,
 							},
 						},
 					},
 				},
 			},
 		}
-		pod = f.PodClient().CreateSync(pod)
-
-		defer func() {
-			By("Cleaning up the secret")
-			if err := f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(secret.Name, nil); err != nil {
+		pod = e2epod.NewPodClient(f).CreateSync(ctx, pod)
+		ginkgo.DeferCleanup(func(ctx context.Context) {
+			ginkgo.By("Cleaning up the secret")
+			if err := f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil {
 				framework.Failf("unable to delete secret %v: %v", secret.Name, err)
 			}
-			By("Cleaning up the git vol pod")
-			if err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(pod.Name, metav1.NewDeleteOptions(0)); err != nil {
-				framework.Failf("unable to delete git vol pod %v: %v", pod.Name, err)
+			ginkgo.By("Cleaning up the configmap")
+			if err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(ctx, configMap.Name, metav1.DeleteOptions{}); err != nil {
+				framework.Failf("unable to delete configmap %v: %v", configMap.Name, err)
 			}
-		}()
+			ginkgo.By("Cleaning up the pod")
+			if err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0)); err != nil {
+				framework.Failf("unable to delete pod %v: %v", pod.Name, err)
+			}
+		})
 	})
 
 	// The following two tests check for the problem fixed in #29641.
@@ -155,51 +182,44 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 	// but these cases are harder because tmpfs-based emptyDir
 	// appears to be less prone to the race problem.
 
-	It("should not cause race condition when used for configmaps [Serial] [Slow]", func() {
-		configMapNames := createConfigmapsForRace(f)
-		defer deleteConfigMaps(f, configMapNames)
+	/*
+		Release: v1.13
+		Testname: EmptyDir Wrapper Volume, ConfigMap volumes, no race
+		Description: Create 50 ConfigMaps Volumes and 5 replicas of pod with these ConfigMapvolumes mounted. Pod MUST NOT fail waiting for Volumes.
+	*/
+	framework.ConformanceIt("should not cause race condition when used for configmaps", f.WithSerial(), func(ctx context.Context) {
+		configMapNames := createConfigmapsForRace(ctx, f)
+		ginkgo.DeferCleanup(deleteConfigMaps, f, configMapNames)
 		volumes, volumeMounts := makeConfigMapVolumes(configMapNames)
-		for i := 0; i < wrappedVolumeRaceConfigMapIterationCount; i++ {
-			testNoWrappedVolumeRace(f, volumes, volumeMounts, wrappedVolumeRaceConfigMapPodCount)
+		for range wrappedVolumeRaceConfigMapIterationCount {
+			testNoWrappedVolumeRace(ctx, f, volumes, volumeMounts, wrappedVolumeRaceConfigMapPodCount)
 		}
 	})
 
-	It("should not cause race condition when used for git_repo [Serial] [Slow]", func() {
-		gitURL, gitRepo, cleanup := createGitServer(f)
+	// Slow by design [~150 Seconds].
+	// This test uses deprecated GitRepo VolumeSource so it MUST not be promoted to Conformance.
+	// To provision a container with a git repo, mount an EmptyDir into an InitContainer that clones the repo using git, then mount the EmptyDir into the Pod's container.
+	// This projected volume maps approach can also be tested with secrets and downwardapi VolumeSource but are less prone to the race problem.
+	f.It("should not cause race condition when used for git_repo", f.WithFeatureGate(features.GitRepoVolumeDriver), f.WithSerial(), f.WithSlow(), func(ctx context.Context) {
+		gitURL, gitRepo, cleanup := createGitServer(ctx, f)
 		defer cleanup()
 		volumes, volumeMounts := makeGitRepoVolumes(gitURL, gitRepo)
-		for i := 0; i < wrappedVolumeRaceGitRepoIterationCount; i++ {
-			testNoWrappedVolumeRace(f, volumes, volumeMounts, wrappedVolumeRaceGitRepoPodCount)
+		for range wrappedVolumeRaceGitRepoIterationCount {
+			testNoWrappedVolumeRace(ctx, f, volumes, volumeMounts, wrappedVolumeRaceGitRepoPodCount)
 		}
 	})
 })
 
-func createGitServer(f *framework.Framework) (gitURL string, gitRepo string, cleanup func()) {
+func createGitServer(ctx context.Context, f *framework.Framework) (gitURL string, gitRepo string, cleanup func()) {
 	var err error
 	gitServerPodName := "git-server-" + string(uuid.NewUUID())
-	containerPort := 8000
+	containerPort := int32(8000)
 
 	labels := map[string]string{"name": gitServerPodName}
 
-	gitServerPod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   gitServerPodName,
-			Labels: labels,
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{
-				{
-					Name:            "git-repo",
-					Image:           imageutils.GetE2EImage(imageutils.Fakegitserver),
-					ImagePullPolicy: "IfNotPresent",
-					Ports: []v1.ContainerPort{
-						{ContainerPort: int32(containerPort)},
-					},
-				},
-			},
-		},
-	}
-	f.PodClient().CreateSync(gitServerPod)
+	gitServerPod := e2epod.NewAgnhostPod(f.Namespace.Name, gitServerPodName, nil, nil, []v1.ContainerPort{{ContainerPort: int32(containerPort)}}, "fake-gitserver")
+	gitServerPod.ObjectMeta.Labels = labels
+	e2epod.NewPodClient(f).CreateSync(ctx, gitServerPod)
 
 	// Portal IP and port
 	httpPort := 2345
@@ -214,30 +234,30 @@ func createGitServer(f *framework.Framework) (gitURL string, gitRepo string, cle
 				{
 					Name:       "http-portal",
 					Port:       int32(httpPort),
-					TargetPort: intstr.FromInt(containerPort),
+					TargetPort: intstr.FromInt32(containerPort),
 				},
 			},
 		},
 	}
 
-	if gitServerSvc, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(gitServerSvc); err != nil {
+	if gitServerSvc, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(ctx, gitServerSvc, metav1.CreateOptions{}); err != nil {
 		framework.Failf("unable to create test git server service %s: %v", gitServerSvc.Name, err)
 	}
 
 	return "http://" + gitServerSvc.Spec.ClusterIP + ":" + strconv.Itoa(httpPort), "test", func() {
-		By("Cleaning up the git server pod")
-		if err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(gitServerPod.Name, metav1.NewDeleteOptions(0)); err != nil {
+		ginkgo.By("Cleaning up the git server pod")
+		if err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, gitServerPod.Name, *metav1.NewDeleteOptions(0)); err != nil {
 			framework.Failf("unable to delete git server pod %v: %v", gitServerPod.Name, err)
 		}
-		By("Cleaning up the git server svc")
-		if err := f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(gitServerSvc.Name, nil); err != nil {
+		ginkgo.By("Cleaning up the git server svc")
+		if err := f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(ctx, gitServerSvc.Name, metav1.DeleteOptions{}); err != nil {
 			framework.Failf("unable to delete git server svc %v: %v", gitServerSvc.Name, err)
 		}
 	}
 }
 
 func makeGitRepoVolumes(gitURL, gitRepo string) (volumes []v1.Volume, volumeMounts []v1.VolumeMount) {
-	for i := 0; i < wrappedVolumeRaceGitRepoVolumeCount; i++ {
+	for i := range wrappedVolumeRaceGitRepoVolumeCount {
 		volumeName := fmt.Sprintf("racey-git-repo-%d", i)
 		volumes = append(volumes, v1.Volume{
 			Name: volumeName,
@@ -256,9 +276,9 @@ func makeGitRepoVolumes(gitURL, gitRepo string) (volumes []v1.Volume, volumeMoun
 	return
 }
 
-func createConfigmapsForRace(f *framework.Framework) (configMapNames []string) {
-	By(fmt.Sprintf("Creating %d configmaps", wrappedVolumeRaceConfigMapVolumeCount))
-	for i := 0; i < wrappedVolumeRaceConfigMapVolumeCount; i++ {
+func createConfigmapsForRace(ctx context.Context, f *framework.Framework) (configMapNames []string) {
+	ginkgo.By(fmt.Sprintf("Creating %d configmaps", wrappedVolumeRaceConfigMapVolumeCount))
+	for i := range wrappedVolumeRaceConfigMapVolumeCount {
 		configMapName := fmt.Sprintf("racey-configmap-%d", i)
 		configMapNames = append(configMapNames, configMapName)
 		configMap := &v1.ConfigMap{
@@ -270,17 +290,17 @@ func createConfigmapsForRace(f *framework.Framework) (configMapNames []string) {
 				"data-1": "value-1",
 			},
 		}
-		_, err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(configMap)
+		_, err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, configMap, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 	}
 	return
 }
 
-func deleteConfigMaps(f *framework.Framework, configMapNames []string) {
-	By("Cleaning up the configMaps")
+func deleteConfigMaps(ctx context.Context, f *framework.Framework, configMapNames []string) {
+	ginkgo.By("Cleaning up the configMaps")
 	for _, configMapName := range configMapNames {
-		err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(configMapName, nil)
-		Expect(err).NotTo(HaveOccurred(), "unable to delete configMap %v", configMapName)
+		err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(ctx, configMapName, metav1.DeleteOptions{})
+		framework.ExpectNoError(err, "unable to delete configMap %v", configMapName)
 	}
 }
 
@@ -311,13 +331,17 @@ func makeConfigMapVolumes(configMapNames []string) (volumes []v1.Volume, volumeM
 	return
 }
 
-func testNoWrappedVolumeRace(f *framework.Framework, volumes []v1.Volume, volumeMounts []v1.VolumeMount, podCount int32) {
-	rcName := wrappedVolumeRaceRCNamePrefix + string(uuid.NewUUID())
-	nodeList := framework.GetReadySchedulableNodesOrDie(f.ClientSet)
-	Expect(len(nodeList.Items)).To(BeNumerically(">", 0))
-	targetNode := nodeList.Items[0]
+func testNoWrappedVolumeRace(ctx context.Context, f *framework.Framework, volumes []v1.Volume, volumeMounts []v1.VolumeMount, podCount int32) {
+	const nodeHostnameLabelKey = "kubernetes.io/hostname"
 
-	By("Creating RC which spawns configmap-volume pods")
+	rcName := wrappedVolumeRaceRCNamePrefix + string(uuid.NewUUID())
+	rcLabels := map[string]string{
+		"name": rcName,
+	}
+	targetNode, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
+	framework.ExpectNoError(err)
+
+	ginkgo.By("Creating RC which spawns configmap-volume pods")
 	affinity := &v1.Affinity{
 		NodeAffinity: &v1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
@@ -325,9 +349,9 @@ func testNoWrappedVolumeRace(f *framework.Framework, volumes []v1.Volume, volume
 					{
 						MatchExpressions: []v1.NodeSelectorRequirement{
 							{
-								Key:      "kubernetes.io/hostname",
+								Key:      nodeHostnameLabelKey,
 								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{targetNode.Name},
+								Values:   []string{targetNode.Labels[nodeHostnameLabelKey]},
 							},
 						},
 					},
@@ -342,24 +366,16 @@ func testNoWrappedVolumeRace(f *framework.Framework, volumes []v1.Volume, volume
 		},
 		Spec: v1.ReplicationControllerSpec{
 			Replicas: &podCount,
-			Selector: map[string]string{
-				"name": rcName,
-			},
+			Selector: rcLabels,
 			Template: &v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"name": rcName},
+					Labels: rcLabels,
 				},
 				Spec: v1.PodSpec{
 					Containers: []v1.Container{
 						{
-							Name:    "test-container",
-							Image:   "busybox",
-							Command: []string{"sleep", "10000"},
-							Resources: v1.ResourceRequirements{
-								Requests: v1.ResourceList{
-									v1.ResourceCPU: resource.MustParse("10m"),
-								},
-							},
+							Name:         "test-container",
+							Image:        imageutils.GetE2EImage(imageutils.Pause),
 							VolumeMounts: volumeMounts,
 						},
 					},
@@ -370,17 +386,15 @@ func testNoWrappedVolumeRace(f *framework.Framework, volumes []v1.Volume, volume
 			},
 		},
 	}
-	_, err := f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Create(rc)
-	Expect(err).NotTo(HaveOccurred(), "error creating replication controller")
+	_, err = f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Create(ctx, rc, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "error creating replication controller")
 
-	defer func() {
-		err := framework.DeleteRCAndPods(f.ClientSet, f.InternalClientset, f.Namespace.Name, rcName)
-		framework.ExpectNoError(err)
-	}()
+	ginkgo.DeferCleanup(e2erc.DeleteRCAndWaitForGC, f.ClientSet, f.Namespace.Name, rcName)
 
-	pods, err := framework.PodsCreated(f.ClientSet, f.Namespace.Name, rcName, podCount)
+	pods, err := e2epod.PodsCreatedByLabel(ctx, f.ClientSet, f.Namespace.Name, rcName, podCount, labels.SelectorFromSet(rcLabels))
+	framework.ExpectNoError(err, "error creating pods")
 
-	By("Ensuring each pod is running")
+	ginkgo.By("Ensuring each pod is running")
 
 	// Wait for the pods to enter the running state. Waiting loops until the pods
 	// are running so non-running pods cause a timeout for this test.
@@ -388,7 +402,7 @@ func testNoWrappedVolumeRace(f *framework.Framework, volumes []v1.Volume, volume
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		err = f.WaitForPodRunning(pod.Name)
-		Expect(err).NotTo(HaveOccurred(), "Failed waiting for pod %s to enter running state", pod.Name)
+		err = e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
+		framework.ExpectNoError(err, "Failed waiting for pod %s to enter running state", pod.Name)
 	}
 }

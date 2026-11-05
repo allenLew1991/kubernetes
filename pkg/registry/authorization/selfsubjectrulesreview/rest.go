@@ -17,9 +17,11 @@ limitations under the License.
 package selfsubjectrulesreview
 
 import (
+	"context"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -37,13 +39,24 @@ func NewREST(ruleResolver authorizer.RuleResolver) *REST {
 	return &REST{ruleResolver}
 }
 
+// NamespaceScoped fulfill rest.Scoper
+func (r *REST) NamespaceScoped() bool {
+	return false
+}
+
 // New creates a new selfsubjectrulesreview object.
 func (r *REST) New() runtime.Object {
 	return &authorizationapi.SelfSubjectRulesReview{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *REST) Destroy() {
+	// Given no underlying store, we don't destroy anything
+	// here explicitly.
+}
+
 // Create attempts to get self subject rules in specific namespace.
-func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, includeUninitialized bool) (runtime.Object, error) {
+func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
 	selfSRR, ok := obj.(*authorizationapi.SelfSubjectRulesReview)
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("not a SelfSubjectRulesReview: %#v", obj))
@@ -58,7 +71,14 @@ func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createV
 	if namespace == "" {
 		return nil, apierrors.NewBadRequest("no namespace on request")
 	}
-	resourceInfo, nonResourceInfo, incomplete, err := r.ruleResolver.RulesFor(user, namespace)
+
+	if createValidation != nil {
+		if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
+			return nil, err
+		}
+	}
+
+	resourceInfo, nonResourceInfo, incomplete, err := r.ruleResolver.RulesFor(ctx, user, namespace)
 
 	ret := &authorizationapi.SelfSubjectRulesReview{
 		Status: authorizationapi.SubjectRulesReviewStatus{
@@ -73,6 +93,12 @@ func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createV
 	}
 
 	return ret, nil
+}
+
+var _ rest.SingularNameProvider = &REST{}
+
+func (r *REST) GetSingularName() string {
+	return "selfsubjectrulesreview"
 }
 
 func getResourceRules(infos []authorizer.ResourceRuleInfo) []authorizationapi.ResourceRule {

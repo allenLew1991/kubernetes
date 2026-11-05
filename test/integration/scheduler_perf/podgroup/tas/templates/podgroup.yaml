@@ -1,0 +1,15 @@
+apiVersion: scheduling.k8s.io/v1beta1
+kind: PodGroup
+metadata:
+  name: group-{{.Index}}
+spec:
+  schedulingPolicy:
+    {{- if .minCount }}
+    gang:
+      minCount: {{.minCount}}
+    {{- else }}
+    basic: {}
+    {{- end }}
+  schedulingConstraints:
+    topology:
+    - key: topology.kubernetes.io/rack

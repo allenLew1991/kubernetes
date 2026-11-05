@@ -19,12 +19,11 @@ package yaml
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -45,12 +44,69 @@ stuff: 1
 	}
 
 	for i, testCase := range testCases {
-		r := NewDocumentDecoder(ioutil.NopCloser(bytes.NewReader([]byte(d))))
+		r := NewDocumentDecoder(io.NopCloser(bytes.NewReader([]byte(d))))
 		b := make([]byte, testCase.bufLen)
 		n, err := r.Read(b)
 		if err != testCase.expectErr || n != testCase.expectLen {
 			t.Fatalf("%d: unexpected body: %d / %v", i, n, err)
 		}
+	}
+}
+
+func TestBigYAML(t *testing.T) {
+	d := `
+stuff: 1
+`
+	maxLen := 5 * 1024 * 1024
+	bufferLen := 4 * 1024
+	//  maxLen 5 M
+	dd := strings.Repeat(d, 512*1024)
+	r := NewDocumentDecoder(io.NopCloser(bytes.NewReader([]byte(dd[:maxLen-1]))))
+	b := make([]byte, bufferLen)
+	n, err := r.Read(b)
+	if err != io.ErrShortBuffer {
+		t.Fatalf("expected ErrShortBuffer: %d / %v", n, err)
+	}
+	b = make([]byte, maxLen)
+	n, err = r.Read(b)
+	if err != nil {
+		t.Fatalf("expected nil: %d / %v", n, err)
+	}
+	r = NewDocumentDecoder(io.NopCloser(bytes.NewReader([]byte(dd))))
+	b = make([]byte, maxLen)
+	n, err = r.Read(b)
+	if err != bufio.ErrTooLong {
+		t.Fatalf("bufio.Scanner: token too long: %d / %v", n, err)
+	}
+}
+
+func TestYAMLDecoderCallsAfterErrShortBufferRestOfFrame(t *testing.T) {
+	d := `---
+stuff: 1
+	test-foo: 1`
+	r := NewDocumentDecoder(io.NopCloser(bytes.NewReader([]byte(d))))
+	b := make([]byte, 12)
+	n, err := r.Read(b)
+	if err != io.ErrShortBuffer || n != 12 {
+		t.Fatalf("expected ErrShortBuffer: %d / %v", n, err)
+	}
+	expected := "---\nstuff: 1"
+	if string(b) != expected {
+		t.Fatalf("expected bytes read to be: %s  got: %s", expected, string(b))
+	}
+	b = make([]byte, 13)
+	n, err = r.Read(b)
+	if err != nil || n != 13 {
+		t.Fatalf("expected nil: %d / %v", n, err)
+	}
+	expected = "\n\ttest-foo: 1"
+	if string(b) != expected {
+		t.Fatalf("expected bytes read to be: '%s'  got: '%s'", expected, string(b))
+	}
+	b = make([]byte, 15)
+	n, err = r.Read(b)
+	if err != io.EOF || n != 0 { //nolint:errorlint
+		t.Fatalf("expected EOF: %d / %v", n, err)
 	}
 }
 
@@ -149,7 +205,64 @@ stuff: 1
 		t.Fatalf("unexpected object: %#v", obj)
 	}
 	obj = generic{}
-	if err := s.Decode(&obj); err != io.EOF {
+	if err := s.Decode(&obj); err != io.EOF { //nolint:errorlint
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestYAMLReaderFinalLineAtBufferBoundary(t *testing.T) {
+	const bufSize = 4096
+	for _, n := range []int{bufSize - 1, bufSize, bufSize + 1, 2 * bufSize, 4 * bufSize} {
+		t.Run(fmt.Sprintf("final line of %d bytes", n), func(t *testing.T) {
+			last := "b: " + strings.Repeat("x", n-3)
+			r := NewYAMLReader(bufio.NewReaderSize(strings.NewReader("a: 1\n---\n"+last), bufSize))
+			if _, err := r.Read(); err != nil {
+				t.Fatalf("first document: unexpected error: %v", err)
+			}
+			doc, err := r.Read()
+			if err != nil {
+				t.Fatalf("second document: unexpected error: %v", err)
+			}
+			if got := strings.TrimSuffix(string(doc), "\n"); got != last {
+				t.Fatalf("second document: got %d bytes, want %d", len(got), len(last))
+			}
+			if _, err := r.Read(); err != io.EOF { //nolint:errorlint
+				t.Fatalf("expected io.EOF, got %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeYAMLSeparatorValidation(t *testing.T) {
+	s := NewYAMLToJSONDecoder(bytes.NewReader([]byte(`---
+stuff: 1
+---    # Make sure termination happen with inline comment
+stuff: 2
+---
+stuff: 3
+--- Make sure uncommented content results YAMLSyntaxError
+
+ `)))
+	obj := generic{}
+	if err := s.Decode(&obj); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fmt.Sprintf("%#v", obj) != `yaml.generic{"stuff":1}` {
+		t.Errorf("unexpected object: %#v", obj)
+	}
+	obj = generic{}
+	if err := s.Decode(&obj); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fmt.Sprintf("%#v", obj) != `yaml.generic{"stuff":2}` {
+		t.Errorf("unexpected object: %#v", obj)
+	}
+	obj = generic{}
+	err := s.Decode(&obj)
+	if err == nil {
+		t.Fatalf("expected YamlSyntaxError, got nil instead")
+	}
+	if _, ok := err.(YAMLSyntaxError); !ok {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -167,8 +280,8 @@ stuff: 1
 		t.Fatal("expected error with yaml: violate, got no error")
 	}
 	fmt.Printf("err: %s\n", err.Error())
-	if !strings.Contains(err.Error(), "yaml: line 2:") {
-		t.Fatalf("expected %q to have 'yaml: line 2:' found a tab character", err.Error())
+	if !strings.Contains(err.Error(), "yaml: line 3:") {
+		t.Fatalf("expected %q to have 'yaml: line 3:' found a tab character", err.Error())
 	}
 }
 
@@ -185,8 +298,9 @@ func TestDecodeBrokenJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error with json: prefix, got no error")
 	}
-	if !strings.HasPrefix(err.Error(), "json: line 3:") {
-		t.Fatalf("expected %q to have 'json: line 3:' prefix", err.Error())
+	const msg = `json: .*invalid character.*".*after object key:value pair`
+	if matched, _ := regexp.MatchString(msg, err.Error()); !matched {
+		t.Fatalf("expected string matching %q, got %q", msg, err.Error())
 	}
 }
 
@@ -224,6 +338,15 @@ func TestYAMLOrJSONDecoder(t *testing.T) {
 			{"foo": "bar"},
 			{"baz": "biz"},
 		}},
+		{"---\nfoo: bar\n--- # with Comment\nbaz: biz", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// Spaces for indent, tabs are not allowed in YAML.
+		{"foo:\n  field: bar\n---\nbaz:\n  field: biz", 100, false, false, []generic{
+			{"foo": map[string]any{"field": "bar"}},
+			{"baz": map[string]any{"field": "biz"}},
+		}},
 		{"foo: bar\n---\n", 100, false, false, []generic{
 			{"foo": "bar"},
 		}},
@@ -239,6 +362,49 @@ func TestYAMLOrJSONDecoder(t *testing.T) {
 		{"foo: bar\n", 100, false, false, []generic{
 			{"foo": "bar"},
 		}},
+		// First document is JSON, second is YAML
+		{"{\"foo\": \"bar\"}\n---\n{baz: biz}", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// First document is JSON, second is YAML but with smaller size.
+		{"{\"foo\": \"bar\"}\n---\na: b", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"a": "b"},
+		}},
+		// First document is JSON, second is YAML,but with smaller size and
+		// trailing whitespace.
+		{"{\"foo\": \"bar\"}    \n---\na: b", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"a": "b"},
+		}},
+		// First document is JSON, second is YAML, longer than the buffer
+		{"{\"foo\": \"bar\"}\n---\n{baz: biz0123456780123456780123456780123456780123456789}", 20, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz0123456780123456780123456780123456780123456789"},
+		}},
+		// First document is JSON, then whitespace, then YAML
+		{"{\"foo\": \"bar\"}    \n---\n{baz: biz}", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// First document is YAML, second is JSON
+		{"{foo: bar}\n---\n{\"baz\": \"biz\"}", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// First document is JSON, second is YAML, using spaces
+		{"{\n  \"foo\": \"bar\"\n}\n---\n{\n  baz: biz\n}", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// First document is JSON, second is YAML, using tabs
+		{"{\n\t\"foo\": \"bar\"\n}\n---\n{\n\tbaz: biz\n}", 100, false, false, []generic{
+			{"foo": "bar"},
+			{"baz": "biz"},
+		}},
+		// First 2 documents are JSON, third is YAML (stream is JSON)
+		{"{\"foo\": \"bar\"}\n{\"baz\": \"biz\"}\n---\n{qux: zrb}", 100, true, true, nil},
 	}
 	for i, testCase := range testCases {
 		decoder := NewYAMLOrJSONDecoder(bytes.NewReader([]byte(testCase.input)), testCase.buffer)
@@ -253,7 +419,7 @@ func TestYAMLOrJSONDecoder(t *testing.T) {
 			}
 			objs = append(objs, out)
 		}
-		if err != io.EOF {
+		if err != io.EOF { //nolint:errorlint
 			switch {
 			case testCase.err && err == nil:
 				t.Errorf("%d: unexpected non-error", i)
@@ -265,12 +431,12 @@ func TestYAMLOrJSONDecoder(t *testing.T) {
 				continue
 			}
 		}
-		switch decoder.decoder.(type) {
-		case *YAMLToJSONDecoder:
+		switch {
+		case decoder.yaml != nil:
 			if testCase.isJSON {
 				t.Errorf("%d: expected JSON decoder, got YAML", i)
 			}
-		case *json.Decoder:
+		case decoder.json != nil:
 			if !testCase.isJSON {
 				t.Errorf("%d: expected YAML decoder, got JSON", i)
 			}
@@ -324,7 +490,7 @@ func testReadLines(t *testing.T, lineLengths []int) {
 	var readLines [][]byte
 	for range lines {
 		bytes, err := lineReader.Read()
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF { //nolint:errorlint
 			t.Fatalf("failed to read lines: %v", err)
 		}
 		readLines = append(readLines, bytes)
@@ -371,5 +537,46 @@ stuff: 1
 	}
 	if _, ok := err.(YAMLSyntaxError); !ok {
 		t.Fatalf("expected %q to be of type YAMLSyntaxError", err.Error())
+	}
+}
+
+func TestUnmarshal(t *testing.T) {
+	mapWithIntegerBytes := []byte(`replicas: 1`)
+	mapWithInteger := make(map[string]interface{})
+	if err := Unmarshal(mapWithIntegerBytes, &mapWithInteger); err != nil {
+		t.Fatalf("unexpected error unmarshaling yaml: %v", err)
+	}
+	if _, ok := mapWithInteger["replicas"].(int64); !ok {
+		t.Fatalf(`Expected number in map to be int64 but got "%T"`, mapWithInteger["replicas"])
+	}
+
+	sliceWithIntegerBytes := []byte(`- 1`)
+	var sliceWithInteger []interface{}
+	if err := Unmarshal(sliceWithIntegerBytes, &sliceWithInteger); err != nil {
+		t.Fatalf("unexpected error unmarshaling yaml: %v", err)
+	}
+	if _, ok := sliceWithInteger[0].(int64); !ok {
+		t.Fatalf(`Expected number in slice to be int64 but got "%T"`, sliceWithInteger[0])
+	}
+
+	integerBytes := []byte(`1`)
+	var integer interface{}
+	if err := Unmarshal(integerBytes, &integer); err != nil {
+		t.Fatalf("unexpected error unmarshaling yaml: %v", err)
+	}
+	if _, ok := integer.(int64); !ok {
+		t.Fatalf(`Expected number to be int64 but got "%T"`, integer)
+	}
+
+	otherTypeBytes := []byte(`123: 2`)
+	otherType := make(map[int]interface{})
+	if err := Unmarshal(otherTypeBytes, &otherType); err != nil {
+		t.Fatalf("unexpected error unmarshaling yaml: %v", err)
+	}
+	if _, ok := otherType[123].(int64); ok {
+		t.Fatalf(`Expected number not to be converted to int64`)
+	}
+	if _, ok := otherType[123].(float64); !ok {
+		t.Fatalf(`Expected number to be float64 but got "%T"`, otherType[123])
 	}
 }

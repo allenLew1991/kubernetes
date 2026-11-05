@@ -16,8 +16,7 @@ limitations under the License.
 
 package apps
 
-import "github.com/onsi/ginkgo"
+import "k8s.io/kubernetes/test/e2e/framework"
 
-func SIGDescribe(text string, body func()) bool {
-	return ginkgo.Describe("[sig-apps] "+text, body)
-}
+// SIGDescribe annotates the test with the SIG label.
+var SIGDescribe = framework.SIGDescribe("apps")

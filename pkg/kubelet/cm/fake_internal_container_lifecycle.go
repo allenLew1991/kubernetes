@@ -18,6 +18,8 @@ package cm
 
 import (
 	"k8s.io/api/core/v1"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
 )
 
 func NewFakeInternalContainerLifecycle() *fakeInternalContainerLifecycle {
@@ -26,14 +28,14 @@ func NewFakeInternalContainerLifecycle() *fakeInternalContainerLifecycle {
 
 type fakeInternalContainerLifecycle struct{}
 
-func (f *fakeInternalContainerLifecycle) PreStartContainer(pod *v1.Pod, container *v1.Container, containerID string) error {
+func (f *fakeInternalContainerLifecycle) PreCreateContainer(_ klog.Logger, _ *v1.Pod, _ *v1.Container, _ *runtimeapi.ContainerConfig) error {
 	return nil
 }
 
-func (f *fakeInternalContainerLifecycle) PreStopContainer(containerID string) error {
+func (f *fakeInternalContainerLifecycle) PreStartContainer(_ klog.Logger, _ *v1.Pod, _ *v1.Container, _ string) error {
 	return nil
 }
 
-func (f *fakeInternalContainerLifecycle) PostStopContainer(containerID string) error {
+func (f *fakeInternalContainerLifecycle) PostStopContainer(_ klog.Logger, _ string) error {
 	return nil
 }

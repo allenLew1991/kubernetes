@@ -16,12 +16,13 @@ limitations under the License.
 
 package common
 
+// Constants related to Prometheus metrics.
 const (
 	ConsumeCPUAddress       = "/ConsumeCPU"
 	ConsumeMemAddress       = "/ConsumeMem"
 	BumpMetricAddress       = "/BumpMetric"
 	GetCurrentStatusAddress = "/GetCurrentStatus"
-	MetricsAddress          = "/Metrics"
+	MetricsAddress          = "/metrics"
 
 	MillicoresQuery              = "millicores"
 	MegabytesQuery               = "megabytes"
@@ -36,6 +37,4 @@ const (
 	UnknownFunction           = "unknown function"
 	IncorrectFunctionArgument = "incorrect function argument"
 	NotGivenFunctionArgument  = "not given function argument"
-
-	FrameworkName = "horizontal-pod-autoscaling"
 )

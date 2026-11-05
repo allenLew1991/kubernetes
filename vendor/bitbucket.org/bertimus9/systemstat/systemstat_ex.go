@@ -2,12 +2,11 @@
 // Licensed under the MIT License
 // see file LICENSE
 
-// +build !linux
+//go:build !linux
 
 package systemstat
 
 import (
-	"syscall"
 	"time"
 )
 
@@ -30,15 +29,8 @@ func getMemSample(procfile string) (samp MemSample) {
 }
 
 func getProcCPUSample() (s ProcCPUSample) {
-	var processInfo syscall.Rusage
-	syscall.Getrusage(syscall.RUSAGE_SELF, &processInfo)
-
+	notImplemented("getProcCPUSample")
 	s.Time = time.Now()
-	s.ProcMemUsedK = int64(processInfo.Maxrss)
-	s.User = float64(processInfo.Utime.Usec)/1000000 + float64(processInfo.Utime.Sec)
-	s.System = float64(processInfo.Stime.Usec)/1000000 + float64(processInfo.Stime.Sec)
-	s.Total = s.User + s.System
-
 	return
 }
 

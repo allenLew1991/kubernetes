@@ -17,22 +17,39 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	"github.com/stretchr/testify/assert"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	api "k8s.io/kubernetes/pkg/apis/core"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
+	"k8s.io/kubernetes/pkg/apis/core"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
+	schedulingapi "k8s.io/kubernetes/pkg/apis/scheduling"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/securitycontext"
+	"k8s.io/utils/ptr"
 )
 
-func noDefault(*api.Pod) error { return nil }
+func noDefault(klog.Logger, *core.Pod) error { return nil }
 
 func TestDecodeSinglePod(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
 	pod := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "",
@@ -54,15 +71,24 @@ func TestDecodeSinglePod(t *testing.T) {
 				TerminationMessagePolicy: v1.TerminationMessageReadFile,
 				SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
 			}},
-			SecurityContext: &v1.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SecurityContext:    &v1.PodSecurityContext{},
+			SchedulerName:      v1.DefaultSchedulerName,
+			EnableServiceLinks: &enableServiceLinks,
+		},
+		Status: v1.PodStatus{
+			PodIP: "1.2.3.4",
+			PodIPs: []v1.PodIP{
+				{
+					IP: "1.2.3.4",
+				},
+			},
 		},
 	}
-	json, err := runtime.Encode(testapi.Default.Codec(), pod)
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	parsed, podOut, err := tryDecodeSinglePod(json, noDefault)
+	parsed, podOut, err := tryDecodeSinglePod(logger, json, noDefault)
 	if !parsed {
 		t.Errorf("expected to have parsed file: (%s)", string(json))
 	}
@@ -73,14 +99,14 @@ func TestDecodeSinglePod(t *testing.T) {
 		t.Errorf("expected:\n%#v\ngot:\n%#v\n%s", pod, podOut, string(json))
 	}
 
-	for _, gv := range legacyscheme.Registry.EnabledVersionsForGroup(v1.GroupName) {
+	for _, gv := range legacyscheme.Scheme.PrioritizedVersionsForGroup(v1.GroupName) {
 		info, _ := runtime.SerializerInfoForMediaType(legacyscheme.Codecs.SupportedMediaTypes(), "application/yaml")
 		encoder := legacyscheme.Codecs.EncoderForVersion(info.Serializer, gv)
 		yaml, err := runtime.Encode(encoder, pod)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		parsed, podOut, err = tryDecodeSinglePod(yaml, noDefault)
+		parsed, podOut, err = tryDecodeSinglePod(logger, yaml, noDefault)
 		if !parsed {
 			t.Errorf("expected to have parsed file: (%s)", string(yaml))
 		}
@@ -93,8 +119,177 @@ func TestDecodeSinglePod(t *testing.T) {
 	}
 }
 
-func TestDecodePodList(t *testing.T) {
+func TestDecodeSinglePodRejectsClusterTrustBundleVolumes(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			UID:       "12345",
+			Namespace: "mynamespace",
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy:                 v1.RestartPolicyAlways,
+			DNSPolicy:                     v1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: &grace,
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+				SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
+				VolumeMounts: []v1.VolumeMount{
+					{
+						Name:      "ctb-volume",
+						MountPath: "/var/run/ctb-volume",
+					},
+				},
+			}},
+			Volumes: []v1.Volume{
+				{
+					Name: "ctb-volume",
+					VolumeSource: v1.VolumeSource{
+						Projected: &v1.ProjectedVolumeSource{
+							Sources: []v1.VolumeProjection{
+								{
+									ClusterTrustBundle: &v1.ClusterTrustBundleProjection{
+										Name: ptr.To("my-ctb"),
+										Path: "ctb-file",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			SecurityContext:    &v1.PodSecurityContext{},
+			SchedulerName:      v1.DefaultSchedulerName,
+			EnableServiceLinks: &enableServiceLinks,
+		},
+		Status: v1.PodStatus{
+			PodIP: "1.2.3.4",
+			PodIPs: []v1.PodIP{
+				{
+					IP: "1.2.3.4",
+				},
+			},
+		},
+	}
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	_, _, err = tryDecodeSinglePod(logger, json, noDefault)
+	if !strings.Contains(err.Error(), "may not reference clustertrustbundles") {
+		t.Errorf("Got error %q, want %q", err, fmt.Errorf("static pods may not reference clustertrustbundles API objects"))
+	}
+}
+
+func TestDecodeSinglePodRejectsResourceClaims(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			UID:       "12345",
+			Namespace: "mynamespace",
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy:                 v1.RestartPolicyAlways,
+			DNSPolicy:                     v1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: &grace,
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+				SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
+				Resources: v1.ResourceRequirements{
+					Claims: []v1.ResourceClaim{{
+						Name: "my-claim",
+					}},
+				},
+			}},
+			ResourceClaims: []v1.PodResourceClaim{{
+				Name:              "my-claim",
+				ResourceClaimName: ptr.To("some-external-claim"),
+			}},
+			SecurityContext:    &v1.PodSecurityContext{},
+			SchedulerName:      v1.DefaultSchedulerName,
+			EnableServiceLinks: &enableServiceLinks,
+		},
+		Status: v1.PodStatus{
+			PodIP: "1.2.3.4",
+			PodIPs: []v1.PodIP{
+				{
+					IP: "1.2.3.4",
+				},
+			},
+		},
+	}
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	_, _, err = tryDecodeSinglePod(logger, json, noDefault)
+	if !strings.Contains(err.Error(), "may not reference resourceclaims") {
+		t.Errorf("Got error %q, want %q", err, fmt.Errorf("static pods may not reference resourceclaims API objects"))
+	}
+}
+
+func TestDecodeSinglePodWithOptions(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ContainerRestartRules, true)
+	logger, _ := ktesting.NewTestContext(t)
+	restartPolicyAlways := v1.ContainerRestartPolicyAlways
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			UID:       "12345",
+			Namespace: "mynamespace",
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyNever,
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+				SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
+				RestartPolicy:            &restartPolicyAlways,
+			}},
+		},
+	}
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	parsed, _, err := tryDecodeSinglePod(logger, json, noDefault)
+	if err != nil {
+		t.Errorf("unexpected error: %v (%s)", err, string(json))
+	}
+	if !parsed {
+		t.Errorf("expected to have parsed file: (%s)", string(json))
+	}
+}
+
+func TestDecodePodList(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
 	pod := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "",
@@ -117,18 +312,27 @@ func TestDecodePodList(t *testing.T) {
 
 				SecurityContext: securitycontext.ValidSecurityContextWithContainerDefaults(),
 			}},
-			SecurityContext: &v1.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SecurityContext:    &v1.PodSecurityContext{},
+			SchedulerName:      v1.DefaultSchedulerName,
+			EnableServiceLinks: &enableServiceLinks,
+		},
+		Status: v1.PodStatus{
+			PodIP: "1.2.3.4",
+			PodIPs: []v1.PodIP{
+				{
+					IP: "1.2.3.4",
+				},
+			},
 		},
 	}
 	podList := &v1.PodList{
 		Items: []v1.Pod{*pod},
 	}
-	json, err := runtime.Encode(testapi.Default.Codec(), podList)
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), podList)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	parsed, podListOut, err := tryDecodePodList(json, noDefault)
+	parsed, podListOut, err := tryDecodePodList(logger, json, noDefault)
 	if !parsed {
 		t.Errorf("expected to have parsed file: (%s)", string(json))
 	}
@@ -139,7 +343,7 @@ func TestDecodePodList(t *testing.T) {
 		t.Errorf("expected:\n%#v\ngot:\n%#v\n%s", podList, &podListOut, string(json))
 	}
 
-	for _, gv := range legacyscheme.Registry.EnabledVersionsForGroup(v1.GroupName) {
+	for _, gv := range legacyscheme.Scheme.PrioritizedVersionsForGroup(v1.GroupName) {
 		info, _ := runtime.SerializerInfoForMediaType(legacyscheme.Codecs.SupportedMediaTypes(), "application/yaml")
 		encoder := legacyscheme.Codecs.EncoderForVersion(info.Serializer, gv)
 		yaml, err := runtime.Encode(encoder, podList)
@@ -147,7 +351,7 @@ func TestDecodePodList(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 
-		parsed, podListOut, err = tryDecodePodList(yaml, noDefault)
+		parsed, podListOut, err = tryDecodePodList(logger, yaml, noDefault)
 		if !parsed {
 			t.Errorf("expected to have parsed file: (%s): %v", string(yaml), err)
 			continue
@@ -162,30 +366,198 @@ func TestDecodePodList(t *testing.T) {
 	}
 }
 
-func TestGetSelfLink(t *testing.T) {
-	var testCases = []struct {
-		desc             string
-		name             string
-		namespace        string
-		expectedSelfLink string
+func TestStaticPodNameGenerate(t *testing.T) {
+	testCases := []struct {
+		nodeName  types.NodeName
+		podName   string
+		expected  string
+		overwrite string
+		shouldErr bool
 	}{
 		{
-			desc:             "No namespace specified",
-			name:             "foo",
-			namespace:        "",
-			expectedSelfLink: "/api/v1/namespaces/default/pods/foo",
+			"node1",
+			"static-pod1",
+			"static-pod1-node1",
+			"",
+			false,
 		},
 		{
-			desc:             "Namespace specified",
-			name:             "foo",
-			namespace:        "bar",
-			expectedSelfLink: "/api/v1/namespaces/bar/pods/foo",
+			"Node1",
+			"static-pod1",
+			"static-pod1-node1",
+			"",
+			false,
+		},
+		{
+			"NODE1",
+			"static-pod1",
+			"static-pod1-node1",
+			"static-pod1-NODE1",
+			true,
 		},
 	}
-	for _, testCase := range testCases {
-		selfLink := getSelfLink(testCase.name, testCase.namespace)
-		if testCase.expectedSelfLink != selfLink {
-			t.Errorf("%s: getSelfLink error, expected: %s, got: %s", testCase.desc, testCase.expectedSelfLink, selfLink)
+	for _, c := range testCases {
+		assert.Equal(t, c.expected, generatePodName(c.podName, c.nodeName), "wrong pod name generated")
+		pod := podtest.MakePod("")
+		pod.Name = c.podName
+		if c.overwrite != "" {
+			pod.Name = c.overwrite
 		}
+		errs := validation.ValidatePodCreate(pod, validation.PodValidationOptions{})
+		if c.shouldErr {
+			specNameErrored := false
+			for _, err := range errs {
+				if err.Field == "metadata.name" {
+					specNameErrored = true
+				}
+			}
+			assert.NotEmpty(t, specNameErrored, "expecting error")
+		} else {
+			for _, err := range errs {
+				if err.Field == "metadata.name" {
+					t.Fail()
+				}
+			}
+		}
+	}
+}
+
+// TestDecodeSinglePodTerminationGracePeriodSeconds ensures
+// a negative TerminationGracePeriodSeconds is clamped.
+func TestDecodeSinglePodTerminationGracePeriodSeconds(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	grace := int64(-1)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", UID: "12345", Namespace: "mynamespace"},
+		Spec: v1.PodSpec{
+			RestartPolicy:                 v1.RestartPolicyAlways,
+			DNSPolicy:                     v1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: &grace,
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+			}},
+		},
+	}
+	json, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	parsed, podOut, err := tryDecodeSinglePod(logger, json, noDefault)
+	if !parsed || err != nil {
+		t.Fatalf("parsed=%v, unexpected error: %v", parsed, err)
+	}
+	if podOut.Spec.TerminationGracePeriodSeconds == nil || *podOut.Spec.TerminationGracePeriodSeconds != 1 {
+		t.Errorf("expected negative grace period clamped to 1 by decode defaulting, got %v", podOut.Spec.TerminationGracePeriodSeconds)
+	}
+}
+
+func TestGetStaticPodPriorityWarning(t *testing.T) {
+	testCases := []struct {
+		podName           string
+		priority          *int32
+		priorityClassName string
+		shouldWarn        bool
+		warning           string
+	}{
+		{
+			podName:           "static-pod-with-priorityclassname-and-nil-priority",
+			priority:          nil,
+			priorityClassName: "invalid-priority-class-name",
+			shouldWarn:        true,
+			warning:           "Static pod has priorityClassName and nil priority. Kubelet will not use priorityClassName, and mirror pod creation may fail.",
+		},
+		{
+			podName:           "static-pod-with-priority-without-priorityclassname",
+			priority:          ptr.To[int32](2000001000),
+			priorityClassName: "",
+			shouldWarn:        true,
+			warning:           "Static pod has priority without priorityClassName. Mirror pod creation may fail if the default priority class doesn't match the given priority.",
+		},
+		{
+			podName:           "static-pod-with-priority-and-priorityclassname",
+			priority:          ptr.To[int32](2000001000),
+			priorityClassName: "system-node-critical",
+			shouldWarn:        false,
+			warning:           "",
+		},
+		{
+			podName:           "static-pod-with-invalid-priority",
+			priority:          ptr.To[int32](0),
+			priorityClassName: "",
+			shouldWarn:        true,
+			warning:           "Static pod has priority without priorityClassName. Mirror pod creation may fail if the default priority class doesn't match the given priority.",
+		},
+		{
+			podName:           "static-pod-with-invalid-priorityclassname",
+			priority:          ptr.To[int32](2000001000),
+			priorityClassName: "invalid-priority-class-name",
+			shouldWarn:        true,
+			warning:           fmt.Sprintf("Static pod has a priority other than %d or a priorityClassName other than %s. Mirror pod may be attempted to be evicted from the node ineffectively.", nodeCriticalPriority, schedulingapi.SystemNodeCritical),
+		},
+	}
+
+	for _, tc := range testCases {
+		pod := &v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test",
+				UID:       "12345",
+				Namespace: "mynamespace",
+			},
+			Spec: v1.PodSpec{
+				RestartPolicy:     v1.RestartPolicyNever,
+				Priority:          tc.priority,
+				PriorityClassName: tc.priorityClassName,
+				Containers: []v1.Container{{
+					Name:  "image",
+					Image: "test/image",
+				}},
+			},
+		}
+		internalPod := &core.Pod{}
+		if err := k8s_api_v1.Convert_v1_Pod_To_core_Pod(pod, internalPod, nil); err != nil {
+			t.Fatalf("%s: Cannot convert pod %#v, %#v", tc.podName, pod, err)
+		}
+
+		warning := getStaticPodPriorityWarning(internalPod)
+		if tc.shouldWarn && warning != tc.warning {
+			t.Errorf("unexpected error: %v (%s)", warning, pod)
+		}
+	}
+}
+
+func TestDecodeStaticPodRunsDeclarativeValidation(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EvictionRequestAPI, true)
+	logger, _ := ktesting.NewTestContext(t)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "mynamespace"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "image", Image: "test/image"}},
+			// Only declarative validation enforces the priority bounds.
+			EvictionResponders: []v1.EvictionResponder{{Name: "acme.io/foo", Priority: new(int32(100001))}},
+		},
+	}
+	const wantErr = "spec.evictionResponders[0].priority"
+
+	single, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, _, err := tryDecodeSinglePod(logger, single, noDefault); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("tryDecodeSinglePod: got error %v, want one containing %q", err, wantErr)
+	}
+
+	list, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.PodList{Items: []v1.Pod{*pod}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, _, err := tryDecodePodList(logger, list, noDefault); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("tryDecodePodList: got error %v, want one containing %q", err, wantErr)
 	}
 }

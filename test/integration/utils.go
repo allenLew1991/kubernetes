@@ -17,48 +17,56 @@ limitations under the License.
 package integration
 
 import (
-	"testing"
+	"context"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 	clientset "k8s.io/client-go/kubernetes"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	testutils "k8s.io/kubernetes/test/utils"
 )
 
-func DeletePodOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
-	if err := c.CoreV1().Pods(ns).Delete(name, nil); err != nil {
+// DeletePodOrErrorf deletes a pod or fails with a call to t.Errorf.
+func DeletePodOrErrorf(t testutils.TB, c clientset.Interface, ns, name string) {
+	if err := c.CoreV1().Pods(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete pod %v: %v", name, err)
 	}
 }
 
 // Requests to try.  Each one should be forbidden or not forbidden
-// depending on the authentication and authorization setup of the master.
-var Code200 = map[int]bool{200: true}
-var Code201 = map[int]bool{201: true}
-var Code400 = map[int]bool{400: true}
-var Code401 = map[int]bool{401: true}
-var Code403 = map[int]bool{403: true}
-var Code404 = map[int]bool{404: true}
-var Code405 = map[int]bool{405: true}
-var Code409 = map[int]bool{409: true}
-var Code422 = map[int]bool{422: true}
-var Code500 = map[int]bool{500: true}
-var Code503 = map[int]bool{503: true}
+// depending on the authentication and authorization setup of the API server.
+var (
+	Code200 = map[int]bool{200: true}
+	Code201 = map[int]bool{201: true}
+	Code400 = map[int]bool{400: true}
+	Code401 = map[int]bool{401: true}
+	Code403 = map[int]bool{403: true}
+	Code404 = map[int]bool{404: true}
+	Code405 = map[int]bool{405: true}
+	Code503 = map[int]bool{503: true}
+)
 
 // WaitForPodToDisappear polls the API server if the pod has been deleted.
 func WaitForPodToDisappear(podClient coreclient.PodInterface, podName string, interval, timeout time.Duration) error {
 	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := podClient.Get(podName, metav1.GetOptions{})
+		_, err := podClient.Get(context.TODO(), podName, metav1.GetOptions{})
 		if err == nil {
 			return false, nil
-		} else {
-			if errors.IsNotFound(err) {
-				return true, nil
-			} else {
-				return false, err
-			}
 		}
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
 	})
+}
+
+// GetEtcdClients returns an initialized etcd clientv3.Client and clientv3.KV.
+func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, clientv3.KV, error) {
+	return kubeapiservertesting.GetEtcdClients(config)
 }

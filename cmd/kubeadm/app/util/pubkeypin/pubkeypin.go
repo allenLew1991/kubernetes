@@ -22,13 +22,19 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"fmt"
 	"strings"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 const (
 	// formatSHA256 is the prefix for pins that are full-length SHA-256 hashes encoded in base 16 (hex)
 	formatSHA256 = "sha256"
+)
+
+var (
+	// supportedFormats enumerates the supported formats
+	supportedFormats = strings.Join([]string{formatSHA256}, ", ")
 )
 
 // Set is a set of pinned x509 public keys.
@@ -46,26 +52,35 @@ func (s *Set) Allow(pubKeyHashes ...string) error {
 	for _, pubKeyHash := range pubKeyHashes {
 		parts := strings.Split(pubKeyHash, ":")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid public key hash, expected \"format:value\"")
+			return errors.Errorf("invalid hash, expected \"format:hex-value\". "+
+				"Known format(s) are: %s", supportedFormats)
 		}
 		format, value := parts[0], parts[1]
 
 		switch strings.ToLower(format) {
 		case "sha256":
-			return s.allowSHA256(value)
+			if err := s.allowSHA256(value); err != nil {
+				return errors.Errorf("invalid hash %q, %v", pubKeyHash, err)
+			}
 		default:
-			return fmt.Errorf("unknown hash format %q", format)
+			return errors.Errorf("unknown hash format %q. Known format(s) are: %s", format, supportedFormats)
 		}
 	}
 	return nil
 }
 
-// Check if a certificate matches one of the public keys in the set
-func (s *Set) Check(certificate *x509.Certificate) error {
-	if s.checkSHA256(certificate) {
-		return nil
+// CheckAny checks if at least one certificate matches one of the public keys in the set
+func (s *Set) CheckAny(certificates []*x509.Certificate) error {
+	var hashes []string
+
+	for _, certificate := range certificates {
+		if s.checkSHA256(certificate) {
+			return nil
+		}
+
+		hashes = append(hashes, Hash(certificate))
 	}
-	return fmt.Errorf("public key %s not pinned", Hash(certificate))
+	return errors.Errorf("none of the public keys %q are pinned", strings.Join(hashes, ":"))
 }
 
 // Empty returns true if the Set contains no pinned public keys.
@@ -86,13 +101,13 @@ func (s *Set) allowSHA256(hash string) error {
 	// validate that the hash is the right length to be a full SHA-256 hash
 	hashLength := hex.DecodedLen(len(hash))
 	if hashLength != sha256.Size {
-		return fmt.Errorf("expected a %d byte SHA-256 hash, found %d bytes", sha256.Size, hashLength)
+		return errors.Errorf("expected a %d byte SHA-256 hash, found %d bytes", sha256.Size, hashLength)
 	}
 
 	// validate that the hash is valid hex
 	_, err := hex.DecodeString(hash)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "could not decode SHA-256 from hex")
 	}
 
 	// in the end, just store the original hex string in memory (in lowercase)

@@ -17,58 +17,96 @@ limitations under the License.
 package remote
 
 import (
-	"flag"
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"os/user"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
-var sshOptions = flag.String("ssh-options", "", "Commandline options passed to ssh.")
-var sshEnv = flag.String("ssh-env", "", "Use predefined ssh options for environment.  Options: gce")
-var sshKey = flag.String("ssh-key", "", "Path to ssh private key.")
-var sshUser = flag.String("ssh-user", "", "Use predefined user for ssh.")
+var sshOptions = CommandLine.String("ssh-options", "", "Commandline options passed to ssh.")
+var sshEnv = CommandLine.String("ssh-env", "", "Use predefined ssh options for environment.  Options: gce")
+var sshKey = CommandLine.String("ssh-key", "", "Path to ssh private key.")
+var sshUser = CommandLine.String("ssh-user", "", "Use predefined user for ssh.")
 
 var sshOptionsMap map[string]string
 var sshDefaultKeyMap map[string]string
+var sshDefaultUserMap map[string]string
 
 func init() {
 	usr, err := user.Current()
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 	sshOptionsMap = map[string]string{
 		"gce": "-o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o CheckHostIP=no -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o LogLevel=ERROR",
+		"aws": "-o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o CheckHostIP=no -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o LogLevel=ERROR",
+	}
+	defaultGceKey := os.Getenv("GCE_SSH_PRIVATE_KEY_FILE")
+	if defaultGceKey == "" {
+		defaultGceKey = fmt.Sprintf("%s/.ssh/google_compute_engine", usr.HomeDir)
 	}
 	sshDefaultKeyMap = map[string]string{
-		"gce": fmt.Sprintf("%s/.ssh/google_compute_engine", usr.HomeDir),
+		"gce": defaultGceKey,
+	}
+	sshDefaultUserMap = map[string]string{
+		"aws": "ec2-user",
 	}
 }
 
-var hostnameIpOverrides = struct {
+var hostnameIPOverrides = struct {
 	sync.RWMutex
 	m map[string]string
 }{m: make(map[string]string)}
 
-func AddHostnameIp(hostname, ip string) {
-	hostnameIpOverrides.Lock()
-	defer hostnameIpOverrides.Unlock()
-	hostnameIpOverrides.m[hostname] = ip
+// AddHostnameIP adds <hostname,ip> pair into hostnameIPOverrides map.
+func AddHostnameIP(hostname, ip string) {
+	hostnameIPOverrides.Lock()
+	defer hostnameIPOverrides.Unlock()
+	hostnameIPOverrides.m[hostname] = ip
 }
 
-// GetHostnameOrIp converts hostname into ip and apply user if necessary.
-func GetHostnameOrIp(hostname string) string {
-	hostnameIpOverrides.RLock()
-	defer hostnameIpOverrides.RUnlock()
+var sshKeyOverrides = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: make(map[string]string)}
+
+// AddSSHKey adds a <hosrtname,path to SSH private key> pair into the sshKeyOverrides map
+func AddSSHKey(hostname, keyFilePath string) {
+	sshKeyOverrides.Lock()
+	defer sshKeyOverrides.Unlock()
+	sshKeyOverrides.m[hostname] = keyFilePath
+}
+
+// GetSSHUser returns the ssh-user CLI flag, the KUBE_SSH_USER environment variable, or the default ssh user
+// for the ssh environment in that order
+func GetSSHUser() string {
+	if *sshUser == "" {
+		*sshUser = os.Getenv("KUBE_SSH_USER")
+	}
+	if *sshUser == "" {
+		*sshUser = sshDefaultUserMap[*sshEnv]
+	}
+	return *sshUser
+}
+
+// GetHostnameOrIP converts hostname into ip and apply user if necessary.
+func GetHostnameOrIP(hostname string) string {
+	hostnameIPOverrides.RLock()
+	defer hostnameIPOverrides.RUnlock()
 	host := hostname
-	if ip, found := hostnameIpOverrides.m[hostname]; found {
+	if ip, found := hostnameIPOverrides.m[hostname]; found {
 		host = ip
 	}
-	if *sshUser != "" {
-		host = fmt.Sprintf("%s@%s", *sshUser, host)
+
+	sshUser := GetSSHUser()
+	if sshUser != "" {
+		host = fmt.Sprintf("%s@%s", sshUser, host)
 	}
 	return host
 }
@@ -81,20 +119,35 @@ func getSSHCommand(sep string, args ...string) string {
 // SSH executes ssh command with runSSHCommand as root. The `sudo` makes sure that all commands
 // are executed by root, so that there won't be permission mismatch between different commands.
 func SSH(host string, cmd ...string) (string, error) {
-	return runSSHCommand("ssh", append([]string{GetHostnameOrIp(host), "--", "sudo"}, cmd...)...)
+	return SSHContext(context.Background(), host, cmd...)
+}
+
+// CommandWaitDelay bounds how long a canceled call waits for pipes that a descendant, such as a ProxyCommand, keeps open.
+const CommandWaitDelay = time.Second
+
+// SSHContext lets provisioning deadlines stop an SSH process that no longer responds.
+func SSHContext(ctx context.Context, host string, cmd ...string) (string, error) {
+	return runSSHCommandContext(ctx, host, "ssh", append([]string{GetHostnameOrIP(host), "--", "sudo"}, cmd...)...)
 }
 
 // SSHNoSudo executes ssh command with runSSHCommand as normal user. Sometimes we need this,
 // for example creating a directory that we'll copy files there with scp.
 func SSHNoSudo(host string, cmd ...string) (string, error) {
-	return runSSHCommand("ssh", append([]string{GetHostnameOrIp(host), "--"}, cmd...)...)
+	return runSSHCommand(host, "ssh", append([]string{GetHostnameOrIP(host), "--"}, cmd...)...)
 }
 
 // runSSHCommand executes the ssh or scp command, adding the flag provided --ssh-options
-func runSSHCommand(cmd string, args ...string) (string, error) {
-	if *sshKey != "" {
-		args = append([]string{"-i", *sshKey}, args...)
-	} else if key, found := sshDefaultKeyMap[*sshEnv]; found {
+func runSSHCommand(host, cmd string, args ...string) (string, error) {
+	return runSSHCommandContext(context.Background(), host, cmd, args...)
+}
+
+func runSSHCommandContext(ctx context.Context, host, cmd string, args ...string) (string, error) {
+	if key, err := getPrivateSSHKey(host); len(key) != 0 {
+		if err != nil {
+			klog.Errorf("private SSH key (%s) not found. Check if the SSH key is configured properly:, err: %v", key, err)
+			return "", fmt.Errorf("private SSH key (%s) does not exist", key)
+		}
+
 		args = append([]string{"-i", key}, args...)
 	}
 	if env, found := sshOptionsMap[*sshEnv]; found {
@@ -103,9 +156,43 @@ func runSSHCommand(cmd string, args ...string) (string, error) {
 	if *sshOptions != "" {
 		args = append(strings.Split(*sshOptions, " "), args...)
 	}
-	output, err := exec.Command(cmd, args...).CombinedOutput()
+	klog.Infof("Running the command %s, with args: %v", cmd, args)
+	command := exec.CommandContext(ctx, cmd, args...)
+	// WaitDelay also fails a normal exit that leaves the pipes open, so only cancelable calls get it.
+	if ctx.Done() != nil {
+		command.WaitDelay = CommandWaitDelay
+	}
+	output, err := command.CombinedOutput()
 	if err != nil {
-		return string(output), fmt.Errorf("command [%s %s] failed with error: %v", cmd, strings.Join(args, " "), err)
+		klog.Errorf("failed to run SSH command: out: %s, err: %v", output, err)
+		return string(output), fmt.Errorf("command [%s %s] failed with error: %w", cmd, strings.Join(args, " "), err)
 	}
 	return string(output), nil
+}
+
+// getPrivateSSHKey returns the path to ssh private key
+func getPrivateSSHKey(host string) (string, error) {
+	if *sshKey != "" {
+		if _, err := os.Stat(*sshKey); err != nil {
+			return *sshKey, err
+		}
+
+		return *sshKey, nil
+	}
+
+	sshKeyOverrides.Lock()
+	defer sshKeyOverrides.Unlock()
+	if key, ok := sshKeyOverrides.m[host]; ok {
+		return key, nil
+	}
+
+	if key, found := sshDefaultKeyMap[*sshEnv]; found {
+		if _, err := os.Stat(key); err != nil {
+			return key, err
+		}
+
+		return key, nil
+	}
+
+	return "", nil
 }

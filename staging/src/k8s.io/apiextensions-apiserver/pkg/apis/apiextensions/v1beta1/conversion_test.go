@@ -17,11 +17,13 @@ limitations under the License.
 package v1beta1
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
 
+	v1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 )
 
@@ -34,26 +36,26 @@ func TestJSONConversion(t *testing.T) {
 
 	testCases := map[string]struct {
 		input    *apiextensions.JSONSchemaProps
-		expected *JSONSchemaProps
+		expected *v1beta1.JSONSchemaProps
 	}{
 		"nil": {
 			input: &apiextensions.JSONSchemaProps{
 				Default: nil,
 			},
-			expected: &JSONSchemaProps{},
+			expected: &v1beta1.JSONSchemaProps{},
 		},
 		"aliased nil": {
 			input: &apiextensions.JSONSchemaProps{
 				Default: &nilJSON,
 			},
-			expected: &JSONSchemaProps{},
+			expected: &v1beta1.JSONSchemaProps{},
 		},
 		"null": {
 			input: &apiextensions.JSONSchemaProps{
 				Default: &nullJSON,
 			},
-			expected: &JSONSchemaProps{
-				Default: &JSON{
+			expected: &v1beta1.JSONSchemaProps{
+				Default: &v1beta1.JSON{
 					Raw: []byte(`"null"`),
 				},
 			},
@@ -62,8 +64,8 @@ func TestJSONConversion(t *testing.T) {
 			input: &apiextensions.JSONSchemaProps{
 				Default: &stringJSON,
 			},
-			expected: &JSONSchemaProps{
-				Default: &JSON{
+			expected: &v1beta1.JSONSchemaProps{
+				Default: &v1beta1.JSON{
 					Raw: []byte(`"foo"`),
 				},
 			},
@@ -72,8 +74,8 @@ func TestJSONConversion(t *testing.T) {
 			input: &apiextensions.JSONSchemaProps{
 				Default: &boolJSON,
 			},
-			expected: &JSONSchemaProps{
-				Default: &JSON{
+			expected: &v1beta1.JSONSchemaProps{
+				Default: &v1beta1.JSON{
 					Raw: []byte(`true`),
 				},
 			},
@@ -82,8 +84,8 @@ func TestJSONConversion(t *testing.T) {
 			input: &apiextensions.JSONSchemaProps{
 				Default: &sliceJSON,
 			},
-			expected: &JSONSchemaProps{
-				Default: &JSON{
+			expected: &v1beta1.JSONSchemaProps{
+				Default: &v1beta1.JSON{
 					Raw: []byte(`["foo","bar","baz"]`),
 				},
 			},
@@ -101,7 +103,7 @@ func TestJSONConversion(t *testing.T) {
 	}
 
 	for k, tc := range testCases {
-		external := &JSONSchemaProps{}
+		external := &v1beta1.JSONSchemaProps{}
 		if err := scheme.Convert(tc.input, external, nil); err != nil {
 			t.Errorf("%s: unexpected error: %v", k, err)
 		}
@@ -109,5 +111,59 @@ func TestJSONConversion(t *testing.T) {
 		if !reflect.DeepEqual(external, tc.expected) {
 			t.Errorf("%s: expected\n\t%#v, got \n\t%#v", k, tc.expected, external)
 		}
+	}
+}
+
+func TestJSONRoundTrip(t *testing.T) {
+	testcases := []struct {
+		name string
+		in   string
+		out  string
+	}{
+		{
+			name: "nulls",
+			in:   `{"default":null,"enum":null,"example":null}`,
+			out:  `{}`,
+		},
+		{
+			name: "null values",
+			in:   `{"default":{"test":null},"enum":[null],"example":{"test":null}}`,
+			out:  `{"default":{"test":null},"enum":[null],"example":{"test":null}}`,
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	// add internal and external types
+	if err := apiextensions.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			external := &v1beta1.JSONSchemaProps{}
+			if err := json.Unmarshal([]byte(tc.in), external); err != nil {
+				t.Fatal(err)
+			}
+
+			internal := &apiextensions.JSONSchemaProps{}
+			if err := scheme.Convert(external, internal, nil); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			roundtripped := &v1beta1.JSONSchemaProps{}
+			if err := scheme.Convert(internal, roundtripped, nil); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			out, err := json.Marshal(roundtripped)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != string(tc.out) {
+				t.Fatalf("expected\n%s\ngot\n%s", string(tc.out), string(out))
+			}
+		})
 	}
 }

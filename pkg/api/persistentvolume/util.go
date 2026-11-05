@@ -17,108 +17,86 @@ limitations under the License.
 package persistentvolume
 
 import (
+	"fmt"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	nodeapi "k8s.io/kubernetes/pkg/api/node"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/features"
 )
 
-func getClaimRefNamespace(pv *api.PersistentVolume) string {
-	if pv.Spec.ClaimRef != nil {
-		return pv.Spec.ClaimRef.Namespace
-	}
-	return ""
-}
-
-// Visitor is called with each object's namespace and name, and returns true if visiting should continue
-type Visitor func(namespace, name string) (shouldContinue bool)
-
-// VisitPVSecretNames invokes the visitor function with the name of every secret
-// referenced by the PV spec. If visitor returns false, visiting is short-circuited.
-// Returns true if visiting completed, false if visiting was short-circuited.
-func VisitPVSecretNames(pv *api.PersistentVolume, visitor Visitor) bool {
-	source := &pv.Spec.PersistentVolumeSource
-	switch {
-	case source.AzureFile != nil:
-		if source.AzureFile.SecretNamespace != nil && len(*source.AzureFile.SecretNamespace) > 0 {
-			if len(source.AzureFile.SecretName) > 0 && !visitor(*source.AzureFile.SecretNamespace, source.AzureFile.SecretName) {
-				return false
-			}
-		} else {
-			if len(source.AzureFile.SecretName) > 0 && !visitor(getClaimRefNamespace(pv), source.AzureFile.SecretName) {
-				return false
-			}
-		}
-		return true
-	case source.CephFS != nil:
-		if source.CephFS.SecretRef != nil {
-			// previously persisted PV objects use claimRef namespace
-			ns := getClaimRefNamespace(pv)
-			if len(source.CephFS.SecretRef.Namespace) > 0 {
-				// use the secret namespace if namespace is set
-				ns = source.CephFS.SecretRef.Namespace
-			}
-			if !visitor(ns, source.CephFS.SecretRef.Name) {
-				return false
-			}
-		}
-	case source.FlexVolume != nil:
-		if source.FlexVolume.SecretRef != nil {
-			// previously persisted PV objects use claimRef namespace
-			ns := getClaimRefNamespace(pv)
-			if len(source.FlexVolume.SecretRef.Namespace) > 0 {
-				// use the secret namespace if namespace is set
-				ns = source.FlexVolume.SecretRef.Namespace
-			}
-			if !visitor(ns, source.FlexVolume.SecretRef.Name) {
-				return false
-			}
-		}
-	case source.RBD != nil:
-		if source.RBD.SecretRef != nil {
-			// previously persisted PV objects use claimRef namespace
-			ns := getClaimRefNamespace(pv)
-			if len(source.RBD.SecretRef.Namespace) > 0 {
-				// use the secret namespace if namespace is set
-				ns = source.RBD.SecretRef.Namespace
-			}
-			if !visitor(ns, source.RBD.SecretRef.Name) {
-				return false
-			}
-		}
-	case source.ScaleIO != nil:
-		if source.ScaleIO.SecretRef != nil {
-			ns := getClaimRefNamespace(pv)
-			if source.ScaleIO.SecretRef != nil && len(source.ScaleIO.SecretRef.Namespace) > 0 {
-				ns = source.ScaleIO.SecretRef.Namespace
-			}
-			if !visitor(ns, source.ScaleIO.SecretRef.Name) {
-				return false
-			}
-		}
-	case source.ISCSI != nil:
-		if source.ISCSI.SecretRef != nil {
-			// previously persisted PV objects use claimRef namespace
-			ns := getClaimRefNamespace(pv)
-			if len(source.ISCSI.SecretRef.Namespace) > 0 {
-				// use the secret namespace if namespace is set
-				ns = source.ISCSI.SecretRef.Namespace
-			}
-			if !visitor(ns, source.ISCSI.SecretRef.Name) {
-				return false
-			}
-		}
-	case source.StorageOS != nil:
-		if source.StorageOS.SecretRef != nil && !visitor(source.StorageOS.SecretRef.Namespace, source.StorageOS.SecretRef.Name) {
-			return false
-		}
-	}
-	return true
-}
-
-// DropDisabledAlphaFields removes disabled fields from the pv spec.
+// DropDisabledSpecFields removes disabled fields from the pv spec.
 // This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a pv spec.
-func DropDisabledAlphaFields(pvSpec *api.PersistentVolumeSpec) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
-		pvSpec.VolumeMode = nil
+func DropDisabledSpecFields(pvSpec *api.PersistentVolumeSpec, oldPVSpec *api.PersistentVolumeSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.VolumeAttributesClass) {
+		if oldPVSpec == nil || oldPVSpec.VolumeAttributesClassName == nil {
+			pvSpec.VolumeAttributesClassName = nil
+		}
 	}
+}
+
+func GetWarningsForPersistentVolume(pv *api.PersistentVolume) []string {
+	if pv == nil {
+		return nil
+	}
+	return warningsForPersistentVolumeSpecAndMeta(nil, &pv.Spec, &pv.ObjectMeta)
+}
+
+var deprecatedAnnotations = []struct {
+	key     string
+	message string
+}{
+	{
+		key:     `volume.beta.kubernetes.io/storage-class`,
+		message: `deprecated since v1.8; use "storageClassName" attribute instead`,
+	},
+	{
+		key:     `volume.beta.kubernetes.io/mount-options`,
+		message: `deprecated since v1.31; use "mountOptions" attribute instead`,
+	},
+}
+
+func warningsForPersistentVolumeSpecAndMeta(fieldPath *field.Path, pvSpec *api.PersistentVolumeSpec, pvMeta *metav1.ObjectMeta) []string {
+	var warnings []string
+
+	// use of deprecated annotations
+	for _, deprecated := range deprecatedAnnotations {
+		if _, exists := pvMeta.Annotations[deprecated.key]; exists {
+			warnings = append(warnings, fmt.Sprintf("%s: %s", fieldPath.Child("metadata", "annotations").Key(deprecated.key), deprecated.message))
+		}
+	}
+
+	if pvSpec.PersistentVolumeReclaimPolicy == api.PersistentVolumeReclaimRecycle {
+		warnings = append(warnings, fmt.Sprintf("%s: The Recycle reclaim policy is deprecated. Instead, the recommended approach is to use dynamic provisioning.", fieldPath.Child("spec", "persistentVolumeReclaimPolicy")))
+	}
+
+	if pvSpec.NodeAffinity != nil && pvSpec.NodeAffinity.Required != nil {
+		termFldPath := fieldPath.Child("spec", "nodeAffinity", "required", "nodeSelectorTerms")
+		// use of deprecated node labels in node affinity
+		for i, term := range pvSpec.NodeAffinity.Required.NodeSelectorTerms {
+			warnings = append(warnings, nodeapi.GetWarningsForNodeSelectorTerm(term, false, termFldPath.Index(i))...)
+		}
+	}
+	// If we are on deprecated volume plugin
+	if pvSpec.CephFS != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.28, non-functional in v1.31+", fieldPath.Child("spec", "cephfs")))
+	}
+	if pvSpec.PhotonPersistentDisk != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.11, non-functional in v1.16+", fieldPath.Child("spec", "photonPersistentDisk")))
+	}
+	if pvSpec.ScaleIO != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.16, non-functional in v1.22+", fieldPath.Child("spec", "scaleIO")))
+	}
+	if pvSpec.StorageOS != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.22, non-functional in v1.25+", fieldPath.Child("spec", "storageOS")))
+	}
+	if pvSpec.Glusterfs != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.25, non-functional in v1.26+", fieldPath.Child("spec", "glusterfs")))
+	}
+	if pvSpec.RBD != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: deprecated in v1.28, non-functional in v1.31+", fieldPath.Child("spec", "rbd")))
+	}
+	return warnings
 }

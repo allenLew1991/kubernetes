@@ -34,13 +34,21 @@ func TestPortRange(t *testing.T) {
 		{" 100-200 ", true, "100-200", 200, 201},
 		{"0-0", true, "0-0", 0, 1},
 		{"", true, "", -1, 0},
-		{"100", false, "", -1, -1},
+		{"100", true, "100-100", 100, 101},
 		{"100 - 200", false, "", -1, -1},
 		{"-100", false, "", -1, -1},
 		{"100-", false, "", -1, -1},
 		{"200-100", false, "", -1, -1},
 		{"60000-70000", false, "", -1, -1},
 		{"70000-80000", false, "", -1, -1},
+		{"70000+80000", false, "", -1, -1},
+		{"1+0", true, "1-1", 1, 2},
+		{"0+0", true, "0-0", 0, 1},
+		{"1+-1", false, "", -1, -1},
+		{"1-+1", false, "", -1, -1},
+		{"100+200", true, "100-300", 300, 301},
+		{"1+65535", false, "", -1, -1},
+		{"0+65535", true, "0-65535", 65535, 65536},
 	}
 
 	for i := range testCases {
@@ -48,11 +56,11 @@ func TestPortRange(t *testing.T) {
 		pr := &PortRange{}
 		var f flag.Value = pr
 		err := f.Set(tc.input)
-		if err != nil && tc.success == true {
+		if err != nil && tc.success {
 			t.Errorf("expected success, got %q", err)
 			continue
-		} else if err == nil && tc.success == false {
-			t.Errorf("expected failure")
+		} else if err == nil && !tc.success {
+			t.Errorf("expected failure %#v", testCases[i])
 			continue
 		} else if tc.success {
 			if f.String() != tc.expected {

@@ -17,13 +17,15 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -34,13 +36,15 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+// Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
 	indexer  cache.Indexer
-	queue    workqueue.RateLimitingInterface
+	queue    workqueue.TypedRateLimitingInterface[string]
 	informer cache.Controller
 }
 
-func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller) *Controller {
+// NewController creates a new Controller.
+func NewController(queue workqueue.TypedRateLimitingInterface[string], indexer cache.Indexer, informer cache.Controller) *Controller {
 	return &Controller{
 		informer: informer,
 		indexer:  indexer,
@@ -48,7 +52,7 @@ func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer,
 	}
 }
 
-func (c *Controller) processNextItem() bool {
+func (c *Controller) processNextItem(logger klog.Logger) bool {
 	// Wait until there is a new item in the working queue
 	key, quit := c.queue.Get()
 	if quit {
@@ -60,9 +64,9 @@ func (c *Controller) processNextItem() bool {
 	defer c.queue.Done(key)
 
 	// Invoke the method containing the business logic
-	err := c.syncToStdout(key.(string))
+	err := c.syncToStdout(key)
 	// Handle the error if something went wrong during the execution of the business logic
-	c.handleErr(err, key)
+	c.handleErr(logger, err, key)
 	return true
 }
 
@@ -72,8 +76,7 @@ func (c *Controller) processNextItem() bool {
 func (c *Controller) syncToStdout(key string) error {
 	obj, exists, err := c.indexer.GetByKey(key)
 	if err != nil {
-		glog.Errorf("Fetching object with key %s from store failed with %v", key, err)
-		return err
+		return fmt.Errorf("fetching object with key %s from store failed: %w", key, err)
 	}
 
 	if !exists {
@@ -88,7 +91,7 @@ func (c *Controller) syncToStdout(key string) error {
 }
 
 // handleErr checks if an error happened and makes sure we will retry later.
-func (c *Controller) handleErr(err error, key interface{}) {
+func (c *Controller) handleErr(logger klog.Logger, err error, key string) {
 	if err == nil {
 		// Forget about the #AddRateLimited history of the key on every successful synchronization.
 		// This ensures that future processing of updates for this key is not delayed because of
@@ -99,7 +102,7 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	// This controller retries 5 times if something goes wrong. After that, it stops trying.
 	if c.queue.NumRequeues(key) < 5 {
-		glog.Infof("Error syncing pod %v: %v", key, err)
+		logger.Info("Syncing failed, will retry", "pod", key, "err", err)
 
 		// Re-enqueue the key rate limited. Based on the rate limiter on the
 		// queue and the re-enqueue history, the key will be processed later again.
@@ -109,35 +112,37 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	c.queue.Forget(key)
 	// Report to an external entity that, even after several retries, we could not successfully process this key
-	runtime.HandleError(err)
-	glog.Infof("Dropping pod %q out of the queue: %v", key, err)
+	runtime.HandleErrorWithLogger(logger, err, "Dropping pod out of the queue", "pod", key)
 }
 
-func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
-	defer runtime.HandleCrash()
+// Run begins watching and syncing.
+func (c *Controller) Run(ctx context.Context, workers int) {
+	defer runtime.HandleCrashWithContext(ctx)
+	logger := klog.FromContext(ctx)
 
 	// Let the workers stop when we are done
 	defer c.queue.ShutDown()
-	glog.Info("Starting Pod controller")
+	logger.Info("Starting Pod controller")
+	defer logger.Info("Stopping Pod controller")
 
-	go c.informer.Run(stopCh)
+	go c.informer.RunWithContext(ctx)
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
-	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.informer.HasSynced) {
 		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
 		return
 	}
 
-	for i := 0; i < threadiness; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	<-stopCh
-	glog.Info("Stopping Pod controller")
+	<-ctx.Done()
 }
 
-func (c *Controller) runWorker() {
-	for c.processNextItem() {
+func (c *Controller) runWorker(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	for c.processNextItem(logger) {
 	}
 }
 
@@ -149,50 +154,67 @@ func main() {
 	flag.StringVar(&master, "master", "", "master url")
 	flag.Parse()
 
+	// Some more complete example could also allow configuring different logging backends.
+	// In this one we use the klog default.
+	logger := klog.Background()
+
 	// creates the connection
 	config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
 	if err != nil {
-		glog.Fatal(err)
+		logger.Error(err, "Building Kubernetes client config failed")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		glog.Fatal(err)
+		logger.Error(err, "Building Kubernetes client failed")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
+
+	ctx := context.Background()
 
 	// create the pod watcher
 	podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", v1.NamespaceDefault, fields.Everything())
 
 	// create the workqueue
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{
+		Logger: &logger,
+	})
 
 	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
 	// whenever the cache is updated, the pod key is added to the workqueue.
 	// Note that when we finally process the item from the workqueue, we might see a newer version
 	// of the Pod than the version which was responsible for triggering the update.
-	indexer, informer := cache.NewIndexerInformer(podListWatcher, &v1.Pod{}, 0, cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-			}
+	store, informer := cache.NewInformerWithOptions(cache.InformerOptions{
+		Logger:        &logger,
+		ListerWatcher: podListWatcher,
+		ObjectType:    &v1.Pod{},
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				key, err := cache.MetaNamespaceKeyFunc(obj)
+				if err == nil {
+					queue.Add(key)
+				}
+			},
+			UpdateFunc: func(old interface{}, new interface{}) {
+				key, err := cache.MetaNamespaceKeyFunc(new)
+				if err == nil {
+					queue.Add(key)
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				// IndexerInformer uses a delta queue, therefore for deletes we have to use this
+				// key function.
+				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+				if err == nil {
+					queue.Add(key)
+				}
+			},
 		},
-		UpdateFunc: func(old interface{}, new interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(new)
-			if err == nil {
-				queue.Add(key)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			// IndexerInformer uses a delta queue, therefore for deletes we have to use this
-			// key function.
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-			}
-		},
-	}, cache.Indexers{})
+		Indexers: cache.Indexers{},
+	})
+	indexer := store.(cache.Indexer)
 
 	controller := NewController(queue, indexer, informer)
 
@@ -208,9 +230,9 @@ func main() {
 	})
 
 	// Now let's start the controller
-	stop := make(chan struct{})
-	defer close(stop)
-	go controller.Run(1, stop)
+	cancelCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(errors.New("time to stop because main has completed"))
+	go controller.Run(cancelCtx, 1)
 
 	// Wait forever
 	select {}

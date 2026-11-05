@@ -33,10 +33,11 @@ import (
 
 var (
 	dumpTree = flag.Bool("dump", false, "print AST")
-	dumpJson = flag.Bool("json", false, "output test list as JSON")
+	dumpJSON = flag.Bool("json", false, "output test list as JSON")
 	warn     = flag.Bool("warn", false, "print warnings")
 )
 
+// Test holds test locations, package names, and test names.
 type Test struct {
 	Loc      string
 	Name     string
@@ -154,16 +155,12 @@ func (w *walker) firstArg(n *ast.CallExpr) string {
 }
 
 // describeName returns the first argument of a function if it's
-// a Ginkgo-relevant function (Describe/KubeDescribe/Context),
+// a Ginkgo-relevant function (Describe/SIGDescribe/Context),
 // and the empty string otherwise.
 func (w *walker) describeName(n *ast.CallExpr) string {
 	switch x := n.Fun.(type) {
-	case *ast.SelectorExpr:
-		if x.Sel.Name != "KubeDescribe" {
-			return ""
-		}
 	case *ast.Ident:
-		if x.Name != "Describe" && x.Name != "Context" {
+		if x.Name != "SIGDescribe" && x.Name != "Describe" && x.Name != "Context" {
 			return ""
 		}
 	default:
@@ -262,7 +259,7 @@ func main() {
 			log.Fatalf("Error walking: %v", err)
 		}
 	}
-	if *dumpJson {
+	if *dumpJSON {
 		json, err := json.Marshal(tests.tests)
 		if err != nil {
 			log.Fatal(err)

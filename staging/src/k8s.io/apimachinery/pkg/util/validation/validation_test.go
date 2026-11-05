@@ -17,6 +17,7 @@ limitations under the License.
 package validation
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -110,31 +111,6 @@ func TestIsDNS1035Label(t *testing.T) {
 	}
 	for _, val := range badValues {
 		if msgs := IsDNS1035Label(val); len(msgs) == 0 {
-			t.Errorf("expected false for '%s'", val)
-		}
-	}
-}
-
-func TestIsCIdentifier(t *testing.T) {
-	goodValues := []string{
-		"a", "ab", "abc", "a1", "_a", "a_", "a_b", "a_1", "a__1__2__b", "__abc_123",
-		"A", "AB", "AbC", "A1", "_A", "A_", "A_B", "A_1", "A__1__2__B", "__123_ABC",
-	}
-	for _, val := range goodValues {
-		if msgs := IsCIdentifier(val); len(msgs) != 0 {
-			t.Errorf("expected true for '%s': %v", val, msgs)
-		}
-	}
-
-	badValues := []string{
-		"", "1", "123", "1a",
-		"-", "a-", "-a", "1-", "-1", "1_", "1_2",
-		".", "a.", ".a", "a.b", "1.", ".1", "1.2",
-		" ", "a ", " a", "a b", "1 ", " 1", "1 2",
-		"#a#",
-	}
-	for _, val := range badValues {
-		if msgs := IsCIdentifier(val); len(msgs) == 0 {
 			t.Errorf("expected false for '%s'", val)
 		}
 	}
@@ -297,7 +273,7 @@ func TestIsValidLabelValue(t *testing.T) {
 		"end-with-num-1",
 		"1234",                  // only num
 		strings.Repeat("a", 63), // to the limit
-		"", // empty value
+		"",                      // empty value
 	}
 	for i := range successCases {
 		if errs := IsValidLabelValue(successCases[i]); len(errs) != 0 {
@@ -318,39 +294,6 @@ func TestIsValidLabelValue(t *testing.T) {
 	for i := range errorCases {
 		if errs := IsValidLabelValue(errorCases[i]); len(errs) == 0 {
 			t.Errorf("case[%d] expected failure", i)
-		}
-	}
-}
-
-func TestIsValidIP(t *testing.T) {
-	goodValues := []string{
-		"::1",
-		"2a00:79e0:2:0:f1c3:e797:93c1:df80",
-		"::",
-		"2001:4860:4860::8888",
-		"::fff:1.1.1.1",
-		"1.1.1.1",
-		"1.1.1.01",
-		"255.0.0.1",
-		"1.0.0.0",
-		"0.0.0.0",
-	}
-	for _, val := range goodValues {
-		if msgs := IsValidIP(val); len(msgs) != 0 {
-			t.Errorf("expected true for %q: %v", val, msgs)
-		}
-	}
-
-	badValues := []string{
-		"[2001:db8:0:1]:80",
-		"myhost.mydomain",
-		"-1.0.0.0",
-		"[2001:db8:0:1]",
-		"a",
-	}
-	for _, val := range badValues {
-		if msgs := IsValidIP(val); len(msgs) == 0 {
-			t.Errorf("expected false for %q", val)
 		}
 	}
 }
@@ -451,6 +394,13 @@ func TestIsConfigMapKey(t *testing.T) {
 	}
 }
 
+func BenchmarkIsWildcardDNS1123Subdomain(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		IsWildcardDNS1123Subdomain("*.foo.example.com")
+	}
+}
+
 func TestIsWildcardDNS1123Subdomain(t *testing.T) {
 	goodValues := []string{
 		"*.example.com",
@@ -477,29 +427,112 @@ func TestIsWildcardDNS1123Subdomain(t *testing.T) {
 	}
 }
 
+func TestIsFullyQualifiedDomainName(t *testing.T) {
+	goodValues := []string{
+		"a.com",
+		"k8s.io",
+		"dev.k8s.io",
+		"dev.k8s.io.",
+		"foo.example.com",
+		"this.is.a.really.long.fqdn",
+		"bbc.co.uk",
+		"10.0.0.1", // DNS labels can start with numbers and there is no requirement for letters.
+		"hyphens-are-good.k8s.io",
+		strings.Repeat("a", 63) + ".k8s.io",
+		strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 54) + ".k8s.io",
+	}
+	for _, val := range goodValues {
+		if err := IsFullyQualifiedDomainName(field.NewPath(""), val).ToAggregate(); err != nil {
+			t.Errorf("expected no errors for %q: %v", val, err)
+		}
+	}
+
+	badValues := []string{
+		".",
+		"...",
+		".io",
+		"com",
+		".com",
+		"Dev.k8s.io",
+		".foo.example.com",
+		"*.example.com",
+		"*.bar.com",
+		"*.foo.bar.com",
+		"underscores_are_bad.k8s.io",
+		"foo@bar.example.com",
+		"http://foo.example.com",
+		strings.Repeat("a", 64) + ".k8s.io",
+		strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 55) + ".k8s.io",
+	}
+	for _, val := range badValues {
+		if err := IsFullyQualifiedDomainName(field.NewPath(""), val).ToAggregate(); err == nil {
+			t.Errorf("expected errors for %q", val)
+		}
+	}
+}
+
 func TestIsFullyQualifiedName(t *testing.T) {
-	tests := []struct {
+	goodValues := []string{
+		"dev.k8s.io",
+		"foo.example.com",
+		"this.is.a.really.long.fqdn",
+		"bbc.co.uk",
+		"10.0.0.1", // DNS labels can start with numbers and there is no requirement for letters.
+		"hyphens-are-good.k8s.io",
+		strings.Repeat("a", 246) + ".k8s.io",
+	}
+	for _, val := range goodValues {
+		if err := IsFullyQualifiedName(field.NewPath(""), val).ToAggregate(); err != nil {
+			t.Errorf("expected no errors for %q: %v", val, err)
+		}
+	}
+
+	badValues := []string{
+		"...",
+		"dev.k8s.io.",
+		".io",
+		"Dev.k8s.io",
+		"k8s.io",
+		"*.example.com",
+		"*.bar.com",
+		"*.foo.bar.com",
+		"underscores_are_bad.k8s.io",
+		"foo@bar.example.com",
+		"http://foo.example.com",
+		strings.Repeat("a", 247) + ".k8s.io",
+	}
+	for _, val := range badValues {
+		if err := IsFullyQualifiedName(field.NewPath(""), val).ToAggregate(); err == nil {
+			t.Errorf("expected errors for %q", val)
+		}
+	}
+
+	messageTests := []struct {
 		name       string
 		targetName string
 		err        string
-	}{
-		{
-			name:       "name needs to be fully qualified, i.e., contains at least 2 dots",
-			targetName: "k8s.io",
-			err:        "should be a domain with at least three segments separated by dots",
-		},
-		{
-			name:       "name cannot be empty",
-			targetName: "",
-			err:        "Required value",
-		},
-		{
-			name:       "name must conform to RFC 1123",
-			targetName: "A.B.C",
-			err:        "a DNS-1123 subdomain must consist of lower case alphanumeric characters",
-		},
-	}
-	for _, tc := range tests {
+	}{{
+		name:       "name needs to be fully qualified, i.e., contains at least 2 dots",
+		targetName: "k8s.io",
+		err:        "should be a domain with at least three segments separated by dots",
+	}, {
+		name:       "name should not include scheme",
+		targetName: "http://foo.k8s.io",
+		err:        "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters",
+	}, {
+		name:       "email should be invalid",
+		targetName: "example@foo.k8s.io",
+		err:        "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters",
+	}, {
+		name:       "name cannot be empty",
+		targetName: "",
+		err:        "Required value",
+	}, {
+		name:       "name must conform to RFC 1123",
+		targetName: "A.B.C",
+		err:        "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters",
+	}}
+	for _, tc := range messageTests {
 		err := IsFullyQualifiedName(field.NewPath(""), tc.targetName).ToAggregate()
 		switch {
 		case tc.err == "" && err != nil:
@@ -509,5 +542,230 @@ func TestIsFullyQualifiedName(t *testing.T) {
 		case tc.err != "" && err != nil && !strings.Contains(err.Error(), tc.err):
 			t.Errorf("%q: expected %s, got %v", tc.name, tc.err, err)
 		}
+	}
+}
+
+func TestIsDomainPrefixedPath(t *testing.T) {
+	goodValues := []string{
+		"a/b",
+		"a/b/c/d",
+		"a.com/foo",
+		"a.b.c.d/foo",
+		"k8s.io/foo/bar",
+		"k8s.io/FOO/BAR",
+		"dev.k8s.io/more/path",
+		"this.is.a.really.long.fqdn/even/longer/path/just/because",
+		"bbc.co.uk/path/goes/here",
+		"10.0.0.1/foo",
+		"hyphens-are-good.k8s.io/and-in-paths-too",
+		strings.Repeat("a", 240) + ".k8s.io/a",
+		"k8s.io/" + strings.Repeat("a", 240),
+	}
+	for _, val := range goodValues {
+		if err := IsDomainPrefixedPath(field.NewPath(""), val).ToAggregate(); err != nil {
+			t.Errorf("expected no errors for %q: %v", val, err)
+		}
+	}
+
+	badValues := []string{
+		".",
+		"...",
+		"/b",
+		"com",
+		".com",
+		"a.b.c.d/foo?a=b",
+		"a.b.c.d/foo#a",
+		"Dev.k8s.io",
+		".foo.example.com",
+		"*.example.com",
+		"example.com/foo{}[]@^`",
+		"underscores_are_bad.k8s.io",
+		"underscores_are_bad.k8s.io/foo",
+		"foo@bar.example.com",
+		"foo@bar.example.com/foo",
+		strings.Repeat("a", 247) + ".k8s.io",
+	}
+	for _, val := range badValues {
+		if err := IsDomainPrefixedPath(field.NewPath(""), val).ToAggregate(); err == nil {
+			t.Errorf("expected errors for %q", val)
+		}
+	}
+}
+
+func TestIsRelaxedEnvVarName(t *testing.T) {
+	goodValues := []string{
+		"-", ":", "_", "+a", ">a", "<a",
+		"a.", "a..", "*a", "%a", "?a",
+		"a:a", "a_a", "aAz", "~a", "|a",
+		"a0a", "a9", "/a", "a ", "#a",
+		"0a", "0 a", "'a", "(a", "@a",
+	}
+	for _, val := range goodValues {
+		if msgs := IsRelaxedEnvVarName(val); len(msgs) != 0 {
+			t.Errorf("expected true for '%s': %v", val, msgs)
+		}
+	}
+
+	badValues := []string{
+		"", "=", "a=", "1=a", "a=b", "#%=&&",
+		string(rune(1)) + "abc", string(rune(130)) + "abc",
+		"Ç ç", "Ä ä", "Ñ ñ", "Ø ø",
+	}
+
+	for _, val := range badValues {
+		if msgs := IsRelaxedEnvVarName(val); len(msgs) == 0 {
+			t.Errorf("expected false for '%s'", val)
+		}
+	}
+}
+
+func TestIsDNS1123SubdomainWithUnderscore(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		expected []string
+	}{
+		{
+			name:     "valid subdomain",
+			value:    "example.com",
+			expected: nil,
+		},
+		{
+			name:     "valid subdomain with underscore",
+			value:    "_example.com",
+			expected: nil,
+		},
+		{
+			name:     "valid subdomain with multiple segments",
+			value:    "sub._example.com",
+			expected: nil,
+		},
+		{
+			name:     "valid subdomain with hyphen",
+			value:    "sub-domain.example.com",
+			expected: nil,
+		},
+		{
+			name:     "valid subdomain with underscore in middle",
+			value:    "sub_domain.example.com",
+			expected: nil,
+		},
+		{
+			name:     "empty string",
+			value:    "",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "invalid uppercase characters",
+			value:    "Example.com",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "invalid starting character",
+			value:    "-example.com",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "invalid ending character",
+			value:    "example.com-",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "invalid characters",
+			value:    "example@.com",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "too long subdomain",
+			value:    "a." + string(make([]byte, 251)) + ".com",
+			expected: []string{MaxLenError(DNS1123SubdomainMaxLength), RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "multiple dots",
+			value:    "example..com",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+		{
+			name:     "underscore only",
+			value:    "_",
+			expected: []string{RegexError(dns1123SubdomainErrorMsgFG, dns1123SubdomainFmtWithUnderscore, "example.com")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsDNS1123SubdomainWithUnderscore(tt.value)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("IsDNS1123SubdomainWithUnderscore(%q) = %v; want %v", tt.value, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsDomainPrefixedKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		expected field.ErrorList
+	}{
+		{
+			name:     "valid domain-prefixed key 1",
+			value:    "example.com/foo",
+			expected: nil,
+		},
+		{
+			name:     "valid domain-prefixed key  2",
+			value:    "example/com",
+			expected: nil,
+		},
+		{
+			name:     "invalid key 1",
+			value:    "example",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example", "must be a domain-prefixed key (such as \"acme.io/foo\")")},
+		},
+		{
+			name:     "invalid key 2",
+			value:    "example/foo/bar",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example/foo/bar", "a valid label key must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]') with an optional DNS subdomain prefix and '/' (e.g. 'example.com/MyName')")},
+		},
+		{
+			name:     "invalid key 3",
+			value:    "/example/foo",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "/example/foo", "a valid label key must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]') with an optional DNS subdomain prefix and '/' (e.g. 'example.com/MyName')")},
+		},
+		{
+			name:     "invalid key 4",
+			value:    "",
+			expected: field.ErrorList{field.Required(field.NewPath("test"), "")},
+		},
+		{
+			name:     "invalid key 5",
+			value:    "example.com/_e",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example.com/_e", "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")},
+		},
+		{
+			name:     "invalid key 6",
+			value:    "example.com/e_",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example.com/e_", "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")},
+		},
+		{
+			name:     "invalid key 7",
+			value:    "example.com/e?",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example.com/e?", "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")},
+		},
+		{
+			name:     "invalid key 8",
+			value:    "example.com/e_$",
+			expected: field.ErrorList{field.Invalid(field.NewPath("test"), "example.com/e_$", "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsDomainPrefixedKey(field.NewPath("test"), tt.value)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("IsDomainPrefixedKey(%q) = %v; want %v", tt.value, result, tt.expected)
+			}
+		})
 	}
 }

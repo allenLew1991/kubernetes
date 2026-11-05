@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -14,17 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -o errexit
+set -o nounset
+set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../../../../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../../../../..
 source "${KUBE_ROOT}/hack/lib/util.sh"
 
 # Register function to be called on EXIT to remove generated binary.
 function cleanup {
-  rm "${KUBE_ROOT}/vendor/k8s.io/kube-aggregator/artifacts/simple-image/kube-aggregator"
+  rm "${KUBE_ROOT}/staging/src/k8s.io/kube-aggregator/artifacts/simple-image/kube-aggregator"
 }
 trap cleanup EXIT
 
-pushd "${KUBE_ROOT}/vendor/k8s.io/kube-aggregator"
+pushd "${KUBE_ROOT}/staging/src/k8s.io/kube-aggregator"
 cp -v ../../../../_output/local/bin/linux/amd64/kube-aggregator ./artifacts/simple-image/kube-aggregator
 docker build -t kube-aggregator:latest ./artifacts/simple-image
 popd

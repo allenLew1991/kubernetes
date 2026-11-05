@@ -1,5 +1,3 @@
-// +build !race
-
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -22,22 +20,27 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	"github.com/onsi/gomega"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/ktesting"
 )
 
 func TestMutationDetector(t *testing.T) {
-	fakeWatch := watch.NewFake()
-	lw := &testLW{
+	logger := ktesting.Init(t).Logger()
+	fakeWatch := watch.NewFakeWithOptions(watch.FakeOptions{Logger: &logger})
+	lw := toListWatcherWithUnSupportedWatchListSemantics(&ListWatch{
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			return fakeWatch, nil
 		},
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			return &v1.PodList{}, nil
 		},
-	}
+	})
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "anything",
@@ -46,36 +49,45 @@ func TestMutationDetector(t *testing.T) {
 	}
 	stopCh := make(chan struct{})
 	defer close(stopCh)
-	addReceived := make(chan bool)
 	mutationFound := make(chan bool)
 
 	informer := NewSharedInformer(lw, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
-	informer.cacheMutationDetector = &defaultCacheMutationDetector{
-		name:   "name",
-		period: 1 * time.Second,
+	detector := &defaultCacheMutationDetector{
+		name:           "name",
+		period:         1 * time.Second,
+		retainDuration: 2 * time.Minute,
 		failureFunc: func(message string) {
-			mutationFound <- true
+			select {
+			case mutationFound <- true:
+			case <-stopCh:
+			}
 		},
 	}
-	informer.AddEventHandler(
-		ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				addReceived <- true
-			},
-		},
-	)
+	informer.cacheMutationDetector = detector
 	go informer.Run(stopCh)
 
 	fakeWatch.Add(pod)
 
-	select {
-	case <-addReceived:
-	}
+	gomega.NewWithT(t).Eventually(func() int {
+		detector.addedObjsLock.Lock()
+		addedLen := len(detector.addedObjs)
+		detector.addedObjsLock.Unlock()
 
+		detector.compareObjectsLock.Lock()
+		cachedLen := len(detector.cachedObjs)
+		detector.compareObjectsLock.Unlock()
+
+		return addedLen + cachedLen
+	}).WithTimeout(wait.ForeverTestTimeout).WithPolling(100*time.Millisecond).Should(gomega.BeNumerically(">", 0), "mutation detector should observe pod")
+
+	detector.compareObjectsLock.Lock()
 	pod.Labels["change"] = "true"
+	detector.compareObjectsLock.Unlock()
 
 	select {
 	case <-mutationFound:
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatalf("failed waiting for mutating detector")
 	}
 
 }

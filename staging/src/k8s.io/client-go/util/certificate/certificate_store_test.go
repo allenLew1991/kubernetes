@@ -17,16 +17,14 @@ limitations under the License.
 package certificate
 
 import (
-	"io/ioutil"
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
-
-	"k8s.io/client-go/util/cert"
 )
 
 func TestUpdateSymlinkExistingFileError(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-update-symlink")
+	dir, err := os.MkdirTemp("", "k8s-test-update-symlink")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -36,7 +34,7 @@ func TestUpdateSymlinkExistingFileError(t *testing.T) {
 		}
 	}()
 	pairFile := filepath.Join(dir, "kubelet-current.pem")
-	if err := ioutil.WriteFile(pairFile, nil, 0600); err != nil {
+	if err := os.WriteFile(pairFile, nil, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
 	}
 
@@ -50,7 +48,7 @@ func TestUpdateSymlinkExistingFileError(t *testing.T) {
 }
 
 func TestUpdateSymlinkNewFileNotExist(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-update-symlink")
+	dir, err := os.MkdirTemp("", "k8s-test-update-symlink")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -60,7 +58,7 @@ func TestUpdateSymlinkNewFileNotExist(t *testing.T) {
 		}
 	}()
 	oldPairFile := filepath.Join(dir, "kubelet-oldpair.pem")
-	if err := ioutil.WriteFile(oldPairFile, nil, 0600); err != nil {
+	if err := os.WriteFile(oldPairFile, nil, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", oldPairFile, err)
 	}
 
@@ -69,16 +67,16 @@ func TestUpdateSymlinkNewFileNotExist(t *testing.T) {
 		pairNamePrefix: "kubelet",
 	}
 	if err := s.updateSymlink(oldPairFile); err != nil {
-		t.Errorf("Got %v, wanted successful update of the symlink to point to %q", err, oldPairFile)
+		t.Errorf("Got error %v, wanted successful update of the symlink to point to %q", err, oldPairFile)
 	}
 
 	if _, err := os.Stat(oldPairFile); err != nil {
-		t.Errorf("Got %v, wanted file %q to be there.", oldPairFile, err)
+		t.Errorf("Got error %v, wanted file %q to be there.", err, oldPairFile)
 	}
 
 	currentPairFile := filepath.Join(dir, "kubelet-current.pem")
 	if fi, err := os.Lstat(currentPairFile); err != nil {
-		t.Errorf("Got %v, wanted file %q to be there", currentPairFile, err)
+		t.Errorf("Got error %v, wanted file %q to be there", err, currentPairFile)
 	} else if fi.Mode()&os.ModeSymlink != os.ModeSymlink {
 		t.Errorf("Got %q not a symlink.", currentPairFile)
 	}
@@ -90,7 +88,7 @@ func TestUpdateSymlinkNewFileNotExist(t *testing.T) {
 }
 
 func TestUpdateSymlinkNoSymlink(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-update-symlink")
+	dir, err := os.MkdirTemp("", "k8s-test-update-symlink")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -100,7 +98,7 @@ func TestUpdateSymlinkNoSymlink(t *testing.T) {
 		}
 	}()
 	pairFile := filepath.Join(dir, "kubelet-newfile.pem")
-	if err := ioutil.WriteFile(pairFile, nil, 0600); err != nil {
+	if err := os.WriteFile(pairFile, nil, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
 	}
 
@@ -113,7 +111,7 @@ func TestUpdateSymlinkNoSymlink(t *testing.T) {
 	}
 
 	if _, err := os.Stat(pairFile); err != nil {
-		t.Errorf("Got error %v, wanted file %q to be there", pairFile, err)
+		t.Errorf("Got error %v, wanted file %q to be there", err, pairFile)
 	}
 	currentPairFile := filepath.Join(dir, "kubelet-current.pem")
 	if fi, err := os.Lstat(currentPairFile); err != nil {
@@ -125,7 +123,7 @@ func TestUpdateSymlinkNoSymlink(t *testing.T) {
 
 func TestUpdateSymlinkReplaceExistingSymlink(t *testing.T) {
 	prefix := "kubelet"
-	dir, err := ioutil.TempDir("", "k8s-test-update-symlink")
+	dir, err := os.MkdirTemp("", "k8s-test-update-symlink")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -135,11 +133,11 @@ func TestUpdateSymlinkReplaceExistingSymlink(t *testing.T) {
 		}
 	}()
 	oldPairFile := filepath.Join(dir, prefix+"-oldfile.pem")
-	if err := ioutil.WriteFile(oldPairFile, nil, 0600); err != nil {
+	if err := os.WriteFile(oldPairFile, nil, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", oldPairFile, err)
 	}
 	newPairFile := filepath.Join(dir, prefix+"-newfile.pem")
-	if err := ioutil.WriteFile(newPairFile, nil, 0600); err != nil {
+	if err := os.WriteFile(newPairFile, nil, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", newPairFile, err)
 	}
 	currentPairFile := filepath.Join(dir, prefix+"-current.pem")
@@ -178,98 +176,8 @@ func TestUpdateSymlinkReplaceExistingSymlink(t *testing.T) {
 	}
 }
 
-func TestLoadCertKeyBlocksNoFile(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-load-cert-key-blocks")
-	if err != nil {
-		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
-		}
-	}()
-
-	pairFile := filepath.Join(dir, "kubelet-pair.pem")
-
-	if _, _, err := loadCertKeyBlocks(pairFile); err == nil {
-		t.Errorf("Got no error, but expected %q not found.", pairFile)
-	}
-}
-
-func TestLoadCertKeyBlocksEmptyFile(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-load-cert-key-blocks")
-	if err != nil {
-		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
-		}
-	}()
-
-	pairFile := filepath.Join(dir, "kubelet-pair.pem")
-	if err := ioutil.WriteFile(pairFile, nil, 0600); err != nil {
-		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
-	}
-
-	if _, _, err := loadCertKeyBlocks(pairFile); err == nil {
-		t.Errorf("Got no error, but expected %q not found.", pairFile)
-	}
-}
-
-func TestLoadCertKeyBlocksPartialFile(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-load-cert-key-blocks")
-	if err != nil {
-		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
-		}
-	}()
-
-	pairFile := filepath.Join(dir, "kubelet-pair.pem")
-	if err := ioutil.WriteFile(pairFile, storeCertData.certificatePEM, 0600); err != nil {
-		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
-	}
-
-	if _, _, err := loadCertKeyBlocks(pairFile); err == nil {
-		t.Errorf("Got no error, but expected %q invalid.", pairFile)
-	}
-}
-
-func TestLoadCertKeyBlocks(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-load-cert-key-blocks")
-	if err != nil {
-		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
-		}
-	}()
-
-	pairFile := filepath.Join(dir, "kubelet-pair.pem")
-	data := append(storeCertData.certificatePEM, []byte("\n")...)
-	data = append(data, storeCertData.keyPEM...)
-	if err := ioutil.WriteFile(pairFile, data, 0600); err != nil {
-		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
-	}
-
-	certBlock, keyBlock, err := loadCertKeyBlocks(pairFile)
-	if err != nil {
-		t.Errorf("Got %v, but expected no error.", pairFile)
-	}
-	if certBlock.Type != cert.CertificateBlockType {
-		t.Errorf("Got %q loaded from the pair file, expected a %q.", certBlock.Type, cert.CertificateBlockType)
-	}
-	if keyBlock.Type != cert.RSAPrivateKeyBlockType {
-		t.Errorf("Got %q loaded from the pair file, expected a %q.", keyBlock.Type, cert.RSAPrivateKeyBlockType)
-	}
-}
-
 func TestLoadFile(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-load-cert-key-blocks")
+	dir, err := os.MkdirTemp("", "k8s-test-load-cert-key-blocks")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -280,27 +188,36 @@ func TestLoadFile(t *testing.T) {
 	}()
 
 	pairFile := filepath.Join(dir, "kubelet-pair.pem")
-	data := append(storeCertData.certificatePEM, []byte("\n")...)
-	data = append(data, storeCertData.keyPEM...)
-	if err := ioutil.WriteFile(pairFile, data, 0600); err != nil {
-		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
-	}
 
-	cert, err := loadFile(pairFile)
-	if err != nil {
-		t.Fatalf("Could not load certificate from disk: %v", err)
+	tests := []struct {
+		desc string
+		data []byte
+	}{
+		{desc: "cert and key", data: bytes.Join([][]byte{storeCertData.certificatePEM, storeCertData.keyPEM}, []byte("\n"))},
+		{desc: "key and cert", data: bytes.Join([][]byte{storeCertData.keyPEM, storeCertData.certificatePEM}, []byte("\n"))},
 	}
-	if cert == nil {
-		t.Fatalf("There was no error, but no certificate data was returned.")
-	}
-	if cert.Leaf == nil {
-		t.Fatalf("Got an empty leaf, expected private data.")
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			if err := os.WriteFile(pairFile, tt.data, 0600); err != nil {
+				t.Fatalf("Unable to create the file %q: %v", pairFile, err)
+			}
+			cert, err := loadFile(pairFile)
+			if err != nil {
+				t.Fatalf("Could not load certificate from disk: %v", err)
+			}
+			if cert == nil {
+				t.Fatalf("There was no error, but no certificate data was returned.")
+			}
+			if cert.Leaf == nil {
+				t.Fatalf("Got an empty leaf, expected private data.")
+			}
+		})
 	}
 }
 
 func TestUpdateNoRotation(t *testing.T) {
 	prefix := "kubelet-server"
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -310,14 +227,15 @@ func TestUpdateNoRotation(t *testing.T) {
 		}
 	}()
 	keyFile := filepath.Join(dir, "kubelet.key")
-	if err := ioutil.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
+	if err := os.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
 	}
 	certFile := filepath.Join(dir, "kubelet.crt")
-	if err := ioutil.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
+	if err := os.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", certFile, err)
 	}
 
+	//nolint:logcheck // Intentionally uses the old API.
 	s, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Got %v while creating a new store.", err)
@@ -334,7 +252,7 @@ func TestUpdateNoRotation(t *testing.T) {
 
 func TestUpdateRotation(t *testing.T) {
 	prefix := "kubelet-server"
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -344,14 +262,15 @@ func TestUpdateRotation(t *testing.T) {
 		}
 	}()
 	keyFile := filepath.Join(dir, "kubelet.key")
-	if err := ioutil.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
+	if err := os.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
 	}
 	certFile := filepath.Join(dir, "kubelet.crt")
-	if err := ioutil.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
+	if err := os.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", certFile, err)
 	}
 
+	//nolint:logcheck // Intentionally uses the old API.
 	s, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Got %v while creating a new store.", err)
@@ -366,9 +285,9 @@ func TestUpdateRotation(t *testing.T) {
 	}
 }
 
-func TestUpdateWithBadCertKeyData(t *testing.T) {
+func TestUpdateTwoCerts(t *testing.T) {
 	prefix := "kubelet-server"
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -378,14 +297,53 @@ func TestUpdateWithBadCertKeyData(t *testing.T) {
 		}
 	}()
 	keyFile := filepath.Join(dir, "kubelet.key")
-	if err := ioutil.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
+	if err := os.WriteFile(keyFile, storeTwoCertsData.keyPEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
 	}
 	certFile := filepath.Join(dir, "kubelet.crt")
-	if err := ioutil.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
+	if err := os.WriteFile(certFile, storeTwoCertsData.certificatePEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", certFile, err)
 	}
 
+	//nolint:logcheck // Intentionally uses the old API.
+	s, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
+	if err != nil {
+		t.Fatalf("Got %v while creating a new store.", err)
+	}
+
+	cert, err := s.Update(storeTwoCertsData.certificatePEM, storeTwoCertsData.keyPEM)
+	if err != nil {
+		t.Errorf("Got %v while updating certificate store.", err)
+	}
+	if cert == nil {
+		t.Fatalf("Got nil certificate, expected something real.")
+	}
+	if len(cert.Certificate) != 2 {
+		t.Fatalf("Unexpected number of certificates, expected 2, got %v", len(cert.Certificate))
+	}
+}
+
+func TestUpdateWithBadCertKeyData(t *testing.T) {
+	prefix := "kubelet-server"
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
+	if err != nil {
+		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
+		}
+	}()
+	keyFile := filepath.Join(dir, "kubelet.key")
+	if err := os.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
+		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
+	}
+	certFile := filepath.Join(dir, "kubelet.crt")
+	if err := os.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
+		t.Fatalf("Unable to create the file %q: %v", certFile, err)
+	}
+
+	//nolint:logcheck // Intentionally uses the old API.
 	s, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Got %v while creating a new store.", err)
@@ -402,7 +360,7 @@ func TestUpdateWithBadCertKeyData(t *testing.T) {
 
 func TestCurrentPairFile(t *testing.T) {
 	prefix := "kubelet-server"
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -414,7 +372,7 @@ func TestCurrentPairFile(t *testing.T) {
 	pairFile := filepath.Join(dir, prefix+"-pair.pem")
 	data := append(storeCertData.certificatePEM, []byte("\n")...)
 	data = append(data, storeCertData.keyPEM...)
-	if err := ioutil.WriteFile(pairFile, data, 0600); err != nil {
+	if err := os.WriteFile(pairFile, data, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", pairFile, err)
 	}
 	currentFile := filepath.Join(dir, prefix+"-current.pem")
@@ -422,6 +380,7 @@ func TestCurrentPairFile(t *testing.T) {
 		t.Fatalf("unable to create a symlink from %q to %q: %v", currentFile, pairFile, err)
 	}
 
+	//nolint:logcheck // Intentionally uses the old API.
 	store, err := NewFileStore("kubelet-server", dir, dir, "", "")
 	if err != nil {
 		t.Fatalf("Failed to initialize certificate store: %v", err)
@@ -441,7 +400,7 @@ func TestCurrentPairFile(t *testing.T) {
 
 func TestCurrentCertKeyFiles(t *testing.T) {
 	prefix := "kubelet-server"
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -451,14 +410,15 @@ func TestCurrentCertKeyFiles(t *testing.T) {
 		}
 	}()
 	certFile := filepath.Join(dir, "kubelet.crt")
-	if err := ioutil.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
+	if err := os.WriteFile(certFile, storeCertData.certificatePEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", certFile, err)
 	}
 	keyFile := filepath.Join(dir, "kubelet.key")
-	if err := ioutil.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
+	if err := os.WriteFile(keyFile, storeCertData.keyPEM, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
 	}
 
+	//nolint:logcheck // Intentionally uses the old API.
 	store, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Failed to initialize certificate store: %v", err)
@@ -476,8 +436,49 @@ func TestCurrentCertKeyFiles(t *testing.T) {
 	}
 }
 
+func TestCurrentTwoCerts(t *testing.T) {
+	prefix := "kubelet-server"
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
+	if err != nil {
+		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
+		}
+	}()
+	certFile := filepath.Join(dir, "kubelet.crt")
+	if err := os.WriteFile(certFile, storeTwoCertsData.certificatePEM, 0600); err != nil {
+		t.Fatalf("Unable to create the file %q: %v", certFile, err)
+	}
+	keyFile := filepath.Join(dir, "kubelet.key")
+	if err := os.WriteFile(keyFile, storeTwoCertsData.keyPEM, 0600); err != nil {
+		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
+	}
+
+	//nolint:logcheck // Intentionally uses the old API.
+	store, err := NewFileStore(prefix, dir, dir, certFile, keyFile)
+	if err != nil {
+		t.Fatalf("Failed to initialize certificate store: %v", err)
+	}
+
+	cert, err := store.Current()
+	if err != nil {
+		t.Fatalf("Could not load certificate from disk: %v", err)
+	}
+	if cert == nil {
+		t.Fatalf("There was no error, but no certificate data was returned.")
+	}
+	if cert.Leaf == nil {
+		t.Fatalf("Got an empty leaf, expected private data.")
+	}
+	if len(cert.Certificate) != 2 {
+		t.Fatalf("Unexpected number of certificates, expected 2, got %v", len(cert.Certificate))
+	}
+}
+
 func TestCurrentNoFiles(t *testing.T) {
-	dir, err := ioutil.TempDir("", "k8s-test-certstore-current")
+	dir, err := os.MkdirTemp("", "k8s-test-certstore-current")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -487,6 +488,7 @@ func TestCurrentNoFiles(t *testing.T) {
 		}
 	}()
 
+	//nolint:logcheck // Intentionally uses the old API.
 	store, err := NewFileStore("kubelet-server", dir, dir, "", "")
 	if err != nil {
 		t.Fatalf("Failed to initialize certificate store: %v", err)

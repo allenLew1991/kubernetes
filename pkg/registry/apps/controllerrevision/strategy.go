@@ -17,9 +17,10 @@ limitations under the License.
 package controllerrevision
 
 import (
+	"context"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -29,13 +30,13 @@ import (
 
 // strategy implements behavior for ConfigMap objects
 type strategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating ControllerRevision
 // objects via the REST API.
-var Strategy = strategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = strategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // Strategy should implement rest.RESTCreateStrategy
 var _ rest.RESTCreateStrategy = Strategy
@@ -50,30 +51,36 @@ func (strategy) NamespaceScoped() bool {
 func (strategy) Canonicalize(obj runtime.Object) {
 }
 
-func (strategy) AllowCreateOnUpdate() bool {
+func (strategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (strategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	_ = obj.(*apps.ControllerRevision)
 }
 
-func (strategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	revision := obj.(*apps.ControllerRevision)
 
-	return validation.ValidateControllerRevision(revision)
+	return validation.ValidateControllerRevisionCreate(revision)
 }
 
-func (strategy) PrepareForUpdate(ctx genericapirequest.Context, newObj, oldObj runtime.Object) {
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (strategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
+
+func (strategy) PrepareForUpdate(ctx context.Context, newObj, oldObj runtime.Object) {
 	_ = oldObj.(*apps.ControllerRevision)
 	_ = newObj.(*apps.ControllerRevision)
 }
 
-func (strategy) AllowUnconditionalUpdate() bool {
+func (strategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
-func (strategy) ValidateUpdate(ctx genericapirequest.Context, newObj, oldObj runtime.Object) field.ErrorList {
+func (strategy) ValidateUpdate(ctx context.Context, newObj, oldObj runtime.Object) field.ErrorList {
 	oldRevision, newRevision := oldObj.(*apps.ControllerRevision), newObj.(*apps.ControllerRevision)
 	return validation.ValidateControllerRevisionUpdate(newRevision, oldRevision)
 }
+
+// WarningsOnUpdate returns warnings for the given update.
+func (strategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string { return nil }

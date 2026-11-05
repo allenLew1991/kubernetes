@@ -1,8 +1,10 @@
-approvers:
-- thockin
-- dchen1107
-- matchstick
-- freehan
-reviewers:
-- sig-network-reviewers
+# See the OWNERS docs at https://go.k8s.io/owners
 
+approvers:
+  - sig-network-approvers
+emeritus_approvers:
+  - matchstick
+reviewers:
+  - sig-network-reviewers
+labels:
+  - sig/network

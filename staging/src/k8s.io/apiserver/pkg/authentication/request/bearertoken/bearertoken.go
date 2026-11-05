@@ -22,7 +22,11 @@ import (
 	"strings"
 
 	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/warning"
+)
+
+const (
+	invalidTokenWithSpaceWarning = "the provided Authorization header contains extra space before the bearer token, and is ignored"
 )
 
 type Authenticator struct {
@@ -35,12 +39,12 @@ func New(auth authenticator.Token) *Authenticator {
 
 var invalidToken = errors.New("invalid bearer token")
 
-func (a *Authenticator) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
+func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
 	auth := strings.TrimSpace(req.Header.Get("Authorization"))
 	if auth == "" {
 		return nil, false, nil
 	}
-	parts := strings.Split(auth, " ")
+	parts := strings.SplitN(auth, " ", 3)
 	if len(parts) < 2 || strings.ToLower(parts[0]) != "bearer" {
 		return nil, false, nil
 	}
@@ -49,10 +53,14 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (user.Info, bool,
 
 	// Empty bearer tokens aren't valid
 	if len(token) == 0 {
+		// The space before the token case
+		if len(parts) == 3 {
+			warning.AddWarning(req.Context(), "", invalidTokenWithSpaceWarning)
+		}
 		return nil, false, nil
 	}
 
-	user, ok, err := a.auth.AuthenticateToken(token)
+	resp, ok, err := a.auth.AuthenticateToken(req.Context(), token)
 	// if we authenticated successfully, go ahead and remove the bearer token so that no one
 	// is ever tempted to use it inside of the API server
 	if ok {
@@ -64,5 +72,5 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (user.Info, bool,
 		err = invalidToken
 	}
 
-	return user, ok, err
+	return resp, ok, err
 }

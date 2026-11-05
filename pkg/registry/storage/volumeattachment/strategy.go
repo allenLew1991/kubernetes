@@ -17,57 +17,139 @@ limitations under the License.
 package volumeattachment
 
 import (
+	"context"
+
+	"k8s.io/apiserver/pkg/registry/rest"
+
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/names"
+	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	"k8s.io/kubernetes/pkg/apis/storage/validation"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // volumeAttachmentStrategy implements behavior for VolumeAttachment objects
 type volumeAttachmentStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // VolumeAttachment objects via the REST API.
-var Strategy = volumeAttachmentStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = volumeAttachmentStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (volumeAttachmentStrategy) NamespaceScoped() bool {
 	return false
 }
 
-// ResetBeforeCreate clears the Status field which is not allowed to be set by end users on creation.
-func (volumeAttachmentStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (volumeAttachmentStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"storage.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
-func (volumeAttachmentStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+// ResetBeforeCreate clears the Status field which is not allowed to be set by end users on creation.
+func (volumeAttachmentStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	volumeAttachment := obj.(*storage.VolumeAttachment)
+	volumeAttachment.Status = storage.VolumeAttachmentStatus{}
+}
+
+func (volumeAttachmentStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	volumeAttachment := obj.(*storage.VolumeAttachment)
 	return validation.ValidateVolumeAttachment(volumeAttachment)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (volumeAttachmentStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
 }
 
 // Canonicalize normalizes the object after validation.
 func (volumeAttachmentStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (volumeAttachmentStrategy) AllowCreateOnUpdate() bool {
+func (volumeAttachmentStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-// PrepareForUpdate sets the Status fields which is not allowed to be set by an end user updating a PV
-func (volumeAttachmentStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+// PrepareForUpdate sets the Status fields which is not allowed to be set by an end user updating a VolumeAttachment
+func (volumeAttachmentStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newVolumeAttachment := obj.(*storage.VolumeAttachment)
+	oldVolumeAttachment := old.(*storage.VolumeAttachment)
+
+	newVolumeAttachment.Status = oldVolumeAttachment.Status
+	// No need to increment Generation because we don't allow updates to spec
+
 }
 
-func (volumeAttachmentStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (volumeAttachmentStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newVolumeAttachmentObj := obj.(*storage.VolumeAttachment)
 	oldVolumeAttachmentObj := old.(*storage.VolumeAttachment)
-	errorList := validation.ValidateVolumeAttachment(newVolumeAttachmentObj)
-	return append(errorList, validation.ValidateVolumeAttachmentUpdate(newVolumeAttachmentObj, oldVolumeAttachmentObj)...)
+	return validation.ValidateVolumeAttachmentUpdate(newVolumeAttachmentObj, oldVolumeAttachmentObj)
 }
 
-func (volumeAttachmentStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (volumeAttachmentStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+func (volumeAttachmentStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
+}
+
+// volumeAttachmentStatusStrategy implements behavior for VolumeAttachmentStatus subresource
+type volumeAttachmentStatusStrategy struct {
+	volumeAttachmentStrategy
+}
+
+// StatusStrategy is the default logic that applies when creating and updating
+// VolumeAttachmentStatus subresource via the REST API.
+var StatusStrategy = volumeAttachmentStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (volumeAttachmentStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"storage.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("metadata"),
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
+
+// PrepareForUpdate sets the Status fields which is not allowed to be set by an end user updating a VolumeAttachment
+func (volumeAttachmentStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newVolumeAttachment := obj.(*storage.VolumeAttachment)
+	oldVolumeAttachment := old.(*storage.VolumeAttachment)
+
+	newVolumeAttachment.Spec = oldVolumeAttachment.Spec
+	metav1.ResetObjectMetaForStatus(&newVolumeAttachment.ObjectMeta, &oldVolumeAttachment.ObjectMeta)
+
+	if !feature.DefaultFeatureGate.Enabled(features.MutableCSINodeAllocatableCount) {
+		// Only clear ErrorCode field if it isn't set in the old object
+		if newVolumeAttachment.Status.AttachError != nil {
+			if oldVolumeAttachment.Status.AttachError == nil || oldVolumeAttachment.Status.AttachError.ErrorCode == nil {
+				newVolumeAttachment.Status.AttachError.ErrorCode = nil
+			}
+		}
+		if newVolumeAttachment.Status.DetachError != nil {
+			if oldVolumeAttachment.Status.DetachError == nil || oldVolumeAttachment.Status.DetachError.ErrorCode == nil {
+				newVolumeAttachment.Status.DetachError.ErrorCode = nil
+			}
+		}
+	}
 }

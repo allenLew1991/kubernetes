@@ -21,34 +21,18 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
 	"os"
+	_ "time/tzdata" // for CronJob Time Zone support
 
-	"k8s.io/apiserver/pkg/util/flag"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/logs/json/register"          // for JSON log format registration
+	_ "k8s.io/component-base/metrics/prometheus/clientgo" // load all the prometheus client-go plugin
+	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/kubernetes/cmd/kube-controller-manager/app"
-	"k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
-	_ "k8s.io/kubernetes/pkg/util/reflector/prometheus" // for reflector metric registration
-	_ "k8s.io/kubernetes/pkg/util/workqueue/prometheus" // for workqueue metric registration
-	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
-	"k8s.io/kubernetes/pkg/version/verflag"
-
-	"github.com/spf13/pflag"
 )
 
 func main() {
-	s := options.NewCMServer()
-	s.AddFlags(pflag.CommandLine, app.KnownControllers(), app.ControllersDisabledByDefault.List())
-
-	flag.InitFlags()
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	verflag.PrintAndExitIfRequested()
-
-	if err := app.Run(s); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
+	command := app.NewControllerManagerCommand()
+	code := cli.Run(command)
+	os.Exit(code)
 }

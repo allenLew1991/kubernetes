@@ -31,14 +31,14 @@ type (
 
 // Pod is a collection of containers, used as either input (create, update) or as output (list, get).
 type Pod struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// Standard object's metadata.
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
 	// Specification of the desired behavior of the pod.
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	// +optional
 	Spec PodSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
@@ -46,7 +46,7 @@ type Pod struct {
 	// This data may not be up to date.
 	// Populated by the system.
 	// Read-only.
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	// +optional
 	Status PodStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
@@ -66,7 +66,7 @@ type PodStatus struct {
 	// +optional
 	Message string `json:"message,omitempty" protobuf:"bytes,3,opt,name=message"`
 	// A brief CamelCase message indicating details about why the pod is in this state.
-	// e.g. 'OutOfDisk'
+	// e.g. 'DiskPressure'
 	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,4,opt,name=reason"`
 
@@ -136,10 +136,11 @@ type PodSpec struct {
 	NodeSelector map[string]string `json:"nodeSelector,omitempty" protobuf:"bytes,7,rep,name=nodeSelector"`
 
 	// ServiceAccountName is the name of the ServiceAccount to use to run this pod.
-	// More info: http://releases.k8s.io/HEAD/docs/design/service_accounts.md
+	// More info: https://kubernetes.io/docs/concepts/security/service-accounts/
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty" protobuf:"bytes,8,opt,name=serviceAccountName"`
-	// DeprecatedServiceAccount is a depreciated alias for ServiceAccountName.
+	// DeprecatedServiceAccount is a deprecated alias for ServiceAccountName.
+	//
 	// Deprecated: Use serviceAccountName instead.
 	// +k8s:conversion-gen=false
 	// +optional
@@ -151,7 +152,6 @@ type PodSpec struct {
 	// +optional
 	NodeName string `json:"nodeName,omitempty" protobuf:"bytes,10,opt,name=nodeName"`
 	// Host networking requested for this pod. Use the host's network namespace.
-	// If this option is set, the ports that will be used must be specified.
 	// Default to false.
 	// +k8s:conversion-gen=false
 	// +optional
@@ -184,9 +184,9 @@ type PodSpec struct {
 
 // PodList is a list of Pods.
 type PodList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// Standard list metadata.
-	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#types-kinds
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 

@@ -19,14 +19,18 @@ package iscsi
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	"k8s.io/mount-utils"
+	testingexec "k8s.io/utils/exec/testing"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	utiltesting "k8s.io/client-go/util/testing"
-	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
@@ -39,17 +43,32 @@ func TestCanSupport(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/iscsi")
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plug.GetPluginName() != "kubernetes.io/iscsi" {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())
 	}
 	if plug.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{}}}) {
 		t.Errorf("Expected false")
+	}
+	if plug.CanSupport(&volume.Spec{}) {
+		t.Errorf("Expected false")
+	}
+	if !plug.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{ISCSI: &v1.ISCSIVolumeSource{}}}}) {
+		t.Errorf("Expected true")
+	}
+	if plug.CanSupport(&volume.Spec{PersistentVolume: &v1.PersistentVolume{Spec: v1.PersistentVolumeSpec{}}}) {
+		t.Errorf("Expected false")
+	}
+	if plug.CanSupport(&volume.Spec{PersistentVolume: &v1.PersistentVolume{Spec: v1.PersistentVolumeSpec{PersistentVolumeSource: v1.PersistentVolumeSource{}}}}) {
+		t.Errorf("Expected false")
+	}
+	if !plug.CanSupport(&volume.Spec{PersistentVolume: &v1.PersistentVolume{Spec: v1.PersistentVolumeSpec{PersistentVolumeSource: v1.PersistentVolumeSource{ISCSI: &v1.ISCSIPersistentVolumeSource{}}}}}) {
+		t.Errorf("Expected true")
 	}
 }
 
@@ -61,7 +80,7 @@ func TestGetAccessModes(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPersistentPluginByName("kubernetes.io/iscsi")
 	if err != nil {
@@ -73,14 +92,12 @@ func TestGetAccessModes(t *testing.T) {
 }
 
 type fakeDiskManager struct {
-	tmpDir       string
-	attachCalled bool
-	detachCalled bool
+	tmpDir string
 }
 
-func NewFakeDiskManager() *fakeDiskManager {
+func NewFakeDiskManager(pluginDir string) *fakeDiskManager {
 	return &fakeDiskManager{
-		tmpDir: utiltesting.MkTmpdirOrDie("fc_test"),
+		tmpDir: filepath.Join(pluginDir, "fake-global-pd"),
 	}
 }
 
@@ -91,6 +108,11 @@ func (fake *fakeDiskManager) Cleanup() {
 func (fake *fakeDiskManager) MakeGlobalPDName(disk iscsiDisk) string {
 	return fake.tmpDir
 }
+
+func (fake *fakeDiskManager) MakeGlobalVDPDName(disk iscsiDisk) string {
+	return fake.tmpDir
+}
+
 func (fake *fakeDiskManager) AttachDisk(b iscsiDiskMounter) (string, error) {
 	globalPath := b.manager.MakeGlobalPDName(*b.iscsiDisk)
 	err := os.MkdirAll(globalPath, 0750)
@@ -99,7 +121,7 @@ func (fake *fakeDiskManager) AttachDisk(b iscsiDiskMounter) (string, error) {
 	}
 	// Simulate the global mount so that the fakeMounter returns the
 	// expected number of mounts for the attached disk.
-	b.mounter.Mount(globalPath, globalPath, b.fsType, nil)
+	b.mounter.MountSensitiveWithoutSystemd(globalPath, globalPath, b.fsType, nil, nil)
 
 	return "/dev/sdb", nil
 }
@@ -113,6 +135,226 @@ func (fake *fakeDiskManager) DetachDisk(c iscsiDiskUnmounter, mntPath string) er
 	return nil
 }
 
+func (fake *fakeDiskManager) DetachBlockISCSIDisk(c iscsiDiskUnmapper, mntPath string) error {
+	globalPath := c.manager.MakeGlobalVDPDName(*c.iscsiDisk)
+	err := os.RemoveAll(globalPath)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// pathTraversalDiskManager constructs global paths using the production
+// helpers so traversal behavior can be exercised in tests.
+type pathTraversalDiskManager struct {
+	host volume.VolumeHost
+}
+
+func (m *pathTraversalDiskManager) MakeGlobalPDName(disk iscsiDisk) string {
+	return makePDNameInternal(m.host, disk.Portals[0], disk.Iqn, disk.Lun, disk.Iface)
+}
+
+func (m *pathTraversalDiskManager) MakeGlobalVDPDName(disk iscsiDisk) string {
+	return makeVDPDNameInternal(m.host, disk.Portals[0], disk.Iqn, disk.Lun, disk.Iface)
+}
+
+func (*pathTraversalDiskManager) AttachDisk(b iscsiDiskMounter) (string, error) {
+	return "", nil
+}
+
+func (*pathTraversalDiskManager) DetachDisk(c iscsiDiskUnmounter, mntPath string) error {
+	return nil
+}
+
+func (*pathTraversalDiskManager) DetachBlockISCSIDisk(c iscsiDiskUnmapper, mntPath string) error {
+	return nil
+}
+
+func TestPersistISCSIRejectsEscapedPluginPath(t *testing.T) {
+	root := t.TempDir()
+
+	host := volumetest.NewFakeVolumeHost(t, root, nil, nil)
+	plugin := &iscsiPlugin{host: host}
+
+	manager := &pathTraversalDiskManager{host: host}
+
+	mounter := iscsiDiskMounter{
+		iscsiDisk: &iscsiDisk{
+			Portals: []string{"10.0.0.1:3260"},
+			Iqn:     "iqn.2026-06.example.com:../../../../../escape",
+			Lun:     "0",
+			Iface:   "default",
+			plugin:  plugin,
+			manager: manager,
+		},
+		volumeMode: v1.PersistentVolumeFilesystem,
+		mounter: &mount.SafeFormatAndMount{
+			Interface: mount.NewFakeMounter(nil),
+		},
+	}
+
+	err := (&ISCSIUtil{}).persistISCSI(mounter)
+	if err == nil {
+		t.Fatal("expected escaped plugin path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "escapes plugin directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	pluginDir := host.GetPluginDir(iscsiPluginName)
+
+	escapedPath := makePDNameInternal(
+		host,
+		"10.0.0.1:3260",
+		"iqn.2026-06.example.com:../../../../../escape",
+		"0",
+		"default",
+	)
+
+	if mount.PathWithinBase(escapedPath, pluginDir) {
+		t.Fatalf("expected test path %q to escape plugin dir %q", escapedPath, pluginDir)
+	}
+
+	if _, err := os.Stat(escapedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected escaped path not to be created, got err=%v", err)
+	}
+}
+
+func TestMountDeviceRejectsEscapedPluginPath(t *testing.T) {
+	root := t.TempDir()
+	host := volumetest.NewFakeVolumeHost(t, root, nil, nil)
+
+	pluginDir := host.GetPluginDir(iscsiPluginName)
+
+	escapedPath := makePDNameInternal(
+		host,
+		"10.0.0.1:3260",
+		"iqn.2026-06.example.com:../../../../../escape",
+		"0",
+		"default",
+	)
+
+	if mount.PathWithinBase(escapedPath, pluginDir) {
+		t.Fatalf("expected test path %q to escape plugin dir %q", escapedPath, pluginDir)
+	}
+
+	attacher := &iscsiAttacher{
+		host: host,
+	}
+
+	err := attacher.MountDevice(
+		nil,
+		"/dev/fake",
+		escapedPath,
+		volume.DeviceMounterArgs{},
+	)
+	if err == nil {
+		t.Fatal("expected escaped plugin path to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "escapes plugin directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(escapedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected escaped path not to be created, got err=%v", err)
+	}
+}
+
+func TestUnmountDeviceRejectsEscapedPluginPath(t *testing.T) {
+	root := t.TempDir()
+	host := volumetest.NewFakeVolumeHost(t, root, nil, nil)
+
+	pluginDir := host.GetPluginDir(iscsiPluginName)
+
+	escapedPath := makePDNameInternal(
+		host,
+		"10.0.0.1:3260",
+		"iqn.2026-06.example.com:../../../../../escape",
+		"0",
+		"default",
+	)
+
+	if mount.PathWithinBase(escapedPath, pluginDir) {
+		t.Fatalf("expected test path %q to escape plugin dir %q", escapedPath, pluginDir)
+	}
+
+	if err := os.MkdirAll(escapedPath, 0750); err != nil {
+		t.Fatalf("failed to create escaped test path: %v", err)
+	}
+
+	sentinel := filepath.Join(escapedPath, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0600); err != nil {
+		t.Fatalf("failed to create sentinel: %v", err)
+	}
+
+	detacher := &iscsiDetacher{
+		host: host,
+	}
+
+	err := detacher.UnmountDevice(escapedPath)
+	if err == nil {
+		t.Fatal("expected escaped plugin path to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "escapes plugin directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("escaped path was modified or removed: %v", err)
+	}
+}
+
+func TestDiskSetUpRejectsEscapedPluginPath(t *testing.T) {
+	root := t.TempDir()
+
+	host := volumetest.NewFakeVolumeHost(t, root, nil, nil)
+	plugin := &iscsiPlugin{host: host}
+	manager := &pathTraversalDiskManager{host: host}
+
+	fakeMounter := mount.NewFakeMounter(nil)
+
+	mounter := iscsiDiskMounter{
+		iscsiDisk: &iscsiDisk{
+			Portals: []string{"10.0.0.1:3260"},
+			Iqn:     "iqn.2026-06.example.com:../../../../../escape",
+			Lun:     "0",
+			Iface:   "default",
+			plugin:  plugin,
+			manager: manager,
+		},
+		mounter: &mount.SafeFormatAndMount{
+			Interface: fakeMounter,
+		},
+	}
+
+	globalPDPath := manager.MakeGlobalPDName(*mounter.iscsiDisk)
+	pluginDir := host.GetPluginDir(iscsiPluginName)
+
+	if mount.PathWithinBase(globalPDPath, pluginDir) {
+		t.Fatalf("expected test path %q to escape plugin dir %q", globalPDPath, pluginDir)
+	}
+
+	volPath := filepath.Join(root, "pods", "poduid", "volumes", "kubernetes.io~iscsi", "vol1")
+
+	err := diskSetUp(
+		manager,
+		mounter,
+		volPath,
+		fakeMounter,
+		volume.MounterArgs{},
+	)
+
+	if err == nil {
+		t.Fatal("expected escaped plugin path to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "escapes plugin directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func doTestPlugin(t *testing.T, spec *volume.Spec) {
 	tmpDir, err := utiltesting.MkTmpdir("iscsi_test")
 	if err != nil {
@@ -121,16 +363,19 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/iscsi")
 	if err != nil {
 		t.Errorf("Can't find the plugin by name")
 	}
-	fakeManager := NewFakeDiskManager()
+
+	pluginDir := plug.(*iscsiPlugin).host.GetPluginDir(iscsiPluginName)
+
+	fakeManager := NewFakeDiskManager(pluginDir)
 	defer fakeManager.Cleanup()
-	fakeMounter := &mount.FakeMounter{}
-	fakeExec := mount.NewFakeExec(nil)
+	fakeMounter := mount.NewFakeMounter(nil)
+	fakeExec := &testingexec.FakeExec{}
 	mounter, err := plug.(*iscsiPlugin).newMounterInternal(spec, types.UID("poduid"), fakeManager, fakeMounter, fakeExec, nil)
 	if err != nil {
 		t.Errorf("Failed to make a new Mounter: %v", err)
@@ -140,12 +385,12 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 	}
 
 	path := mounter.GetPath()
-	expectedPath := fmt.Sprintf("%s/pods/poduid/volumes/kubernetes.io~iscsi/vol1", tmpDir)
+	expectedPath := filepath.Join(tmpDir, "pods/poduid/volumes/kubernetes.io~iscsi/vol1")
 	if path != expectedPath {
 		t.Errorf("Unexpected path, expected %q, got: %q", expectedPath, path)
 	}
 
-	if err := mounter.SetUp(nil); err != nil {
+	if err := mounter.SetUp(volume.MounterArgs{}); err != nil {
 		t.Errorf("Expected success, got: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -155,15 +400,8 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 			t.Errorf("SetUp() failed: %v", err)
 		}
 	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", path)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
-	}
 
-	fakeManager2 := NewFakeDiskManager()
+	fakeManager2 := NewFakeDiskManager(pluginDir)
 	defer fakeManager2.Cleanup()
 	unmounter, err := plug.(*iscsiPlugin).newUnmounterInternal("vol1", types.UID("poduid"), fakeManager2, fakeMounter, fakeExec)
 	if err != nil {
@@ -259,13 +497,13 @@ func TestPersistentClaimReadOnlyFlag(t *testing.T) {
 	client := fake.NewSimpleClientset(pv, claim)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, client, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, client, nil))
 	plug, _ := plugMgr.FindPluginByName(iscsiPluginName)
 
 	// readOnly bool is supplied by persistent-claim volume source when its mounter creates other volumes
 	spec := volume.NewSpecFromPersistentVolume(pv, true)
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID("poduid")}}
-	mounter, _ := plug.NewMounter(spec, pod, volume.VolumeOptions{})
+	mounter, _ := plug.NewMounter(spec, pod)
 	if mounter == nil {
 		t.Fatalf("Got a nil Mounter")
 	}
@@ -289,10 +527,12 @@ type testcase struct {
 	defaultNs string
 	spec      *volume.Spec
 	// Expected return of the test
-	expectedName  string
-	expectedNs    string
-	expectedIface string
-	expectedError error
+	expectedName          string
+	expectedNs            string
+	expectedIface         string
+	expectedError         error
+	expectedDiscoveryCHAP bool
+	expectedSessionCHAP   bool
 }
 
 func TestGetSecretNameAndNamespaceForPV(t *testing.T) {
@@ -424,5 +664,105 @@ func TestGetISCSIInitiatorInfo(t *testing.T) {
 				err, resultIface)
 		}
 	}
+}
 
+func TestGetISCSICHAP(t *testing.T) {
+	tests := []testcase{
+		{
+			name: "persistent volume source",
+			spec: &volume.Spec{
+				PersistentVolume: &v1.PersistentVolume{
+					Spec: v1.PersistentVolumeSpec{
+						PersistentVolumeSource: v1.PersistentVolumeSource{
+							ISCSI: &v1.ISCSIPersistentVolumeSource{
+								DiscoveryCHAPAuth: true,
+								SessionCHAPAuth:   true,
+							},
+						},
+					},
+				},
+			},
+			expectedDiscoveryCHAP: true,
+			expectedSessionCHAP:   true,
+			expectedError:         nil,
+		},
+		{
+			name: "pod volume source",
+			spec: &volume.Spec{
+				Volume: &v1.Volume{
+					VolumeSource: v1.VolumeSource{
+						ISCSI: &v1.ISCSIVolumeSource{
+							DiscoveryCHAPAuth: true,
+							SessionCHAPAuth:   true,
+						},
+					},
+				},
+			},
+			expectedDiscoveryCHAP: true,
+			expectedSessionCHAP:   true,
+			expectedError:         nil,
+		},
+		{
+			name:                  "no volume",
+			spec:                  &volume.Spec{},
+			expectedDiscoveryCHAP: false,
+			expectedSessionCHAP:   false,
+			expectedError:         fmt.Errorf("Spec does not reference an ISCSI volume type"),
+		},
+	}
+	for _, testcase := range tests {
+		resultDiscoveryCHAP, _ := getISCSIDiscoveryCHAPInfo(testcase.spec)
+		resultSessionCHAP, err := getISCSISessionCHAPInfo(testcase.spec)
+		switch testcase.name {
+		case "no volume":
+			if err == nil || err.Error() != testcase.expectedError.Error() || resultDiscoveryCHAP != testcase.expectedDiscoveryCHAP || resultSessionCHAP != testcase.expectedSessionCHAP {
+				t.Errorf("%s failed: expected err=%v DiscoveryCHAP=%v SessionCHAP=%v, got %v/%v/%v",
+					testcase.name, testcase.expectedError, testcase.expectedDiscoveryCHAP, testcase.expectedSessionCHAP,
+					err, resultDiscoveryCHAP, resultSessionCHAP)
+			}
+		default:
+			if err != testcase.expectedError || resultDiscoveryCHAP != testcase.expectedDiscoveryCHAP || resultSessionCHAP != testcase.expectedSessionCHAP {
+				t.Errorf("%s failed: expected err=%v DiscoveryCHAP=%v SessionCHAP=%v, got %v/%v/%v", testcase.name, testcase.expectedError, testcase.expectedDiscoveryCHAP, testcase.expectedSessionCHAP,
+					err, resultDiscoveryCHAP, resultSessionCHAP)
+			}
+		}
+	}
+}
+
+func TestGetVolumeSpec(t *testing.T) {
+	path := "plugins/kubernetes.io/iscsi/volumeDevices/iface-default/127.0.0.1:3260-iqn.2014-12.server:storage.target01-lun-0"
+	spec, _ := getVolumeSpecFromGlobalMapPath("test", path)
+
+	portal := spec.PersistentVolume.Spec.PersistentVolumeSource.ISCSI.TargetPortal
+	if portal != "127.0.0.1:3260" {
+		t.Errorf("wrong portal: %v", portal)
+	}
+	iqn := spec.PersistentVolume.Spec.PersistentVolumeSource.ISCSI.IQN
+	if iqn != "iqn.2014-12.server:storage.target01" {
+		t.Errorf("wrong iqn: %v", iqn)
+	}
+	lun := spec.PersistentVolume.Spec.PersistentVolumeSource.ISCSI.Lun
+	if lun != 0 {
+		t.Errorf("wrong lun: %v", lun)
+	}
+	iface := spec.PersistentVolume.Spec.PersistentVolumeSource.ISCSI.ISCSIInterface
+	if iface != "default" {
+		t.Errorf("wrong ISCSIInterface: %v", iface)
+	}
+}
+
+func TestGetVolumeSpec_no_lun(t *testing.T) {
+	path := "plugins/kubernetes.io/iscsi/volumeDevices/iface-default/127.0.0.1:3260-iqn.2014-12.server:storage.target01"
+	_, err := getVolumeSpecFromGlobalMapPath("test", path)
+	if !strings.Contains(err.Error(), "malformatted mnt path") {
+		t.Errorf("should get error: malformatted mnt path")
+	}
+}
+
+func TestGetVolumeSpec_no_iface(t *testing.T) {
+	path := "plugins/kubernetes.io/iscsi/volumeDevices/default/127.0.0.1:3260-iqn.2014-12.server:storage.target01-lun-0"
+	_, err := getVolumeSpecFromGlobalMapPath("test", path)
+	if !strings.Contains(err.Error(), "failed to retrieve iface") {
+		t.Errorf("should get error: failed to retrieve iface")
+	}
 }

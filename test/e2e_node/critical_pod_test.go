@@ -14,46 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	kubeapi "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
+	"k8s.io/kubernetes/pkg/kubelet/events"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 const (
-	criticalPodName   = "critical-pod"
+	criticalPodName   = "static-critical-pod"
 	guaranteedPodName = "guaranteed"
 	burstablePodName  = "burstable"
 	bestEffortPodName = "best-effort"
 )
 
-var _ = framework.KubeDescribe("CriticalPod [Serial] [Disruptive]", func() {
+var _ = SIGDescribe("CriticalPod", framework.WithSerial(), framework.WithDisruptive(), feature.CriticalPod, func() {
 	f := framework.NewDefaultFramework("critical-pod-test")
-
-	Context("when we need to admit a critical pod", func() {
-		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
-			initialConfig.FeatureGates[string(features.ExperimentalCriticalPodAnnotation)] = true
-		})
-
-		It("should be able to create and delete a critical pod", func() {
-			configEnabled, err := isKubeletConfigEnabled(f)
-			framework.ExpectNoError(err)
-			if !configEnabled {
-				framework.Skipf("unable to run test without dynamic kubelet config enabled.")
-			}
-
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	ginkgo.Context("when we need to admit a critical pod", func() {
+		ginkgo.It("should be able to create and delete a critical pod", func(ctx context.Context) {
+			// because admission Priority enable, If the priority class is not found, the Pod is rejected.
+			node := getNodeName(ctx, f)
 			// Define test pods
 			nonCriticalGuaranteed := getTestPod(false, guaranteedPodName, v1.ResourceRequirements{
 				Requests: v1.ResourceList{
@@ -64,54 +62,160 @@ var _ = framework.KubeDescribe("CriticalPod [Serial] [Disruptive]", func() {
 					v1.ResourceCPU:    resource.MustParse("100m"),
 					v1.ResourceMemory: resource.MustParse("100Mi"),
 				},
-			})
+			}, node)
 			nonCriticalBurstable := getTestPod(false, burstablePodName, v1.ResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceCPU:    resource.MustParse("100m"),
 					v1.ResourceMemory: resource.MustParse("100Mi"),
 				},
-			})
-			nonCriticalBestEffort := getTestPod(false, bestEffortPodName, v1.ResourceRequirements{})
+			}, node)
+			nonCriticalBestEffort := getTestPod(false, bestEffortPodName, v1.ResourceRequirements{}, node)
 			criticalPod := getTestPod(true, criticalPodName, v1.ResourceRequirements{
 				// request the entire resource capacity of the node, so that
 				// admitting this pod requires the other pod to be preempted
-				Requests: getNodeCPUAndMemoryCapacity(f),
-			})
+				Requests: getNodeCPUAndMemoryCapacity(ctx, f),
+			}, node)
 
 			// Create pods, starting with non-critical so that the critical preempts the other pods.
-			f.PodClient().CreateBatch([]*v1.Pod{nonCriticalBestEffort, nonCriticalBurstable, nonCriticalGuaranteed})
-			f.PodClientNS(kubeapi.NamespaceSystem).CreateSyncInNamespace(criticalPod, kubeapi.NamespaceSystem)
+			e2epod.NewPodClient(f).CreateBatch(ctx, []*v1.Pod{nonCriticalBestEffort, nonCriticalBurstable, nonCriticalGuaranteed})
+			e2epod.PodClientNS(f, kubeapi.NamespaceSystem).CreateSync(ctx, criticalPod)
 
 			// Check that non-critical pods other than the besteffort have been evicted
-			updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(metav1.ListOptions{})
+			updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(ctx, metav1.ListOptions{})
 			framework.ExpectNoError(err)
 			for _, p := range updatedPodList.Items {
 				if p.Name == nonCriticalBestEffort.Name {
-					Expect(p.Status.Phase).NotTo(Equal(v1.PodFailed), fmt.Sprintf("pod: %v should be preempted", p.Name))
+					gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodRunning), "pod: %v should not be preempted with status: %#v", p.Name, p.Status)
 				} else {
-					Expect(p.Status.Phase).To(Equal(v1.PodFailed), fmt.Sprintf("pod: %v should not be preempted", p.Name))
+					gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodFailed), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
+					gomega.Expect(p.Status.Reason).To(gomega.Equal(events.PreemptContainer), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
 				}
 			}
 		})
-		AfterEach(func() {
+
+		f.It("should add DisruptionTarget condition to the preempted pod", func(ctx context.Context) {
+			// because admission Priority enable, If the priority class is not found, the Pod is rejected.
+			node := getNodeName(ctx, f)
+			nonCriticalGuaranteed := getTestPod(false, guaranteedPodName, v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("100m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("100m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			}, node)
+
+			criticalPod := getTestPod(true, criticalPodName, v1.ResourceRequirements{
+				// request the entire resource capacity of the node, so that
+				// admitting this pod requires the other pod to be preempted
+				Requests: getNodeCPUAndMemoryCapacity(ctx, f),
+			}, node)
+			criticalPod.Namespace = kubeapi.NamespaceSystem
+
+			ginkgo.By(fmt.Sprintf("create the non-critical pod %q", klog.KObj(nonCriticalGuaranteed)))
+			e2epod.NewPodClient(f).CreateSync(ctx, nonCriticalGuaranteed)
+
+			ginkgo.By(fmt.Sprintf("create the critical pod %q", klog.KObj(criticalPod)))
+			e2epod.PodClientNS(f, kubeapi.NamespaceSystem).Create(ctx, criticalPod)
+
+			ginkgo.By(fmt.Sprintf("await for the critical pod %q to be ready", klog.KObj(criticalPod)))
+			err := e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, criticalPod.Name, kubeapi.NamespaceSystem)
+			framework.ExpectNoError(err, "Failed to await for the pod to be running: %q", klog.KObj(criticalPod))
+
+			// Check that non-critical pods other than the besteffort have been evicted
+			updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(ctx, metav1.ListOptions{})
+			framework.ExpectNoError(err)
+			for _, p := range updatedPodList.Items {
+				ginkgo.By(fmt.Sprintf("verify that the non-critical pod %q is preempted and has the DisruptionTarget condition", klog.KObj(&p)))
+				gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodFailed), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
+				gomega.Expect(p.Status.Reason).To(gomega.Equal(events.PreemptContainer), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
+				if condition := e2epod.FindPodConditionByType(&p.Status, v1.DisruptionTarget); condition == nil {
+					framework.Failf("pod %q should have the condition: %q, pod status: %v", klog.KObj(&p), v1.DisruptionTarget, p.Status)
+				}
+			}
+		})
+		ginkgo.AfterEach(func(ctx context.Context) {
 			// Delete Pods
-			f.PodClient().DeleteSync(guaranteedPodName, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
-			f.PodClient().DeleteSync(burstablePodName, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
-			f.PodClient().DeleteSync(bestEffortPodName, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
-			f.PodClientNS(kubeapi.NamespaceSystem).DeleteSyncInNamespace(criticalPodName, kubeapi.NamespaceSystem, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
+			e2epod.NewPodClient(f).DeleteSync(ctx, guaranteedPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.NewPodClient(f).DeleteSync(ctx, burstablePodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.NewPodClient(f).DeleteSync(ctx, bestEffortPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.PodClientNS(f, kubeapi.NamespaceSystem).DeleteSync(ctx, criticalPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 			// Log Events
-			logPodEvents(f)
-			logNodeEvents(f)
+			logPodEvents(ctx, f)
+			logNodeEvents(ctx, f)
 
 		})
 	})
 })
 
-func getNodeCPUAndMemoryCapacity(f *framework.Framework) v1.ResourceList {
-	nodeList, err := f.ClientSet.CoreV1().Nodes().List(metav1.ListOptions{})
+var _ = SIGDescribe("CriticalPodWithPodLevelResources", framework.WithSerial(), framework.WithDisruptive(), feature.PodLevelResources, func() {
+	f := framework.NewDefaultFramework("critical-pod-test-pod-level-resources")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	ginkgo.Context("when we need to admit a critical pod", func() {
+		ginkgo.It("should be able to create and delete a critical pod", func(ctx context.Context) {
+			// because admission Priority enable, If the priority class is not found, the Pod is rejected.
+			node := getNodeName(ctx, f)
+			// Define test pods
+			nonCriticalGuaranteed := getTestPodWithPodLevelResources(false, guaranteedPodName, v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("100m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("100m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			}, v1.ResourceRequirements{}, node)
+			nonCriticalBurstable := getTestPodWithPodLevelResources(false, burstablePodName, v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("100m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			}, v1.ResourceRequirements{}, node)
+			nonCriticalBestEffort := getTestPod(false, bestEffortPodName, v1.ResourceRequirements{}, node)
+			criticalPod := getTestPodWithPodLevelResources(true, criticalPodName, v1.ResourceRequirements{
+				// request the entire resource capacity of the node, so that
+				// admitting this pod requires the other pod to be preempted
+				Requests: getNodeCPUAndMemoryCapacity(ctx, f),
+			}, v1.ResourceRequirements{}, node)
+
+			// Create pods, starting with non-critical so that the critical preempts the other pods.
+			e2epod.NewPodClient(f).CreateBatch(ctx, []*v1.Pod{nonCriticalBestEffort, nonCriticalBurstable, nonCriticalGuaranteed})
+			e2epod.PodClientNS(f, kubeapi.NamespaceSystem).CreateSync(ctx, criticalPod)
+
+			// Check that non-critical pods other than the besteffort have been evicted
+			updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(ctx, metav1.ListOptions{})
+			framework.ExpectNoError(err)
+			for _, p := range updatedPodList.Items {
+				if p.Name == nonCriticalBestEffort.Name {
+					gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodRunning), "pod: %v should not be preempted with status: %#v", p.Name, p.Status)
+				} else {
+					gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodFailed), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
+					gomega.Expect(p.Status.Reason).To(gomega.Equal(events.PreemptContainer), "pod: %v should be preempted with status: %#v", p.Name, p.Status)
+				}
+			}
+		})
+		ginkgo.AfterEach(func(ctx context.Context) {
+			// Delete Pods
+			e2epod.NewPodClient(f).DeleteSync(ctx, guaranteedPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.NewPodClient(f).DeleteSync(ctx, burstablePodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.NewPodClient(f).DeleteSync(ctx, bestEffortPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			e2epod.PodClientNS(f, kubeapi.NamespaceSystem).DeleteSync(ctx, criticalPodName, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+			// Log Events
+			logPodEvents(ctx, f)
+			logNodeEvents(ctx, f)
+
+		})
+	})
+})
+
+func getNodeCPUAndMemoryCapacity(ctx context.Context, f *framework.Framework) v1.ResourceList {
+	nodeList, err := f.ClientSet.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	framework.ExpectNoError(err)
 	// Assuming that there is only one node, because this is a node e2e test.
-	Expect(len(nodeList.Items)).To(Equal(1))
+	gomega.Expect(nodeList.Items).To(gomega.HaveLen(1))
 	capacity := nodeList.Items[0].Status.Allocatable
 	return v1.ResourceList{
 		v1.ResourceCPU:    capacity[v1.ResourceCPU],
@@ -119,7 +223,15 @@ func getNodeCPUAndMemoryCapacity(f *framework.Framework) v1.ResourceList {
 	}
 }
 
-func getTestPod(critical bool, name string, resources v1.ResourceRequirements) *v1.Pod {
+func getNodeName(ctx context.Context, f *framework.Framework) string {
+	nodeList, err := f.ClientSet.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	framework.ExpectNoError(err)
+	// Assuming that there is only one node, because this is a node e2e test.
+	gomega.Expect(nodeList.Items).To(gomega.HaveLen(1))
+	return nodeList.Items[0].GetName()
+}
+
+func getTestPod(critical bool, name string, resources v1.ResourceRequirements, node string) *v1.Pod {
 	pod := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
@@ -130,20 +242,33 @@ func getTestPod(critical bool, name string, resources v1.ResourceRequirements) *
 			Containers: []v1.Container{
 				{
 					Name:      "container",
-					Image:     framework.GetPauseImageNameForHostArch(),
+					Image:     imageutils.GetPauseImageName(),
 					Resources: resources,
 				},
 			},
+			NodeName: node,
 		},
 	}
 	if critical {
 		pod.ObjectMeta.Namespace = kubeapi.NamespaceSystem
 		pod.ObjectMeta.Annotations = map[string]string{
-			kubelettypes.CriticalPodAnnotationKey: "",
+			kubelettypes.ConfigSourceAnnotationKey: kubelettypes.FileSource,
 		}
-		Expect(kubelettypes.IsCriticalPod(pod)).To(BeTrue(), "pod should be a critical pod")
+		pod.Spec.PriorityClassName = scheduling.SystemNodeCritical
+
+		if !kubelettypes.IsCriticalPod(pod) {
+			framework.Failf("pod %q should be a critical pod", pod.Name)
+		}
 	} else {
-		Expect(kubelettypes.IsCriticalPod(pod)).To(BeFalse(), "pod should not be a critical pod")
+		if kubelettypes.IsCriticalPod(pod) {
+			framework.Failf("pod %q should not be a critical pod", pod.Name)
+		}
 	}
+	return pod
+}
+
+func getTestPodWithPodLevelResources(critical bool, name string, podResources v1.ResourceRequirements, containerResources v1.ResourceRequirements, node string) *v1.Pod {
+	pod := getTestPod(critical, name, containerResources, node)
+	pod.Spec.Resources = &podResources
 	return pod
 }

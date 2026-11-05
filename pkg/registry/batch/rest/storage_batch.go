@@ -18,8 +18,6 @@ package rest
 
 import (
 	batchapiv1 "k8s.io/api/batch/v1"
-	batchapiv1beta1 "k8s.io/api/batch/v1beta1"
-	batchapiv2alpha1 "k8s.io/api/batch/v2alpha1"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -32,61 +30,43 @@ import (
 
 type RESTStorageProvider struct{}
 
-func (p RESTStorageProvider) NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (genericapiserver.APIGroupInfo, bool) {
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(batch.GroupName, legacyscheme.Registry, legacyscheme.Scheme, legacyscheme.ParameterCodec, legacyscheme.Codecs)
+func (p RESTStorageProvider) NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (genericapiserver.APIGroupInfo, error) {
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(batch.GroupName, legacyscheme.Scheme, legacyscheme.ParameterCodec, legacyscheme.Codecs)
 	// If you add a version here, be sure to add an entry in `k8s.io/kubernetes/cmd/kube-apiserver/app/aggregator.go with specific priorities.
 	// TODO refactor the plumbing to provide the information in the APIGroupInfo
 
-	if apiResourceConfigSource.AnyResourcesForVersionEnabled(batchapiv1.SchemeGroupVersion) {
-		apiGroupInfo.VersionedResourcesStorageMap[batchapiv1.SchemeGroupVersion.Version] = p.v1Storage(apiResourceConfigSource, restOptionsGetter)
-		apiGroupInfo.GroupMeta.GroupVersion = batchapiv1.SchemeGroupVersion
-	}
-	if apiResourceConfigSource.AnyResourcesForVersionEnabled(batchapiv1beta1.SchemeGroupVersion) {
-		apiGroupInfo.VersionedResourcesStorageMap[batchapiv1beta1.SchemeGroupVersion.Version] = p.v1beta1Storage(apiResourceConfigSource, restOptionsGetter)
-		apiGroupInfo.GroupMeta.GroupVersion = batchapiv1beta1.SchemeGroupVersion
-	}
-	if apiResourceConfigSource.AnyResourcesForVersionEnabled(batchapiv2alpha1.SchemeGroupVersion) {
-		apiGroupInfo.VersionedResourcesStorageMap[batchapiv2alpha1.SchemeGroupVersion.Version] = p.v2alpha1Storage(apiResourceConfigSource, restOptionsGetter)
-		apiGroupInfo.GroupMeta.GroupVersion = batchapiv2alpha1.SchemeGroupVersion
+	if storageMap, err := p.v1Storage(apiResourceConfigSource, restOptionsGetter); err != nil {
+		return genericapiserver.APIGroupInfo{}, err
+	} else if len(storageMap) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap[batchapiv1.SchemeGroupVersion.Version] = storageMap
 	}
 
-	return apiGroupInfo, true
+	return apiGroupInfo, nil
 }
 
-func (p RESTStorageProvider) v1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) map[string]rest.Storage {
-	version := batchapiv1.SchemeGroupVersion
-
+func (p RESTStorageProvider) v1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (map[string]rest.Storage, error) {
 	storage := map[string]rest.Storage{}
-	if apiResourceConfigSource.ResourceEnabled(version.WithResource("jobs")) {
-		jobsStorage, jobsStatusStorage := jobstore.NewREST(restOptionsGetter)
-		storage["jobs"] = jobsStorage
-		storage["jobs/status"] = jobsStatusStorage
+
+	// jobs
+	if resource := "jobs"; apiResourceConfigSource.ResourceEnabled(batchapiv1.SchemeGroupVersion.WithResource(resource)) {
+		jobsStorage, jobsStatusStorage, err := jobstore.NewREST(restOptionsGetter)
+		if err != nil {
+			return storage, err
+		}
+		storage[resource] = jobsStorage
+		storage[resource+"/status"] = jobsStatusStorage
 	}
-	return storage
-}
 
-func (p RESTStorageProvider) v1beta1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) map[string]rest.Storage {
-	version := batchapiv1beta1.SchemeGroupVersion
-
-	storage := map[string]rest.Storage{}
-	if apiResourceConfigSource.ResourceEnabled(version.WithResource("cronjobs")) {
-		cronJobsStorage, cronJobsStatusStorage := cronjobstore.NewREST(restOptionsGetter)
-		storage["cronjobs"] = cronJobsStorage
-		storage["cronjobs/status"] = cronJobsStatusStorage
+	// cronjobs
+	if resource := "cronjobs"; apiResourceConfigSource.ResourceEnabled(batchapiv1.SchemeGroupVersion.WithResource(resource)) {
+		cronJobsStorage, cronJobsStatusStorage, err := cronjobstore.NewREST(restOptionsGetter)
+		if err != nil {
+			return storage, err
+		}
+		storage[resource] = cronJobsStorage
+		storage[resource+"/status"] = cronJobsStatusStorage
 	}
-	return storage
-}
-
-func (p RESTStorageProvider) v2alpha1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) map[string]rest.Storage {
-	version := batchapiv2alpha1.SchemeGroupVersion
-
-	storage := map[string]rest.Storage{}
-	if apiResourceConfigSource.ResourceEnabled(version.WithResource("cronjobs")) {
-		cronJobsStorage, cronJobsStatusStorage := cronjobstore.NewREST(restOptionsGetter)
-		storage["cronjobs"] = cronJobsStorage
-		storage["cronjobs/status"] = cronJobsStatusStorage
-	}
-	return storage
+	return storage, nil
 }
 
 func (p RESTStorageProvider) GroupName() string {

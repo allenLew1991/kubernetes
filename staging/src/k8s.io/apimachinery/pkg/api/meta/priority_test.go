@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/ktesting"
 )
 
 func TestPriorityRESTMapperResourceForErrorHandling(t *testing.T) {
@@ -34,6 +35,30 @@ func TestPriorityRESTMapperResourceForErrorHandling(t *testing.T) {
 		result           schema.GroupVersionResource
 		err              string
 	}{
+		{
+			name:     "error",
+			delegate: fixedRESTMapper{err: errors.New("delegateError")},
+			err:      "delegateError",
+		},
+		{
+			name:     "single hit + error",
+			delegate: fixedRESTMapper{resourcesFor: []schema.GroupVersionResource{{Resource: "single-hit"}}, err: errors.New("delegateError")},
+			result:   schema.GroupVersionResource{Resource: "single-hit"},
+			err:      "delegateError",
+		},
+		{
+			name: "group selection + error",
+			delegate: fixedRESTMapper{resourcesFor: []schema.GroupVersionResource{
+				{Group: "one", Version: "a", Resource: "first"},
+				{Group: "two", Version: "b", Resource: "second"},
+			}, err: errors.New("delegateError")},
+			resourcePatterns: []schema.GroupVersionResource{
+				{Group: "one", Version: AnyVersion, Resource: AnyResource},
+			},
+			result: schema.GroupVersionResource{Group: "one", Version: "a", Resource: "first"},
+			err:    "delegateError",
+		},
+
 		{
 			name:     "single hit",
 			delegate: fixedRESTMapper{resourcesFor: []schema.GroupVersionResource{{Resource: "single-hit"}}},
@@ -96,14 +121,19 @@ func TestPriorityRESTMapperResourceForErrorHandling(t *testing.T) {
 		},
 	}
 
+	tCtx := ktesting.Init(t)
 	for _, tc := range tcs {
-		mapper := PriorityRESTMapper{Delegate: tc.delegate, ResourcePriority: tc.resourcePatterns}
+		mapper := ToPriorityRESTMapperWithContext(PriorityRESTMapper{Delegate: tc.delegate, ResourcePriority: tc.resourcePatterns})
 
-		actualResult, actualErr := mapper.ResourceFor(schema.GroupVersionResource{})
+		actualResult, actualErr := mapper.ResourceForWithContext(tCtx, schema.GroupVersionResource{})
 		if e, a := tc.result, actualResult; e != a {
 			t.Errorf("%s: expected %v, got %v", tc.name, e, a)
 		}
 		if len(tc.err) == 0 && actualErr == nil {
+			continue
+		}
+		if len(tc.err) == 0 && actualErr != nil {
+			t.Errorf("%s: unexpected err: %v", tc.name, actualErr)
 			continue
 		}
 		if len(tc.err) > 0 && actualErr == nil {
@@ -125,6 +155,30 @@ func TestPriorityRESTMapperKindForErrorHandling(t *testing.T) {
 		result       schema.GroupVersionKind
 		err          string
 	}{
+		{
+			name:     "error",
+			delegate: fixedRESTMapper{err: errors.New("delegateErr")},
+			err:      "delegateErr",
+		},
+		{
+			name:     "single hit + error",
+			delegate: fixedRESTMapper{kindsFor: []schema.GroupVersionKind{{Kind: "single-hit"}}, err: errors.New("delegateErr")},
+			result:   schema.GroupVersionKind{Kind: "single-hit"},
+			err:      "delegateErr",
+		},
+		{
+			name: "group selection + error",
+			delegate: fixedRESTMapper{kindsFor: []schema.GroupVersionKind{
+				{Group: "one", Version: "a", Kind: "first"},
+				{Group: "two", Version: "b", Kind: "second"},
+			}, err: errors.New("delegateErr")},
+			kindPatterns: []schema.GroupVersionKind{
+				{Group: "one", Version: AnyVersion, Kind: AnyKind},
+			},
+			result: schema.GroupVersionKind{Group: "one", Version: "a", Kind: "first"},
+			err:    "delegateErr",
+		},
+
 		{
 			name:     "single hit",
 			delegate: fixedRESTMapper{kindsFor: []schema.GroupVersionKind{{Kind: "single-hit"}}},
@@ -187,14 +241,19 @@ func TestPriorityRESTMapperKindForErrorHandling(t *testing.T) {
 		},
 	}
 
+	tCtx := ktesting.Init(t)
 	for _, tc := range tcs {
-		mapper := PriorityRESTMapper{Delegate: tc.delegate, KindPriority: tc.kindPatterns}
+		mapper := ToPriorityRESTMapperWithContext(PriorityRESTMapper{Delegate: tc.delegate, KindPriority: tc.kindPatterns})
 
-		actualResult, actualErr := mapper.KindFor(schema.GroupVersionResource{})
+		actualResult, actualErr := mapper.KindForWithContext(tCtx, schema.GroupVersionResource{})
 		if e, a := tc.result, actualResult; e != a {
 			t.Errorf("%s: expected %v, got %v", tc.name, e, a)
 		}
 		if len(tc.err) == 0 && actualErr == nil {
+			continue
+		}
+		if len(tc.err) == 0 && actualErr != nil {
+			t.Errorf("%s: unexpected err: %v", tc.name, actualErr)
 			continue
 		}
 		if len(tc.err) > 0 && actualErr == nil {
@@ -249,6 +308,13 @@ func TestPriorityRESTMapperRESTMapping(t *testing.T) {
 			err:    errors.New("fail on this"),
 		},
 		{
+			name:   "result + error",
+			mapper: PriorityRESTMapper{Delegate: fixedRESTMapper{mappings: []*RESTMapping{mapping1}, err: errors.New("fail on this")}},
+			input:  schema.GroupKind{Kind: "Foo"},
+			result: mapping1,
+			err:    errors.New("fail on this"),
+		},
+		{
 			name: "return error for ambiguous",
 			mapper: PriorityRESTMapper{
 				Delegate: allMappers,
@@ -291,8 +357,9 @@ func TestPriorityRESTMapperRESTMapping(t *testing.T) {
 		},
 	}
 
+	tCtx := ktesting.Init(t)
 	for _, tc := range tcs {
-		actualResult, actualErr := tc.mapper.RESTMapping(tc.input)
+		actualResult, actualErr := ToPriorityRESTMapperWithContext(tc.mapper).RESTMappingWithContext(tCtx, tc.input)
 		if e, a := tc.result, actualResult; !reflect.DeepEqual(e, a) {
 			t.Errorf("%s: expected %v, got %v", tc.name, e, a)
 		}
@@ -321,12 +388,13 @@ func TestPriorityRESTMapperRESTMappingHonorsUserVersion(t *testing.T) {
 		fixedRESTMapper{mappings: []*RESTMapping{mappingV1}},
 	}
 
-	mapper := PriorityRESTMapper{
+	mapper := ToPriorityRESTMapperWithContext(PriorityRESTMapper{
 		Delegate:     allMappers,
 		KindPriority: []schema.GroupVersionKind{{Group: "Bar", Version: "v2alpha1", Kind: AnyKind}, {Group: "Bar", Version: AnyVersion, Kind: AnyKind}},
-	}
+	})
+	tCtx := ktesting.Init(t)
 
-	outMapping1, err := mapper.RESTMapping(schema.GroupKind{Group: "Bar", Kind: "Foo"}, "v1")
+	outMapping1, err := mapper.RESTMappingWithContext(tCtx, schema.GroupKind{Group: "Bar", Kind: "Foo"}, "v1")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -335,7 +403,7 @@ func TestPriorityRESTMapperRESTMappingHonorsUserVersion(t *testing.T) {
 		t.Errorf("asked for version %v, expected mapping for %v, got mapping for %v", "v1", mappingV1.GroupVersionKind, outMapping1.GroupVersionKind)
 	}
 
-	outMapping2, err := mapper.RESTMapping(schema.GroupKind{Group: "Bar", Kind: "Foo"}, "v2alpha1")
+	outMapping2, err := mapper.RESTMappingWithContext(tCtx, schema.GroupKind{Group: "Bar", Kind: "Foo"}, "v2alpha1")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}

@@ -17,83 +17,188 @@ limitations under the License.
 package kuberuntime
 
 import (
-	"path/filepath"
+	"context"
+	"fmt"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	runtimetesting "k8s.io/kubernetes/pkg/kubelet/apis/cri/testing"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	runtimetesting "k8s.io/cri-api/pkg/apis/testing"
+	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"k8s.io/utils/ptr"
 )
 
-func TestStableKey(t *testing.T) {
-	container := &v1.Container{
-		Name:  "test_container",
-		Image: "foo/image:v1",
-	}
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test_pod",
-			Namespace: "test_pod_namespace",
-			UID:       "test_pod_uid",
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{*container},
-		},
-	}
-	oldKey := getStableKey(pod, container)
-
-	// Updating the container image should change the key.
-	container.Image = "foo/image:v2"
-	newKey := getStableKey(pod, container)
-	assert.NotEqual(t, oldKey, newKey)
+type fakePodStatusProvider struct {
+	pod    *kubecontainer.Pod
+	status *kubecontainer.PodStatus
 }
 
-// TestGetSystclsFromAnnotations tests the logic of getting sysctls from annotations.
-func TestGetSystclsFromAnnotations(t *testing.T) {
-	tests := []struct {
-		annotations     map[string]string
-		expectedSysctls map[string]string
-	}{{
-		annotations: map[string]string{
-			v1.SysctlsPodAnnotationKey:       "kernel.shmmni=32768,kernel.shmmax=1000000000",
-			v1.UnsafeSysctlsPodAnnotationKey: "knet.ipv4.route.min_pmtu=1000",
-		},
-		expectedSysctls: map[string]string{
-			"kernel.shmmni":            "32768",
-			"kernel.shmmax":            "1000000000",
-			"knet.ipv4.route.min_pmtu": "1000",
-		},
-	}, {
-		annotations: map[string]string{
-			v1.SysctlsPodAnnotationKey: "kernel.shmmni=32768,kernel.shmmax=1000000000",
-		},
-		expectedSysctls: map[string]string{
-			"kernel.shmmni": "32768",
-			"kernel.shmmax": "1000000000",
-		},
-	}, {
-		annotations: map[string]string{
-			v1.UnsafeSysctlsPodAnnotationKey: "knet.ipv4.route.min_pmtu=1000",
-		},
-		expectedSysctls: map[string]string{
-			"knet.ipv4.route.min_pmtu": "1000",
-		},
-	}}
+func (f fakePodStatusProvider) GetPod(_ context.Context, uid types.UID) (*kubecontainer.Pod, error) {
+	if uid != f.pod.ID {
+		return nil, fmt.Errorf("unexpected pod UID: got %s, want %s", uid, f.pod.ID)
+	}
+	return f.pod, nil
+}
 
+func (f fakePodStatusProvider) GetPodStatus(_ context.Context, pod *kubecontainer.Pod) (*kubecontainer.PodStatus, error) {
+	if pod != f.pod {
+		return nil, fmt.Errorf("Unexpected pod: %v", pod)
+	}
+	return f.status, nil
+}
+
+func TestIsInitContainerFailed(t *testing.T) {
+	tests := []struct {
+		status      *kubecontainer.Status
+		isFailed    bool
+		description string
+	}{
+		{
+			status: &kubecontainer.Status{
+				State:    kubecontainer.ContainerStateExited,
+				ExitCode: 1,
+			},
+			isFailed:    true,
+			description: "Init container in exited state and non-zero exit code should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateUnknown,
+			},
+			isFailed:    true,
+			description: "Init container in unknown state should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				Reason:   "OOMKilled",
+				ExitCode: 0,
+			},
+			isFailed:    true,
+			description: "Init container which reason is OOMKilled should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				State:    kubecontainer.ContainerStateExited,
+				ExitCode: 0,
+			},
+			isFailed:    false,
+			description: "Init container in exited state and zero exit code should return false",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateRunning,
+			},
+			isFailed:    false,
+			description: "Init container in running state should return false",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateCreated,
+			},
+			isFailed:    false,
+			description: "Init container in created state should return false",
+		},
+	}
 	for i, test := range tests {
-		actualSysctls, err := getSysctlsFromAnnotations(test.annotations)
-		assert.NoError(t, err, "TestCase[%d]", i)
-		assert.Len(t, actualSysctls, len(test.expectedSysctls), "TestCase[%d]", i)
-		assert.Equal(t, test.expectedSysctls, actualSysctls, "TestCase[%d]", i)
+		isFailed := isInitContainerFailed(test.status)
+		assert.Equal(t, test.isFailed, isFailed, "TestCase[%d]: %s", i, test.description)
+	}
+}
+
+func TestGetBackoffKey(t *testing.T) {
+	testSpecs := map[string]v1.PodSpec{
+		"empty resources": {
+			Containers: []v1.Container{{
+				Name:  "test_container",
+				Image: "foo/image:v1",
+			}},
+		},
+		"with resources": {
+			Containers: []v1.Container{{
+				Name:  "test_container",
+				Image: "foo/image:v1",
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("100m"),
+						v1.ResourceMemory: resource.MustParse("100Mi"),
+					},
+					Limits: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("200m"),
+						v1.ResourceMemory: resource.MustParse("200Mi"),
+					},
+				},
+			}},
+		},
+	}
+
+	for name, spec := range testSpecs {
+		t.Run(name, func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test_pod",
+					Namespace: "test_pod_namespace",
+					UID:       "test_pod_uid",
+				},
+				Spec: spec,
+			}
+			secondContainer := v1.Container{
+				Name:  "second_container",
+				Image: "registry.k8s.io/pause",
+			}
+			pod.Spec.Containers = append(pod.Spec.Containers, secondContainer)
+			originalKey := GetBackoffKey(pod, &pod.Spec.Containers[0])
+
+			podCopy := pod.DeepCopy()
+			podCopy.Spec.ActiveDeadlineSeconds = ptr.To[int64](1)
+			assert.Equal(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[0]),
+				"Unrelated change should not change the key")
+
+			podCopy = pod.DeepCopy()
+			assert.NotEqual(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[1]),
+				"Different container change should change the key")
+
+			podCopy = pod.DeepCopy()
+			podCopy.Name = "other-pod"
+			assert.NotEqual(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[0]),
+				"Different pod name should change the key")
+
+			podCopy = pod.DeepCopy()
+			podCopy.Namespace = "other-namespace"
+			assert.NotEqual(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[0]),
+				"Different pod namespace should change the key")
+
+			podCopy = pod.DeepCopy()
+			podCopy.Spec.Containers[0].Image = "foo/image:v2"
+			assert.NotEqual(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[0]),
+				"Updating the container image should change the key")
+
+			podCopy = pod.DeepCopy()
+			c := &podCopy.Spec.Containers[0]
+			if c.Resources.Requests == nil {
+				c.Resources.Requests = v1.ResourceList{}
+			}
+			c.Resources.Requests[v1.ResourceCPU] = resource.MustParse("200m")
+			assert.NotEqual(t, originalKey, GetBackoffKey(podCopy, &podCopy.Spec.Containers[0]),
+				"Updating the resources should change the key")
+		})
 	}
 }
 
 func TestToKubeContainer(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	c := &runtimeapi.Container{
 		Id: "test-id",
 		Metadata: &runtimeapi.ContainerMetadata{
@@ -101,6 +206,7 @@ func TestToKubeContainer(t *testing.T) {
 			Attempt: 1,
 		},
 		Image:    &runtimeapi.ImageSpec{Image: "test-image"},
+		ImageId:  "test-image-id",
 		ImageRef: "test-image-ref",
 		State:    runtimeapi.ContainerState_CONTAINER_RUNNING,
 		Annotations: map[string]string{
@@ -112,22 +218,75 @@ func TestToKubeContainer(t *testing.T) {
 			Type: runtimetesting.FakeRuntimeName,
 			ID:   "test-id",
 		},
-		Name:    "test-name",
-		ImageID: "test-image-ref",
-		Image:   "test-image",
-		Hash:    uint64(0x1234),
-		State:   kubecontainer.ContainerStateRunning,
+		Name:                "test-name",
+		ImageID:             "test-image-id",
+		ImageRef:            "test-image-ref",
+		Image:               "test-image",
+		ImageRuntimeHandler: "",
+		Hash:                uint64(0x1234),
+		State:               kubecontainer.ContainerStateRunning,
 	}
 
-	_, _, m, err := createTestRuntimeManager()
+	_, _, m, err := createTestRuntimeManager(tCtx)
 	assert.NoError(t, err)
-	got, err := m.toKubeContainer(c)
+	got, err := m.toKubeContainer(tCtx, c)
 	assert.NoError(t, err)
 	assert.Equal(t, expect, got)
+
+	// unable to convert a nil pointer to a runtime container
+	_, err = m.toKubeContainer(tCtx, nil)
+	assert.Error(t, err)
+	_, err = m.sandboxToKubeContainer(nil)
+	assert.Error(t, err)
+}
+
+func TestToKubeContainerWithRuntimeHandlerInImageSpecCri(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RuntimeClassInImageCriAPI, true)
+	tCtx := ktesting.Init(t)
+	c := &runtimeapi.Container{
+		Id: "test-id",
+		Metadata: &runtimeapi.ContainerMetadata{
+			Name:    "test-name",
+			Attempt: 1,
+		},
+		Image:    &runtimeapi.ImageSpec{Image: "test-image", RuntimeHandler: "test-runtimeHandler"},
+		ImageId:  "test-image-id",
+		ImageRef: "test-image-ref",
+		State:    runtimeapi.ContainerState_CONTAINER_RUNNING,
+		Annotations: map[string]string{
+			containerHashLabel: "1234",
+		},
+	}
+	expect := &kubecontainer.Container{
+		ID: kubecontainer.ContainerID{
+			Type: runtimetesting.FakeRuntimeName,
+			ID:   "test-id",
+		},
+		Name:                "test-name",
+		ImageID:             "test-image-id",
+		ImageRef:            "test-image-ref",
+		Image:               "test-image",
+		ImageRuntimeHandler: "test-runtimeHandler",
+		Hash:                uint64(0x1234),
+		State:               kubecontainer.ContainerStateRunning,
+	}
+
+	_, _, m, err := createTestRuntimeManager(tCtx)
+	assert.NoError(t, err)
+	got, err := m.toKubeContainer(tCtx, c)
+	assert.NoError(t, err)
+	assert.Equal(t, expect, got)
+
+	// unable to convert a nil pointer to a runtime container
+	_, err = m.toKubeContainer(tCtx, nil)
+	assert.Error(t, err)
+	_, err = m.sandboxToKubeContainer(nil)
+	assert.Error(t, err)
 }
 
 func TestGetImageUser(t *testing.T) {
-	_, i, m, err := createTestRuntimeManager()
+	tCtx := ktesting.Init(t)
+	_, i, m, err := createTestRuntimeManager(tCtx)
 	assert.NoError(t, err)
 
 	type image struct {
@@ -194,10 +353,11 @@ func TestGetImageUser(t *testing.T) {
 
 	i.SetFakeImages([]string{"test-image-ref1", "test-image-ref2", "test-image-ref3"})
 	for j, test := range tests {
+		tCtx := ktesting.Init(t)
 		i.Images[test.originalImage.name].Username = test.originalImage.username
 		i.Images[test.originalImage.name].Uid = test.originalImage.uid
 
-		uid, username, err := m.getImageUser(test.originalImage.name)
+		uid, username, err := m.getImageUser(tCtx, test.originalImage.name)
 		assert.NoError(t, err, "TestCase[%d]", j)
 
 		if test.expectedImageUserValues.uid == (*int64)(nil) {
@@ -209,99 +369,451 @@ func TestGetImageUser(t *testing.T) {
 	}
 }
 
-func TestGetSeccompProfileFromAnnotations(t *testing.T) {
-	_, _, m, err := createTestRuntimeManager()
-	require.NoError(t, err)
-
-	tests := []struct {
-		description     string
-		annotation      map[string]string
-		containerName   string
-		expectedProfile string
+func TestToRuntimeProtocol(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	logger := klog.FromContext(tCtx)
+	for _, test := range []struct {
+		name     string
+		protocol string
+		expected runtimeapi.Protocol
 	}{
 		{
-			description:     "no seccomp should return empty string",
-			expectedProfile: "",
+			name:     "TCP protocol",
+			protocol: "TCP",
+			expected: runtimeapi.Protocol_TCP,
 		},
 		{
-			description:     "no seccomp with containerName should return exmpty string",
-			containerName:   "container1",
-			expectedProfile: "",
+			name:     "UDP protocol",
+			protocol: "UDP",
+			expected: runtimeapi.Protocol_UDP,
 		},
 		{
-			description: "pod docker/default seccomp profile should return docker/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "docker/default",
+			name:     "SCTP protocol",
+			protocol: "SCTP",
+			expected: runtimeapi.Protocol_SCTP,
+		},
+		{
+			name:     "unknown protocol",
+			protocol: "unknown",
+			expected: runtimeapi.Protocol_TCP,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if result := toRuntimeProtocol(logger, v1.Protocol(test.protocol)); result != test.expected {
+				t.Errorf("expected %d but got %d", test.expected, result)
+			}
+		})
+	}
+}
+
+func TestToKubeContainerState(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		state    int32
+		expected kubecontainer.State
+	}{
+		{
+			name:     "container created",
+			state:    0,
+			expected: kubecontainer.ContainerStateCreated,
+		},
+		{
+			name:     "container running",
+			state:    1,
+			expected: kubecontainer.ContainerStateRunning,
+		},
+		{
+			name:     "container exited",
+			state:    2,
+			expected: kubecontainer.ContainerStateExited,
+		},
+		{
+			name:     "unknown state",
+			state:    3,
+			expected: kubecontainer.ContainerStateUnknown,
+		},
+		{
+			name:     "not supported state",
+			state:    4,
+			expected: kubecontainer.ContainerStateUnknown,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if result := toKubeContainerState(runtimeapi.ContainerState(test.state)); result != test.expected {
+				t.Errorf("expected %s but got %s", test.expected, result)
+			}
+		})
+	}
+}
+
+func TestGetAppArmorProfile(t *testing.T) {
+	tests := []struct {
+		name               string
+		podProfile         *v1.AppArmorProfile
+		expectedProfile    *runtimeapi.SecurityProfile
+		expectedOldProfile string
+		expectError        bool
+	}{{
+		name:            "no appArmor",
+		expectedProfile: nil,
+	}, {
+		name:       "runtime default",
+		podProfile: &v1.AppArmorProfile{Type: v1.AppArmorProfileTypeRuntimeDefault},
+		expectedProfile: &runtimeapi.SecurityProfile{
+			ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+		},
+		expectedOldProfile: "runtime/default",
+	}, {
+		name:       "unconfined",
+		podProfile: &v1.AppArmorProfile{Type: v1.AppArmorProfileTypeUnconfined},
+		expectedProfile: &runtimeapi.SecurityProfile{
+			ProfileType: runtimeapi.SecurityProfile_Unconfined,
+		},
+		expectedOldProfile: "unconfined",
+	}, {
+		name: "localhost",
+		podProfile: &v1.AppArmorProfile{
+			Type:             v1.AppArmorProfileTypeLocalhost,
+			LocalhostProfile: ptr.To("test"),
+		},
+		expectedProfile: &runtimeapi.SecurityProfile{
+			ProfileType:  runtimeapi.SecurityProfile_Localhost,
+			LocalhostRef: "test",
+		},
+		expectedOldProfile: "localhost/test",
+	}, {
+		name: "invalid localhost",
+		podProfile: &v1.AppArmorProfile{
+			Type: v1.AppArmorProfileTypeLocalhost,
+		},
+		expectError: true,
+	}, {
+		name: "invalid type",
+		podProfile: &v1.AppArmorProfile{
+			Type: "foo",
+		},
+		expectError: true,
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pod := v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bar",
+				},
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						AppArmorProfile: test.podProfile,
+					},
+					Containers: []v1.Container{{Name: "foo"}},
+				},
+			}
+
+			actual, actualOld, err := getAppArmorProfile(&pod, &pod.Spec.Containers[0])
+
+			if test.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, test.expectedProfile, actual, "AppArmor profile")
+			assert.Equal(t, test.expectedOldProfile, actualOld, "old (deprecated) profile string")
+		})
+	}
+}
+
+func TestMergeResourceConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   *cm.ResourceConfig
+		update   *cm.ResourceConfig
+		expected *cm.ResourceConfig
+	}{
+		{
+			name:   "merge all fields",
+			source: &cm.ResourceConfig{Memory: ptr.To[int64](1024), CPUShares: ptr.To[uint64](2)},
+			update: &cm.ResourceConfig{Memory: ptr.To[int64](2048), CPUQuota: ptr.To[int64](5000)},
+			expected: &cm.ResourceConfig{
+				Memory:    ptr.To[int64](2048),
+				CPUShares: ptr.To[uint64](2),
+				CPUQuota:  ptr.To[int64](5000),
 			},
-			expectedProfile: "docker/default",
 		},
 		{
-			description: "pod docker/default seccomp profile with containerName should return docker/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "docker/default",
+			name:   "merge HugePageLimit and Unified",
+			source: &cm.ResourceConfig{HugePageLimit: map[int64]int64{2048: 1024}, Unified: map[string]string{"key1": "value1"}},
+			update: &cm.ResourceConfig{HugePageLimit: map[int64]int64{4096: 2048}, Unified: map[string]string{"key1": "newValue1", "key2": "value2"}},
+			expected: &cm.ResourceConfig{
+				HugePageLimit: map[int64]int64{2048: 1024, 4096: 2048},
+				Unified:       map[string]string{"key1": "newValue1", "key2": "value2"},
 			},
-			containerName:   "container1",
-			expectedProfile: "docker/default",
 		},
 		{
-			description: "pod unconfined seccomp profile should return unconfined",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "unconfined",
+			name:   "update nil source",
+			source: nil,
+			update: &cm.ResourceConfig{Memory: ptr.To[int64](4096)},
+			expected: &cm.ResourceConfig{
+				Memory: ptr.To[int64](4096),
 			},
-			expectedProfile: "unconfined",
 		},
 		{
-			description: "pod unconfined seccomp profile with containerName should return unconfined",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "unconfined",
+			name:   "update nil update",
+			source: &cm.ResourceConfig{Memory: ptr.To[int64](1024)},
+			update: nil,
+			expected: &cm.ResourceConfig{
+				Memory: ptr.To[int64](1024),
 			},
-			containerName:   "container1",
-			expectedProfile: "unconfined",
 		},
 		{
-			description: "pod localhost seccomp profile should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "localhost/chmod.json",
+			name:   "update empty source",
+			source: &cm.ResourceConfig{},
+			update: &cm.ResourceConfig{Memory: ptr.To[int64](8192)},
+			expected: &cm.ResourceConfig{
+				Memory: ptr.To[int64](8192),
 			},
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
-		},
-		{
-			description: "pod localhost seccomp profile with containerName should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
-		},
-		{
-			description: "container localhost seccomp profile with containerName should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
-		},
-		{
-			description: "container localhost seccomp profile should override pod profile",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey:                            "unconfined",
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
-		},
-		{
-			description: "container localhost seccomp profile with unmatched containerName should return empty string",
-			annotation: map[string]string{
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container2",
-			expectedProfile: "",
 		},
 	}
 
-	for i, test := range tests {
-		seccompProfile := m.getSeccompProfileFromAnnotations(test.annotation, test.containerName)
-		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]", i)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			merged := mergeResourceConfig(tt.source, tt.update)
+
+			assert.Equal(t, tt.expected, merged)
+		})
+	}
+}
+
+func TestConvertResourceConfigToLinuxContainerResources(t *testing.T) {
+	resCfg := &cm.ResourceConfig{
+		Memory:        ptr.To[int64](2048),
+		CPUShares:     ptr.To[uint64](2),
+		CPUPeriod:     ptr.To[uint64](10000),
+		CPUQuota:      ptr.To[int64](5000),
+		HugePageLimit: map[int64]int64{4096: 2048},
+		Unified:       map[string]string{"key1": "value1"},
+	}
+
+	lcr := convertResourceConfigToLinuxContainerResources(resCfg)
+
+	assert.Equal(t, int64(*resCfg.CPUPeriod), lcr.CpuPeriod)
+	assert.Equal(t, *resCfg.CPUQuota, lcr.CpuQuota)
+	assert.Equal(t, int64(*resCfg.CPUShares), lcr.CpuShares)
+	assert.Equal(t, *resCfg.Memory, lcr.MemoryLimitInBytes)
+	assert.Equal(t, resCfg.Unified, lcr.Unified)
+}
+
+func TestContainerByCreatedThenID(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		input    []*runtimeapi.Container
+		expected []*runtimeapi.Container
+	}{
+		{
+			name: "different CreatedAt sort by time desc (newest first)",
+			input: []*runtimeapi.Container{
+				{Id: "c1", CreatedAt: now.Add(-30 * time.Minute).Unix()},
+				{Id: "c2", CreatedAt: now.Unix()},
+				{Id: "c3", CreatedAt: now.Add(-10 * time.Minute).Unix()},
+			},
+			expected: []*runtimeapi.Container{
+				{Id: "c2"}, // newest
+				{Id: "c3"},
+				{Id: "c1"}, // oldest
+			},
+		},
+		{
+			name: "same CreatedAt sort by ID asc",
+			input: []*runtimeapi.Container{
+				{Id: "container-zzz", CreatedAt: now.Unix()},
+				{Id: "container-aaa", CreatedAt: now.Unix()},
+				{Id: "container-mmm", CreatedAt: now.Unix()},
+			},
+			expected: []*runtimeapi.Container{
+				{Id: "container-aaa"},
+				{Id: "container-mmm"},
+				{Id: "container-zzz"},
+			},
+		},
+		{
+			name: "mixed: some same time, some different",
+			input: []*runtimeapi.Container{
+				{Id: "c-old-2", CreatedAt: now.Add(-1 * time.Hour).Unix()},
+				{Id: "c-new-1", CreatedAt: now.Unix()},
+				{Id: "c-group-b", CreatedAt: now.Unix()},
+				{Id: "c-group-a", CreatedAt: now.Unix()},
+				{Id: "c-old-1", CreatedAt: now.Add(-1 * time.Hour).Unix()},
+			},
+			expected: []*runtimeapi.Container{
+				{Id: "c-group-a"},
+				{Id: "c-group-b"},
+				{Id: "c-new-1"},
+				{Id: "c-old-1"},
+				{Id: "c-old-2"},
+			},
+		},
+		{
+			name:     "empty slice",
+			input:    []*runtimeapi.Container{},
+			expected: []*runtimeapi.Container{},
+		},
+		{
+			name: "single element",
+			input: []*runtimeapi.Container{
+				{Id: "only-one", CreatedAt: now.Add(-5 * time.Minute).Unix()},
+			},
+			expected: []*runtimeapi.Container{
+				{Id: "only-one"},
+			},
+		},
+		{
+			name: "all CreatedAt same, IDs already sorted should remain stable",
+			input: []*runtimeapi.Container{
+				{Id: "id-001", CreatedAt: now.Unix()},
+				{Id: "id-002", CreatedAt: now.Unix()},
+				{Id: "id-003", CreatedAt: now.Unix()},
+			},
+			expected: []*runtimeapi.Container{
+				{Id: "id-001"},
+				{Id: "id-002"},
+				{Id: "id-003"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			containers := make([]*runtimeapi.Container, len(tt.input))
+			copy(containers, tt.input)
+
+			sort.Sort(containerByCreatedThenID(containers))
+
+			assert.Len(t, containers, len(tt.expected), "length mismatch")
+
+			for i := range tt.expected {
+				assert.Equal(t, tt.expected[i].Id, containers[i].Id, "ID mismatch at index %d", i)
+			}
+		})
+	}
+}
+
+func TestPodSandboxByCreatedThenID(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		input    []*runtimeapi.PodSandbox
+		expected []string
+	}{
+		{
+			name: "different Attempt higher Attempt first",
+			input: []*runtimeapi.PodSandbox{
+				{
+					Id:        "sandbox-c",
+					CreatedAt: now.UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 0},
+				},
+				{
+					Id:        "sandbox-a",
+					CreatedAt: now.UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 2},
+				},
+				{
+					Id:        "sandbox-b",
+					CreatedAt: now.UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 1},
+				},
+			},
+			expected: []string{"sandbox-a", "sandbox-b", "sandbox-c"},
+		},
+		{
+			name: "same Attempt newer CreatedAt first",
+			input: []*runtimeapi.PodSandbox{
+				{
+					Id:        "old",
+					CreatedAt: now.Add(-10 * time.Minute).UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 5},
+				},
+				{
+					Id:        "newest",
+					CreatedAt: now.UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 5},
+				},
+				{
+					Id:        "medium",
+					CreatedAt: now.Add(-5 * time.Minute).UnixNano(),
+					Metadata:  &runtimeapi.PodSandboxMetadata{Attempt: 5},
+				},
+			},
+			expected: []string{"newest", "medium", "old"},
+		},
+		{
+			name: "same Attempt and CreatedAt sort by Id ascending",
+			input: []*runtimeapi.PodSandbox{
+				{Id: "zzz-3", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+				{Id: "aaa-1", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+				{Id: "mmm-2", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+			},
+			expected: []string{"aaa-1", "mmm-2", "zzz-3"},
+		},
+		{
+			name: "mixed: Attempt CreatedAt + Id",
+			input: []*runtimeapi.PodSandbox{
+				{Id: "c1", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 0}},
+				{Id: "a2", CreatedAt: now.Add(-20 * time.Minute).UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 2}},
+				{Id: "b3", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+				{Id: "group-b", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+				{Id: "group-a", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 1}},
+			},
+			expected: []string{
+				"a2",
+				"b3",
+				"group-a",
+				"group-b",
+				"c1",
+			},
+		},
+		{
+			name:     "empty slice",
+			input:    []*runtimeapi.PodSandbox{},
+			expected: []string{},
+		},
+		{
+			name: "single sandbox",
+			input: []*runtimeapi.PodSandbox{
+				{Id: "single", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 3}},
+			},
+			expected: []string{"single"},
+		},
+		{
+			name: "Metadata nil fallback only CreatedAt then Id",
+			input: []*runtimeapi.PodSandbox{
+				{Id: "nil-b", CreatedAt: now.UnixNano(), Metadata: nil},
+				{Id: "nil-a", CreatedAt: now.UnixNano(), Metadata: nil},
+				{Id: "with-meta", CreatedAt: now.UnixNano(), Metadata: &runtimeapi.PodSandboxMetadata{Attempt: 0}},
+			},
+			expected: []string{"nil-a", "nil-b", "with-meta"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxes := make([]*runtimeapi.PodSandbox, len(tt.input))
+			copy(sandboxes, tt.input)
+
+			sort.Sort(podSandboxByCreatedThenID(sandboxes))
+
+			assert.Len(t, sandboxes, len(tt.expected), "length mismatch")
+
+			actualIDs := make([]string, len(sandboxes))
+			for i, s := range sandboxes {
+				actualIDs[i] = s.Id
+			}
+
+			assert.Equal(t, tt.expected, actualIDs, "sorting order mismatch")
+		})
 	}
 }

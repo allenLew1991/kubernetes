@@ -21,12 +21,11 @@ import (
 )
 
 // +genclient
-// +genclient:noStatus
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Foo is a specification for a Foo resource
 type Foo struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta   `json:""`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	Spec   FooSpec   `json:"spec"`
@@ -48,8 +47,8 @@ type FooStatus struct {
 
 // FooList is a list of Foo resources
 type FooList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata"`
+	metav1.TypeMeta `json:""`
+	metav1.ListMeta `json:"metadata,omitempty"`
 
 	Items []Foo `json:"items"`
 }

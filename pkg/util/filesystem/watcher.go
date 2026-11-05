@@ -17,6 +17,9 @@ limitations under the License.
 package filesystem
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -28,7 +31,8 @@ type FSWatcher interface {
 
 	// Starts listening for events and errors.
 	// When an event or error occurs, the corresponding handler is called.
-	Run()
+	// The watcher stops and releases resources when ctx is canceled.
+	Run(ctx context.Context)
 
 	// Add a filesystem path to watch
 	AddWatch(path string) error
@@ -62,7 +66,7 @@ func (w *fsnotifyWatcher) Init(eventHandler FSEventHandler, errorHandler FSError
 	var err error
 	w.watcher, err = fsnotify.NewWatcher()
 	if err != nil {
-		return err
+		return fmt.Errorf("fsnotify watcher init: %w", err)
 	}
 
 	w.eventHandler = eventHandler
@@ -70,11 +74,13 @@ func (w *fsnotifyWatcher) Init(eventHandler FSEventHandler, errorHandler FSError
 	return nil
 }
 
-func (w *fsnotifyWatcher) Run() {
+func (w *fsnotifyWatcher) Run(ctx context.Context) {
 	go func() {
 		defer w.watcher.Close()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case event := <-w.watcher.Events:
 				if w.eventHandler != nil {
 					w.eventHandler(event)

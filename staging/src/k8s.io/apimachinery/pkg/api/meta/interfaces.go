@@ -17,17 +17,13 @@ limitations under the License.
 package meta
 
 import (
+	"context"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
-
-// VersionInterfaces contains the interfaces one should use for dealing with types of a particular version.
-type VersionInterfaces struct {
-	runtime.ObjectConvertor
-	MetadataAccessor
-}
 
 type ListMetaAccessor interface {
 	GetListMeta() List
@@ -92,28 +88,19 @@ const (
 type RESTScope interface {
 	// Name of the scope
 	Name() RESTScopeName
-	// ParamName is the optional name of the parameter that should be inserted in the resource url
-	// If empty, no param will be inserted
-	ParamName() string
-	// ArgumentName is the optional name that should be used for the variable holding the value.
-	ArgumentName() string
-	// ParamDescription is the optional description to use to document the parameter in api documentation
-	ParamDescription() string
 }
 
 // RESTMapping contains the information needed to deal with objects of a specific
 // resource and kind in a RESTful manner.
 type RESTMapping struct {
-	// Resource is a string representing the name of this resource as a REST client would see it
-	Resource string
+	// Resource is the GroupVersionResource (location) for this endpoint
+	Resource schema.GroupVersionResource
 
+	// GroupVersionKind is the GroupVersionKind (data format) to submit to this endpoint
 	GroupVersionKind schema.GroupVersionKind
 
 	// Scope contains the information needed to deal with REST Resources that are in a resource hierarchy
 	Scope RESTScope
-
-	runtime.ObjectConvertor
-	MetadataAccessor
 }
 
 // RESTMapper allows clients to map resources to kind, and map kind and version
@@ -124,7 +111,9 @@ type RESTMapping struct {
 // to API groups. In other words, kinds and resources should not be assumed to be
 // unique across groups.
 //
-// TODO: split into sub-interfaces
+// RESTMapperWithContext is a better alternative because it supports contextual logging and cancellation.
+//
+// Contextual logging: Use RESTMapperWithContext instead.
 type RESTMapper interface {
 	// KindFor takes a partial resource and returns the single match.  Returns an error if there are multiple matches
 	KindFor(resource schema.GroupVersionResource) (schema.GroupVersionKind, error)
@@ -146,4 +135,116 @@ type RESTMapper interface {
 	RESTMappings(gk schema.GroupKind, versions ...string) ([]*RESTMapping, error)
 
 	ResourceSingularizer(resource string) (singular string, err error)
+}
+
+// RESTMapperWithContext allows clients to map resources to kind, and map kind and version
+// to interfaces for manipulating those objects. It is primarily intended for
+// consumers of Kubernetes compatible REST APIs as defined in docs/devel/api-conventions.md.
+//
+// The Kubernetes API provides versioned resources and object kinds which are scoped
+// to API groups. In other words, kinds and resources should not be assumed to be
+// unique across groups.
+type RESTMapperWithContext interface {
+	// KindFor takes a partial resource and returns the single match.  Returns an error if there are multiple matches
+	KindForWithContext(ctx context.Context, resource schema.GroupVersionResource) (schema.GroupVersionKind, error)
+
+	// KindsFor takes a partial resource and returns the list of potential kinds in priority order
+	KindsForWithContext(ctx context.Context, resource schema.GroupVersionResource) ([]schema.GroupVersionKind, error)
+
+	// ResourceFor takes a partial resource and returns the single match.  Returns an error if there are multiple matches
+	ResourceForWithContext(ctx context.Context, input schema.GroupVersionResource) (schema.GroupVersionResource, error)
+
+	// ResourcesFor takes a partial resource and returns the list of potential resource in priority order
+	ResourcesForWithContext(ctx context.Context, input schema.GroupVersionResource) ([]schema.GroupVersionResource, error)
+
+	// RESTMapping identifies a preferred resource mapping for the provided group kind.
+	RESTMappingWithContext(ctx context.Context, gk schema.GroupKind, versions ...string) (*RESTMapping, error)
+	// RESTMappings returns all resource mappings for the provided group kind if no
+	// version search is provided. Otherwise identifies a preferred resource mapping for
+	// the provided version(s).
+	RESTMappingsWithContext(ctx context.Context, gk schema.GroupKind, versions ...string) ([]*RESTMapping, error)
+
+	ResourceSingularizerWithContext(ctx context.Context, resource string) (singular string, err error)
+}
+
+func ToRESTMapperWithContext(m RESTMapper) RESTMapperWithContext {
+	if m == nil {
+		return nil
+	}
+	if m, ok := m.(RESTMapperWithContext); ok {
+		return m
+	}
+	return &restMapperWrapper{
+		delegate: m,
+	}
+}
+
+type restMapperWrapper struct {
+	delegate RESTMapper
+}
+
+func (m *restMapperWrapper) KindForWithContext(ctx context.Context, resource schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	return m.delegate.KindFor(resource)
+}
+func (m *restMapperWrapper) KindsForWithContext(ctx context.Context, resource schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	return m.delegate.KindsFor(resource)
+}
+func (m *restMapperWrapper) ResourceForWithContext(ctx context.Context, input schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	return m.delegate.ResourceFor(input)
+}
+func (m *restMapperWrapper) ResourcesForWithContext(ctx context.Context, input schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	return m.delegate.ResourcesFor(input)
+}
+func (m *restMapperWrapper) RESTMappingWithContext(ctx context.Context, gk schema.GroupKind, versions ...string) (*RESTMapping, error) {
+	return m.delegate.RESTMapping(gk, versions...)
+}
+func (m *restMapperWrapper) RESTMappingsWithContext(ctx context.Context, gk schema.GroupKind, versions ...string) ([]*RESTMapping, error) {
+	return m.delegate.RESTMappings(gk, versions...)
+}
+func (m *restMapperWrapper) ResourceSingularizerWithContext(ctx context.Context, resource string) (singular string, err error) {
+	return m.delegate.ResourceSingularizer(resource)
+}
+
+// ResettableRESTMapper is a RESTMapper which is capable of resetting itself
+// from discovery.
+// All rest mappers that delegate to other rest mappers must implement this interface and dynamically
+// check if the delegate mapper supports the Reset() operation.
+//
+// ResettableRESTMapperWithContext is a better alternative because it supports contextual logging and cancellation.
+//
+// Contextual logging: Use ResettableRESTMapperWithContext instead.
+type ResettableRESTMapper interface {
+	RESTMapper
+	Reset()
+}
+
+// ResettableRESTMapperWithContext is a RESTMapper which is capable of resetting itself
+// from discovery.
+// All rest mappers that delegate to other rest mappers must implement this interface and dynamically
+// check if the delegate mapper supports the ResetWithContext() operation.
+type ResettableRESTMapperWithContext interface {
+	RESTMapperWithContext
+	ResetWithContext(ctx context.Context)
+}
+
+func ToResettableRESTMapperWithContext(m ResettableRESTMapper) ResettableRESTMapperWithContext {
+	if m == nil {
+		return nil
+	}
+	if m, ok := m.(ResettableRESTMapperWithContext); ok {
+		return m
+	}
+	return &resettableRESTMapperWrapper{
+		RESTMapperWithContext: ToRESTMapperWithContext(m),
+		delegate:              m,
+	}
+}
+
+type resettableRESTMapperWrapper struct {
+	RESTMapperWithContext
+	delegate ResettableRESTMapper
+}
+
+func (m *resettableRESTMapperWrapper) ResetWithContext(ctx context.Context) {
+	m.delegate.Reset()
 }

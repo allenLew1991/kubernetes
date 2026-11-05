@@ -1,4 +1,4 @@
-// +build cgo,linux
+//go:build linux
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -20,38 +20,43 @@ package cadvisor
 
 import (
 	"fmt"
+	"strings"
 
-	cadvisorfs "github.com/google/cadvisor/fs"
-	"k8s.io/kubernetes/pkg/kubelet/types"
+	cadvisorfs "github.com/google/cadvisor/lib/fs"
 )
 
 // imageFsInfoProvider knows how to translate the configured runtime
 // to its file system label for images.
 type imageFsInfoProvider struct {
-	runtime         string
 	runtimeEndpoint string
 }
 
 // ImageFsInfoLabel returns the image fs label for the configured runtime.
 // For remote runtimes, it handles additional runtimes natively understood by cAdvisor.
 func (i *imageFsInfoProvider) ImageFsInfoLabel() (string, error) {
-	switch i.runtime {
-	case types.DockerContainerRuntime:
-		return cadvisorfs.LabelDockerImages, nil
-	case types.RktContainerRuntime:
-		return cadvisorfs.LabelRktImages, nil
-	case types.RemoteContainerRuntime:
-		// This is a temporary workaround to get stats for cri-o from cadvisor
-		// and should be removed.
-		// Related to https://github.com/kubernetes/kubernetes/issues/51798
-		if i.runtimeEndpoint == CrioSocket {
-			return cadvisorfs.LabelCrioImages, nil
-		}
+	if detectCrioWorkaround(i) {
+		return cadvisorfs.LabelCrioImages, nil
 	}
 	return "", fmt.Errorf("no imagefs label for configured runtime")
 }
 
+// ContainerFsInfoLabel returns the container fs label for the configured runtime.
+// For remote runtimes, it handles addition runtimes natively understood by cAdvisor.
+func (i *imageFsInfoProvider) ContainerFsInfoLabel() (string, error) {
+	if detectCrioWorkaround(i) {
+		return cadvisorfs.LabelCrioContainers, nil
+	}
+	return "", fmt.Errorf("no containerfs label for configured runtime")
+}
+
+// This is a temporary workaround to get stats for cri-o from cadvisor
+// and should be removed.
+// Related to https://github.com/kubernetes/kubernetes/issues/51798
+func detectCrioWorkaround(i *imageFsInfoProvider) bool {
+	return strings.HasSuffix(i.runtimeEndpoint, CrioSocketSuffix)
+}
+
 // NewImageFsInfoProvider returns a provider for the specified runtime configuration.
-func NewImageFsInfoProvider(runtime, runtimeEndpoint string) ImageFsInfoProvider {
-	return &imageFsInfoProvider{runtime: runtime, runtimeEndpoint: runtimeEndpoint}
+func NewImageFsInfoProvider(runtimeEndpoint string) ImageFsInfoProvider {
+	return &imageFsInfoProvider{runtimeEndpoint: runtimeEndpoint}
 }

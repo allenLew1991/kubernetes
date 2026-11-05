@@ -17,9 +17,10 @@ limitations under the License.
 package rolebinding
 
 import (
+	"context"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -29,13 +30,13 @@ import (
 
 // strategy implements behavior for RoleBindings
 type strategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // strategy is the default logic that applies when creating and updating
 // RoleBinding objects.
-var Strategy = strategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = strategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // Strategy should implement rest.RESTCreateStrategy
 var _ rest.RESTCreateStrategy = Strategy
@@ -49,18 +50,18 @@ func (strategy) NamespaceScoped() bool {
 }
 
 // AllowCreateOnUpdate is true for RoleBindings.
-func (strategy) AllowCreateOnUpdate() bool {
+func (strategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return true
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users
 // on creation.
-func (strategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	_ = obj.(*rbac.RoleBinding)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (strategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (strategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newRoleBinding := obj.(*rbac.RoleBinding)
 	oldRoleBinding := old.(*rbac.RoleBinding)
 
@@ -68,10 +69,13 @@ func (strategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime
 }
 
 // Validate validates a new RoleBinding. Validation must check for a correct signature.
-func (strategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	roleBinding := obj.(*rbac.RoleBinding)
 	return validation.ValidateRoleBinding(roleBinding)
 }
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (strategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
 
 // Canonicalize normalizes the object after validation.
 func (strategy) Canonicalize(obj runtime.Object) {
@@ -79,10 +83,25 @@ func (strategy) Canonicalize(obj runtime.Object) {
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (strategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	newObj := obj.(*rbac.RoleBinding)
-	errorList := validation.ValidateRoleBinding(newObj)
-	return append(errorList, validation.ValidateRoleBindingUpdate(newObj, old.(*rbac.RoleBinding))...)
+func (strategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+
+	newRoleBinding := obj.(*rbac.RoleBinding)
+	oldRoleBinding := old.(*rbac.RoleBinding)
+
+	return validation.ValidateRoleBindingUpdate(newRoleBinding, oldRoleBinding)
+}
+
+func (strategy) DeclarativeValidationConfig(ctx context.Context, obj, oldObj runtime.Object) rest.DeclarativeValidationConfig {
+	// Match declarative validation short-circuit errors with handwritten child field errors.
+	// This is required because RoleBinding.RoleRef is immutable.
+	return rest.DeclarativeValidationConfig{
+		ShortCircuitMismatch: true,
+	}
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (strategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 // If AllowUnconditionalUpdate() is true and the object specified by
@@ -90,6 +109,6 @@ func (strategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.O
 // populates it with the latest version. Else, it checks that the
 // version specified by the user matches the version of latest etcd
 // object.
-func (strategy) AllowUnconditionalUpdate() bool {
+func (strategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }

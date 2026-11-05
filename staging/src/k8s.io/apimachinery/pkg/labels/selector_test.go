@@ -17,12 +17,20 @@ limitations under the License.
 package labels
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+var (
+	ignoreDetail = cmpopts.IgnoreFields(field.Error{}, "Detail")
 )
 
 func TestSelectorParse(t *testing.T) {
@@ -140,6 +148,7 @@ func expectMatchDirect(t *testing.T, selector, ls Set) {
 	}
 }
 
+//nolint:staticcheck,unused //iccheck // U1000 currently commented out in TODO of TestSetMatches
 func expectNoMatchDirect(t *testing.T, selector, ls Set) {
 	if SelectorFromSet(selector).Matches(ls) {
 		t.Errorf("Wanted '%s' to not match '%s', but it did.", selector, ls)
@@ -215,14 +224,6 @@ func TestLexer(t *testing.T) {
 	}
 }
 
-func min(l, r int) (m int) {
-	m = r
-	if l < r {
-		m = l
-	}
-	return m
-}
-
 func TestLexerSequence(t *testing.T) {
 	testcases := []struct {
 		s string
@@ -240,16 +241,14 @@ func TestLexerSequence(t *testing.T) {
 		{"key<1", []Token{IdentifierToken, LessThanToken, IdentifierToken}},
 	}
 	for _, v := range testcases {
-		var literals []string
 		var tokens []Token
 		l := &Lexer{s: v.s, pos: 0}
 		for {
-			token, lit := l.Lex()
+			token, _ := l.Lex()
 			if token == EndOfStringToken {
 				break
 			}
 			tokens = append(tokens, token)
-			literals = append(literals, lit)
 		}
 		if len(tokens) != len(v.t) {
 			t.Errorf("Bad number of tokens for '%s %d, %d", v.s, len(tokens), len(v.t))
@@ -298,32 +297,211 @@ func TestParserLookahead(t *testing.T) {
 	}
 }
 
+func TestParseOperator(t *testing.T) {
+	testcases := []struct {
+		token         string
+		expectedError error
+	}{
+		{"in", nil},
+		{"=", nil},
+		{"==", nil},
+		{">", nil},
+		{"<", nil},
+		{"notin", nil},
+		{"!=", nil},
+		{"!", fmt.Errorf("found '%s', expected: %v", selection.DoesNotExist, strings.Join(binaryOperators, ", "))},
+		{"exists", fmt.Errorf("found '%s', expected: %v", selection.Exists, strings.Join(binaryOperators, ", "))},
+		{"(", fmt.Errorf("found '%s', expected: %v", "(", strings.Join(binaryOperators, ", "))},
+	}
+	for _, testcase := range testcases {
+		p := &Parser{l: &Lexer{s: testcase.token, pos: 0}, position: 0}
+		p.scan()
+
+		_, err := p.parseOperator()
+		if ok := reflect.DeepEqual(testcase.expectedError, err); !ok {
+			t.Errorf("\nexpect err [%v], \nactual err [%v]", testcase.expectedError, err)
+		}
+	}
+}
+
 func TestRequirementConstructor(t *testing.T) {
 	requirementConstructorTests := []struct {
 		Key     string
 		Op      selection.Operator
 		Vals    sets.String
-		Success bool
+		WantErr field.ErrorList
 	}{
-		{"x", selection.In, nil, false},
-		{"x", selection.NotIn, sets.NewString(), false},
-		{"x", selection.In, sets.NewString("foo"), true},
-		{"x", selection.NotIn, sets.NewString("foo"), true},
-		{"x", selection.Exists, nil, true},
-		{"x", selection.DoesNotExist, nil, true},
-		{"1foo", selection.In, sets.NewString("bar"), true},
-		{"1234", selection.In, sets.NewString("bar"), true},
-		{"y", selection.GreaterThan, sets.NewString("1"), true},
-		{"z", selection.LessThan, sets.NewString("6"), true},
-		{"foo", selection.GreaterThan, sets.NewString("bar"), false},
-		{"barz", selection.LessThan, sets.NewString("blah"), false},
-		{strings.Repeat("a", 254), selection.Exists, nil, false}, //breaks DNS rule that len(key) <= 253
+		{
+			Key: "x1",
+			Op:  selection.In,
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values",
+					BadValue: []string{},
+				},
+			},
+		},
+		{
+			Key:  "x2",
+			Op:   selection.NotIn,
+			Vals: sets.NewString(),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values",
+					BadValue: []string{},
+				},
+			},
+		},
+		{
+			Key:  "x3",
+			Op:   selection.In,
+			Vals: sets.NewString("foo"),
+		},
+		{
+			Key:  "x4",
+			Op:   selection.NotIn,
+			Vals: sets.NewString("foo"),
+		},
+		{
+			Key:  "x5",
+			Op:   selection.Equals,
+			Vals: sets.NewString("foo", "bar"),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values",
+					BadValue: []string{"bar", "foo"},
+				},
+			},
+		},
+		{
+			Key: "x6",
+			Op:  selection.Exists,
+		},
+		{
+			Key: "x7",
+			Op:  selection.DoesNotExist,
+		},
+		{
+			Key:  "x8",
+			Op:   selection.Exists,
+			Vals: sets.NewString("foo"),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values",
+					BadValue: []string{"foo"},
+				},
+			},
+		},
+		{
+			Key:  "x9",
+			Op:   selection.In,
+			Vals: sets.NewString("bar"),
+		},
+		{
+			Key:  "x10",
+			Op:   selection.In,
+			Vals: sets.NewString("bar"),
+		},
+		{
+			Key:  "x11",
+			Op:   selection.GreaterThan,
+			Vals: sets.NewString("1"),
+		},
+		{
+			Key:  "x12",
+			Op:   selection.LessThan,
+			Vals: sets.NewString("6"),
+		},
+		{
+			Key: "x13",
+			Op:  selection.GreaterThan,
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values",
+					BadValue: []string{},
+				},
+			},
+		},
+		{
+			Key:  "x14",
+			Op:   selection.GreaterThan,
+			Vals: sets.NewString("bar"),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values[0]",
+					BadValue: "bar",
+				},
+			},
+		},
+		{
+			Key:  "x15",
+			Op:   selection.LessThan,
+			Vals: sets.NewString("bar"),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values[0]",
+					BadValue: "bar",
+				},
+			},
+		},
+		{
+			Key: strings.Repeat("a", 254), //breaks DNS rule that len(key) <= 253
+			Op:  selection.Exists,
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "key",
+					BadValue: strings.Repeat("a", 254),
+				},
+			},
+		},
+		{
+			Key:  "x16",
+			Op:   selection.Equals,
+			Vals: sets.NewString(strings.Repeat("a", 254)),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values[0][x16]",
+					BadValue: strings.Repeat("a", 254),
+				},
+			},
+		},
+		{
+			Key:  "x17",
+			Op:   selection.Equals,
+			Vals: sets.NewString("a b"),
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values[0][x17]",
+					BadValue: "a b",
+				},
+			},
+		},
+		{
+			Key: "x18",
+			Op:  "unsupportedOp",
+			WantErr: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeNotSupported,
+					Field:    "operator",
+					BadValue: selection.Operator("unsupportedOp"),
+				},
+			},
+		},
 	}
 	for _, rc := range requirementConstructorTests {
-		if _, err := NewRequirement(rc.Key, rc.Op, rc.Vals.List()); err == nil && !rc.Success {
-			t.Errorf("expected error with key:%#v op:%v vals:%v, got no error", rc.Key, rc.Op, rc.Vals)
-		} else if err != nil && rc.Success {
-			t.Errorf("expected no error with key:%#v op:%v vals:%v, got:%v", rc.Key, rc.Op, rc.Vals, err)
+		_, err := NewRequirement(rc.Key, rc.Op, rc.Vals.List())
+		if diff := cmp.Diff(rc.WantErr.ToAggregate(), err, ignoreDetail); diff != "" {
+			t.Errorf("NewRequirement test %v returned unexpected error (-want,+got):\n%s", rc.Key, diff)
 		}
 	}
 }
@@ -458,8 +636,23 @@ func TestSetSelectorParser(t *testing.T) {
 		{"x in (abc,)", internalSelector{
 			getRequirement("x", selection.In, sets.NewString("abc", ""), t),
 		}, true, true},
+		{"x in (abc,abc)", internalSelector{
+			getRequirement("x", selection.In, sets.NewString("abc"), t),
+		}, true, true},
 		{"x in ()", internalSelector{
 			getRequirement("x", selection.In, sets.NewString(""), t),
+		}, true, true},
+		{"x in (a,,)", internalSelector{
+			getRequirement("x", selection.In, sets.NewString("a", ""), t),
+		}, true, true},
+		{"x in (a,,,)", internalSelector{
+			getRequirement("x", selection.In, sets.NewString("a", ""), t),
+		}, true, true},
+		{"x in (a,,,,,,)", internalSelector{
+			getRequirement("x", selection.In, sets.NewString("a", ""), t),
+		}, true, true},
+		{"x in (a,,a,,a,,a,,)", internalSelector{
+			getRequirement("x", selection.In, sets.NewString("a", ""), t),
 		}, true, true},
 		{"x notin (abc,,def),bar,z in (),w", internalSelector{
 			getRequirement("bar", selection.Exists, nil, t),
@@ -571,5 +764,464 @@ func TestAdd(t *testing.T) {
 		if !reflect.DeepEqual(ts.sel, ts.refSelector) {
 			t.Errorf("%s - Expected %v found %v", ts.name, ts.refSelector, ts.sel)
 		}
+	}
+}
+
+func TestSafeSort(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     []string
+		inCopy []string
+		want   []string
+	}{
+		{
+			name:   "nil strings",
+			in:     nil,
+			inCopy: nil,
+			want:   nil,
+		},
+		{
+			name:   "ordered strings",
+			in:     []string{"bar", "foo"},
+			inCopy: []string{"bar", "foo"},
+			want:   []string{"bar", "foo"},
+		},
+		{
+			name:   "unordered strings",
+			in:     []string{"foo", "bar"},
+			inCopy: []string{"foo", "bar"},
+			want:   []string{"bar", "foo"},
+		},
+		{
+			name:   "duplicated strings",
+			in:     []string{"foo", "bar", "foo", "bar"},
+			inCopy: []string{"foo", "bar", "foo", "bar"},
+			want:   []string{"bar", "bar", "foo", "foo"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := safeSort(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("safeSort() = %v, want %v", got, tt.want)
+			}
+			if !reflect.DeepEqual(tt.in, tt.inCopy) {
+				t.Errorf("after safeSort(), input = %v, want %v", tt.in, tt.inCopy)
+			}
+		})
+	}
+}
+
+func BenchmarkSelectorFromValidatedSet(b *testing.B) {
+	set := map[string]string{
+		"foo": "foo",
+		"bar": "bar",
+	}
+	matchee := Set(map[string]string{
+		"foo":   "foo",
+		"bar":   "bar",
+		"extra": "label",
+	})
+
+	for i := 0; i < b.N; i++ {
+		s := SelectorFromValidatedSet(set)
+		if s.Empty() {
+			b.Errorf("Unexpected selector")
+		}
+		if !s.Matches(matchee) {
+			b.Errorf("Unexpected match")
+		}
+	}
+}
+
+func BenchmarkSetSelector(b *testing.B) {
+	set := map[string]string{
+		"foo": "foo",
+		"bar": "bar",
+	}
+	matchee := Set(map[string]string{
+		"foo":   "foo",
+		"bar":   "bar",
+		"extra": "label",
+	})
+
+	for i := 0; i < b.N; i++ {
+		s := ValidatedSetSelector(set)
+		if s.Empty() {
+			b.Errorf("Unexpected selector")
+		}
+		if !s.Matches(matchee) {
+			b.Errorf("Unexpected match")
+		}
+	}
+}
+
+func TestSetSelectorString(t *testing.T) {
+	cases := []struct {
+		set Set
+		out string
+	}{
+		{
+			Set{},
+			"",
+		},
+		{
+			Set{"app": "foo"},
+			"app=foo",
+		},
+		{
+			Set{"app": "foo", "a": "b"},
+			"a=b,app=foo",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.out, func(t *testing.T) {
+			if got := ValidatedSetSelector(tt.set).String(); tt.out != got {
+				t.Fatalf("expected %v, got %v", tt.out, got)
+			}
+		})
+	}
+}
+
+func TestRequiresExactMatch(t *testing.T) {
+	testCases := []struct {
+		name          string
+		sel           Selector
+		label         string
+		expectedFound bool
+		expectedValue string
+	}{
+		{
+			name:          "keyInOperatorExactMatch",
+			sel:           internalSelector{Requirement{"key", selection.In, []string{"value"}}},
+			label:         "key",
+			expectedFound: true,
+			expectedValue: "value",
+		},
+		{
+			name:          "keyInOperatorNotExactMatch",
+			sel:           internalSelector{Requirement{"key", selection.In, []string{"value", "value2"}}},
+			label:         "key",
+			expectedFound: false,
+			expectedValue: "",
+		},
+		{
+			name: "keyInOperatorNotExactMatch",
+			sel: internalSelector{
+				Requirement{"key", selection.In, []string{"value", "value1"}},
+				Requirement{"key2", selection.In, []string{"value2"}},
+			},
+			label:         "key2",
+			expectedFound: true,
+			expectedValue: "value2",
+		},
+		{
+			name:          "keyEqualOperatorExactMatch",
+			sel:           internalSelector{Requirement{"key", selection.Equals, []string{"value"}}},
+			label:         "key",
+			expectedFound: true,
+			expectedValue: "value",
+		},
+		{
+			name:          "keyDoubleEqualOperatorExactMatch",
+			sel:           internalSelector{Requirement{"key", selection.DoubleEquals, []string{"value"}}},
+			label:         "key",
+			expectedFound: true,
+			expectedValue: "value",
+		},
+		{
+			name:          "keyNotEqualOperatorExactMatch",
+			sel:           internalSelector{Requirement{"key", selection.NotEquals, []string{"value"}}},
+			label:         "key",
+			expectedFound: false,
+			expectedValue: "",
+		},
+		{
+			name: "keyEqualOperatorExactMatchFirst",
+			sel: internalSelector{
+				Requirement{"key", selection.In, []string{"value"}},
+				Requirement{"key2", selection.In, []string{"value2"}},
+			},
+			label:         "key",
+			expectedFound: true,
+			expectedValue: "value",
+		},
+	}
+	for _, ts := range testCases {
+		t.Run(ts.name, func(t *testing.T) {
+			value, found := ts.sel.RequiresExactMatch(ts.label)
+			if found != ts.expectedFound {
+				t.Errorf("Expected match %v, found %v", ts.expectedFound, found)
+			}
+			if found && value != ts.expectedValue {
+				t.Errorf("Expected value %v, found %v", ts.expectedValue, value)
+			}
+
+		})
+	}
+}
+
+func TestValidatedSelectorFromSet(t *testing.T) {
+	tests := []struct {
+		name             string
+		input            Set
+		expectedSelector internalSelector
+		expectedError    field.ErrorList
+	}{
+		{
+			name:  "Simple Set, no error",
+			input: Set{"key": "val"},
+			expectedSelector: internalSelector{
+				Requirement{
+					key:       "key",
+					operator:  selection.Equals,
+					strValues: []string{"val"},
+				},
+			},
+		},
+		{
+			name:  "Invalid Set, value too long",
+			input: Set{"Key": "axahm2EJ8Phiephe2eixohbee9eGeiyees1thuozi1xoh0GiuH3diewi8iem7Nui"},
+			expectedError: field.ErrorList{
+				&field.Error{
+					Type:     field.ErrorTypeInvalid,
+					Field:    "values[0][Key]",
+					BadValue: "axahm2EJ8Phiephe2eixohbee9eGeiyees1thuozi1xoh0GiuH3diewi8iem7Nui",
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		selector, err := ValidatedSelectorFromSet(tc.input)
+		if diff := cmp.Diff(tc.expectedError.ToAggregate(), err, ignoreDetail); diff != "" {
+			t.Errorf("ValidatedSelectorFromSet %#v returned unexpected error (-want,+got):\n%s", tc.name, diff)
+		}
+		if err == nil {
+			if diff := cmp.Diff(tc.expectedSelector, selector); diff != "" {
+				t.Errorf("ValidatedSelectorFromSet %#v returned unexpected selector (-want,+got):\n%s", tc.name, diff)
+			}
+		}
+	}
+}
+
+func BenchmarkRequirementString(b *testing.B) {
+	r := Requirement{
+		key:      "environment",
+		operator: selection.NotIn,
+		strValues: []string{
+			"dev",
+		},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if r.String() != "environment notin (dev)" {
+			b.Errorf("Unexpected Requirement string")
+		}
+	}
+}
+
+func BenchmarkRequirementMatches(b *testing.B) {
+	r := Requirement{
+		key:      "environment",
+		operator: selection.NotIn,
+		strValues: []string{
+			"dev",
+		},
+	}
+	labels := Set(map[string]string{
+		"key":         "value",
+		"environment": "dev",
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.Matches(labels)
+	}
+}
+
+func TestRequirementEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		x, y *Requirement
+		want bool
+	}{
+		{
+			name: "same requirements should be equal",
+			x: &Requirement{
+				key:       "key",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			y: &Requirement{
+				key:       "key",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			want: true,
+		},
+		{
+			name: "requirements with different keys should not be equal",
+			x: &Requirement{
+				key:       "key1",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			y: &Requirement{
+				key:       "key2",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			want: false,
+		},
+		{
+			name: "requirements with different operators should not be equal",
+			x: &Requirement{
+				key:       "key",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			y: &Requirement{
+				key:       "key",
+				operator:  selection.In,
+				strValues: []string{"foo", "bar"},
+			},
+			want: false,
+		},
+		{
+			name: "requirements with different values should not be equal",
+			x: &Requirement{
+				key:       "key",
+				operator:  selection.Equals,
+				strValues: []string{"foo", "bar"},
+			},
+			y: &Requirement{
+				key:       "key",
+				operator:  selection.Equals,
+				strValues: []string{"foobar"},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cmp.Equal(tt.x, tt.y); got != tt.want {
+				t.Errorf("cmp.Equal() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesNothing(t *testing.T) {
+	tests := []struct {
+		name          string
+		selector      string
+		set           map[string]string
+		labelSelector Selector
+		want          bool
+	}{
+		{
+			name:          "MatchNothing should match Nothing()",
+			labelSelector: Nothing(),
+			want:          true,
+		},
+		{
+			name:          "MatchNothing should match sharedNothingSelector",
+			labelSelector: sharedNothingSelector,
+			want:          true,
+		},
+		{
+			name:          "MatchNothing should not match Everything()",
+			labelSelector: Everything(),
+			want:          false,
+		},
+		{
+			name:          "MatchNothing should not match sharedEverythingSelector",
+			labelSelector: sharedEverythingSelector,
+			want:          false,
+		},
+		{
+			name: "MatchNothing should not match empty set",
+			set:  map[string]string{},
+			want: false,
+		},
+		{
+			name: "MatchNothing should not match non-empty set",
+			set:  map[string]string{"key": "value"},
+			want: false,
+		},
+		{
+			name:     "MatchNothing should not match empty selector",
+			selector: "",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - exists",
+			selector: "a",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - not exists",
+			selector: "!a",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - equals",
+			selector: "a=b",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - not equals",
+			selector: "a!=b",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - in",
+			selector: "a in (b)",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - notin",
+			selector: "a notin (b)",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - conflict exists and not exists",
+			selector: "a,!a",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - conflict equals and not equals",
+			selector: "a=b,a!=b",
+			want:     false,
+		},
+		{
+			name:     "MatchNothing should not match non-empty selector - conflict in and notin",
+			selector: "a in (b),a notin (b)",
+			want:     false,
+		},
+	}
+
+	for i := 0; i < len(tests); i++ {
+		if tests[i].labelSelector != nil {
+			expectMatchNothing(t, tests[i].labelSelector, tests[i].want)
+		} else if tests[i].set != nil {
+			expectMatchNothing(t, SelectorFromSet(tests[i].set), tests[i].want)
+		} else {
+			selector, err := Parse(tests[i].selector)
+			if err != nil {
+				t.Errorf("Unable to parse %v as a selector.\n", selector)
+			}
+			expectMatchNothing(t, selector, tests[i].want)
+		}
+	}
+}
+
+func expectMatchNothing(t *testing.T, selector Selector, want bool) {
+	if MatchesNothing(selector) != want {
+		t.Errorf("Wanted %s to MatchNothing '%t', but it did not.\n", selector, want)
 	}
 }

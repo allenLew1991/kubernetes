@@ -17,38 +17,40 @@ limitations under the License.
 package bootstrappolicy_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
-	"github.com/ghodss/yaml"
+	"github.com/google/go-cmp/cmp"
+	"sigs.k8s.io/yaml"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/component-helpers/auth/rbac/validation"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
-	"k8s.io/kubernetes/pkg/apis/rbac"
 	_ "k8s.io/kubernetes/pkg/apis/rbac/install"
-	rbacregistryvalidation "k8s.io/kubernetes/pkg/registry/rbac/validation"
+	rbacv1helpers "k8s.io/kubernetes/pkg/apis/rbac/v1"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac/bootstrappolicy"
 )
 
 // semanticRoles is a few enumerated roles for which the relationships are well established
 // and we want to maintain symmetric roles
 type semanticRoles struct {
-	admin *rbac.ClusterRole
-	edit  *rbac.ClusterRole
-	view  *rbac.ClusterRole
+	admin *rbacv1.ClusterRole
+	edit  *rbacv1.ClusterRole
+	view  *rbacv1.ClusterRole
 }
 
-func getSemanticRoles(roles []rbac.ClusterRole) semanticRoles {
+func getSemanticRoles(roles []rbacv1.ClusterRole) semanticRoles {
 	ret := semanticRoles{}
 	for i := range roles {
 		role := roles[i]
@@ -64,64 +66,21 @@ func getSemanticRoles(roles []rbac.ClusterRole) semanticRoles {
 	return ret
 }
 
-// Some roles should always cover others
-func TestCovers(t *testing.T) {
-	semanticRoles := getSemanticRoles(bootstrappolicy.ClusterRoles())
-
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.admin.Rules, semanticRoles.edit.Rules); !covers {
-		t.Errorf("failed to cover: %#v", miss)
-	}
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.admin.Rules, semanticRoles.view.Rules); !covers {
-		t.Errorf("failed to cover: %#v", miss)
-	}
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.edit.Rules, semanticRoles.view.Rules); !covers {
-		t.Errorf("failed to cover: %#v", miss)
-	}
-}
-
-// additionalAdminPowers is the list of powers that we expect to be different than the editor role.
-// one resource per rule to make the "does not already contain" check easy
-var additionalAdminPowers = []rbac.PolicyRule{
-	rbac.NewRule("create").Groups("authorization.k8s.io").Resources("localsubjectaccessreviews").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.ReadWrite...).Groups("rbac.authorization.k8s.io").Resources("rolebindings").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.ReadWrite...).Groups("rbac.authorization.k8s.io").Resources("roles").RuleOrDie(),
-}
-
-func TestAdminEditRelationship(t *testing.T) {
-	semanticRoles := getSemanticRoles(bootstrappolicy.ClusterRoles())
-
-	// confirm that the edit role doesn't already have extra powers
-	for _, rule := range additionalAdminPowers {
-		if covers, _ := rbacregistryvalidation.Covers(semanticRoles.edit.Rules, []rbac.PolicyRule{rule}); covers {
-			t.Errorf("edit has extra powers: %#v", rule)
-		}
-	}
-	semanticRoles.edit.Rules = append(semanticRoles.edit.Rules, additionalAdminPowers...)
-
-	// at this point, we should have a two way covers relationship
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.admin.Rules, semanticRoles.edit.Rules); !covers {
-		t.Errorf("admin has lost rules for: %#v", miss)
-	}
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.edit.Rules, semanticRoles.admin.Rules); !covers {
-		t.Errorf("edit is missing rules for: %#v\nIf these should only be admin powers, add them to the list.  Otherwise, add them to the edit role.", miss)
-	}
-}
-
 // viewEscalatingNamespaceResources is the list of rules that would allow privilege escalation attacks based on
 // ability to view (GET) them
-var viewEscalatingNamespaceResources = []rbac.PolicyRule{
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/attach").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/proxy").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/exec").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/portforward").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("secrets").RuleOrDie(),
-	rbac.NewRule(bootstrappolicy.Read...).Groups("").Resources("services/proxy").RuleOrDie(),
+var viewEscalatingNamespaceResources = []rbacv1.PolicyRule{
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/attach").RuleOrDie(),
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/proxy").RuleOrDie(),
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/exec").RuleOrDie(),
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("pods/portforward").RuleOrDie(),
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("secrets").RuleOrDie(),
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("").Resources("services/proxy").RuleOrDie(),
 }
 
 // ungettableResources is the list of rules that don't allow to view (GET) them
 // this is purposefully separate list to distinguish from escalating privs
-var ungettableResources = []rbac.PolicyRule{
-	rbac.NewRule(bootstrappolicy.Read...).Groups("apps", "extensions").Resources("deployments/rollback").RuleOrDie(),
+var ungettableResources = []rbacv1.PolicyRule{
+	rbacv1helpers.NewRule(bootstrappolicy.Read...).Groups("apps", "extensions").Resources("deployments/rollback").RuleOrDie(),
 }
 
 func TestEditViewRelationship(t *testing.T) {
@@ -143,7 +102,7 @@ func TestEditViewRelationship(t *testing.T) {
 
 	// confirm that the view role doesn't already have extra powers
 	for _, rule := range viewEscalatingNamespaceResources {
-		if covers, _ := rbacregistryvalidation.Covers(semanticRoles.view.Rules, []rbac.PolicyRule{rule}); covers {
+		if covers, _ := validation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
 			t.Errorf("view has extra powers: %#v", rule)
 		}
 	}
@@ -151,19 +110,11 @@ func TestEditViewRelationship(t *testing.T) {
 
 	// confirm that the view role doesn't have ungettable resources
 	for _, rule := range ungettableResources {
-		if covers, _ := rbacregistryvalidation.Covers(semanticRoles.view.Rules, []rbac.PolicyRule{rule}); covers {
+		if covers, _ := validation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
 			t.Errorf("view has ungettable resource: %#v", rule)
 		}
 	}
 	semanticRoles.view.Rules = append(semanticRoles.view.Rules, ungettableResources...)
-
-	// at this point, we should have a two way covers relationship
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.edit.Rules, semanticRoles.view.Rules); !covers {
-		t.Errorf("edit has lost rules for: %#v", miss)
-	}
-	if covers, miss := rbacregistryvalidation.Covers(semanticRoles.view.Rules, semanticRoles.edit.Rules); !covers {
-		t.Errorf("view is missing rules for: %#v\nIf these are escalating powers, add them to the list.  Otherwise, add them to the view role.", miss)
-	}
 }
 
 func TestBootstrapNamespaceRoles(t *testing.T) {
@@ -226,6 +177,28 @@ func TestBootstrapClusterRoles(t *testing.T) {
 	testObjects(t, list, "cluster-roles.yaml")
 }
 
+func TestBootstrapClusterRolesWithFeatureGatesEnabled(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		"AllAlpha": true,
+		"AllBeta":  true,
+	})
+
+	bootstrapRoles := bootstrappolicy.ClusterRoles()
+	featureGateList := &api.List{}
+	featureGateNames := sets.NewString()
+	featureGateRoles := map[string]runtime.Object{}
+	for i := range bootstrapRoles {
+		role := bootstrapRoles[i]
+		featureGateNames.Insert(role.Name)
+		featureGateRoles[role.Name] = &role
+	}
+	for _, featureGateName := range featureGateNames.List() {
+		featureGateList.Items = append(featureGateList.Items, featureGateRoles[featureGateName])
+	}
+
+	testObjects(t, featureGateList, "cluster-roles-featuregates.yaml")
+}
+
 func TestBootstrapClusterRoleBindings(t *testing.T) {
 	list := &api.List{}
 	names := sets.NewString()
@@ -258,6 +231,28 @@ func TestBootstrapControllerRoles(t *testing.T) {
 	testObjects(t, list, "controller-roles.yaml")
 }
 
+func TestBootstrapControllerRolesWithFeatureGatesEnabled(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		"AllAlpha": true,
+		"AllBeta":  true,
+	})
+
+	roles := bootstrappolicy.ControllerRoles()
+	featureGateList := &api.List{}
+	featureGateNames := sets.NewString()
+	featureGateRoles := map[string]runtime.Object{}
+	for i := range roles {
+		role := roles[i]
+		featureGateNames.Insert(role.Name)
+		featureGateRoles[role.Name] = &role
+	}
+	for _, featureGateName := range featureGateNames.List() {
+		featureGateList.Items = append(featureGateList.Items, featureGateRoles[featureGateName])
+	}
+
+	testObjects(t, featureGateList, "controller-roles-featuregates.yaml")
+}
+
 func TestBootstrapControllerRoleBindings(t *testing.T) {
 	list := &api.List{}
 	names := sets.NewString()
@@ -276,7 +271,7 @@ func TestBootstrapControllerRoleBindings(t *testing.T) {
 
 func testObjects(t *testing.T, list *api.List, fixtureFilename string) {
 	filename := filepath.Join("testdata", fixtureFilename)
-	expectedYAML, err := ioutil.ReadFile(filename)
+	expectedYAML, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,14 +293,14 @@ func testObjects(t *testing.T, list *api.List, fixtureFilename string) {
 
 		const updateEnvVar = "UPDATE_BOOTSTRAP_POLICY_FIXTURE_DATA"
 		if os.Getenv(updateEnvVar) == "true" {
-			if err := ioutil.WriteFile(filename, []byte(yamlData), os.FileMode(0755)); err == nil {
+			if err := os.WriteFile(filename, []byte(yamlData), os.FileMode(0755)); err == nil {
 				t.Logf("Updated data in %s", filename)
 				t.Logf("Verify the diff, commit changes, and rerun the tests")
 			} else {
 				t.Logf("Could not update data in %s: %v", filename, err)
 			}
 		} else {
-			t.Logf("Diff between bootstrap data and fixture data in %s:\n-------------\n%s", filename, diff.StringDiff(string(yamlData), string(expectedYAML)))
+			t.Logf("Diff between bootstrap data and fixture data in %s:\n-------------\n%s", filename, cmp.Diff(string(yamlData), string(expectedYAML)))
 			t.Logf("If the change is expected, re-run with %s=true to update the fixtures", updateEnvVar)
 		}
 	}
@@ -334,6 +329,42 @@ func TestClusterRoleLabel(t *testing.T) {
 		}
 		if got, want := accessor.GetLabels(), map[string]string{"kubernetes.io/bootstrapping": "rbac-defaults"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("ClusterRoleBinding: %s GetLabels() = %s, want %s", accessor.GetName(), got, want)
+		}
+	}
+}
+
+func TestNodeRuleVerbsConsistency(t *testing.T) {
+	rules := bootstrappolicy.NodeRules()
+	for _, rule := range rules {
+		verbs := rule.Verbs
+		if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+			t.Errorf("The NodeRule has Verb `List` but does not have Verb `Watch`.")
+		}
+	}
+}
+
+func TestClusterRoleVerbsConsistency(t *testing.T) {
+	roles := bootstrappolicy.ClusterRoles()
+	for _, role := range roles {
+		for _, rule := range role.Rules {
+			verbs := rule.Verbs
+			if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+				t.Errorf("The ClusterRole %s has Verb `List` but does not have Verb `Watch`.", role.Name)
+			}
+		}
+	}
+}
+
+func TestNamespaceRoleVerbsConsistency(t *testing.T) {
+	namespaceRoles := bootstrappolicy.NamespaceRoles()
+	for namespace, roles := range namespaceRoles {
+		for _, role := range roles {
+			for _, rule := range role.Rules {
+				verbs := rule.Verbs
+				if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+					t.Errorf("The Role %s/%s has Verb `List` but does not have Verb `Watch`.", namespace, role.Name)
+				}
+			}
 		}
 	}
 }

@@ -16,8 +16,8 @@ limitations under the License.
 
 package events
 
+// Container event reason list
 const (
-	// Container event reason list
 	CreatedContainer        = "Created"
 	StartedContainer        = "Started"
 	FailedToCreateContainer = "Failed"
@@ -26,22 +26,34 @@ const (
 	PreemptContainer        = "Preempting"
 	BackOffStartContainer   = "BackOff"
 	ExceededGracePeriod     = "ExceededGracePeriod"
+)
 
-	// Pod event reason list
-	FailedToKillPod                = "FailedKillPod"
-	FailedToCreatePodContainer     = "FailedCreatePodContainer"
-	FailedToMakePodDataDirectories = "Failed"
-	NetworkNotReady                = "NetworkNotReady"
+// Pod event reason list
+const (
+	FailedToKillPod                 = "FailedKillPod"
+	FailedToCreatePodContainer      = "FailedCreatePodContainer"
+	FailedToMakePodDataDirectories  = "Failed"
+	NetworkNotReady                 = "NetworkNotReady"
+	ResizeDeferred                  = "ResizeDeferred"
+	ResizeInfeasible                = "ResizeInfeasible"
+	ResizeCompleted                 = "ResizeCompleted"
+	ResizeStarted                   = "ResizeStarted"
+	ResizeError                     = "ResizeError"
+	FailedNodeDeclaredFeaturesCheck = "FailedNodeDeclaredFeaturesCheck"
+)
 
-	// Image event reason list
+// Image event reason list
+const (
 	PullingImage            = "Pulling"
 	PulledImage             = "Pulled"
 	FailedToPullImage       = "Failed"
 	FailedToInspectImage    = "InspectFailed"
 	ErrImageNeverPullPolicy = "ErrImageNeverPull"
 	BackOffPullImage        = "BackOff"
+)
 
-	// kubelet event reason list
+// kubelet event reason list
+const (
 	NodeReady                            = "NodeReady"
 	NodeNotReady                         = "NodeNotReady"
 	NodeSchedulable                      = "NodeSchedulable"
@@ -49,50 +61,56 @@ const (
 	StartingKubelet                      = "Starting"
 	KubeletSetupFailed                   = "KubeletSetupFailed"
 	FailedAttachVolume                   = "FailedAttachVolume"
-	FailedDetachVolume                   = "FailedDetachVolume"
 	FailedMountVolume                    = "FailedMount"
 	VolumeResizeFailed                   = "VolumeResizeFailed"
+	VolumeResizeSuccess                  = "VolumeResizeSuccessful"
 	FileSystemResizeFailed               = "FileSystemResizeFailed"
+	VolumePermissionChangeInProgress     = "VolumePermissionChangeInProgress"
 	FileSystemResizeSuccess              = "FileSystemResizeSuccessful"
-	FailedUnMountVolume                  = "FailedUnMount"
 	FailedMapVolume                      = "FailedMapVolume"
-	FailedUnmapDevice                    = "FailedUnmapDevice"
 	WarnAlreadyMountedVolume             = "AlreadyMountedVolume"
-	SuccessfulDetachVolume               = "SuccessfulDetachVolume"
 	SuccessfulAttachVolume               = "SuccessfulAttachVolume"
 	SuccessfulMountVolume                = "SuccessfulMountVolume"
-	SuccessfulUnMountVolume              = "SuccessfulUnMountVolume"
-	HostPortConflict                     = "HostPortConflict"
-	NodeSelectorMismatching              = "NodeSelectorMismatching"
-	InsufficientFreeCPU                  = "InsufficientFreeCPU"
-	InsufficientFreeMemory               = "InsufficientFreeMemory"
-	HostNetworkNotSupported              = "HostNetworkNotSupported"
-	UndefinedShaper                      = "NilShaper"
 	NodeRebooted                         = "Rebooted"
+	NodeShutdown                         = "Shutdown"
 	ContainerGCFailed                    = "ContainerGCFailed"
 	ImageGCFailed                        = "ImageGCFailed"
 	FailedNodeAllocatableEnforcement     = "FailedNodeAllocatableEnforcement"
 	SuccessfulNodeAllocatableEnforcement = "NodeAllocatableEnforced"
-	UnsupportedMountOption               = "UnsupportedMountOption"
 	SandboxChanged                       = "SandboxChanged"
 	FailedCreatePodSandBox               = "FailedCreatePodSandBox"
 	FailedStatusPodSandBox               = "FailedPodSandBoxStatus"
+	FailedMountOnFilesystemMismatch      = "FailedMountOnFilesystemMismatch"
+	FailedPrepareDynamicResources        = "FailedPrepareDynamicResources"
+	PossibleMemoryBackedVolumesOnDisk    = "PossibleMemoryBackedVolumesOnDisk"
+	CgroupV1                             = "CgroupV1"
+)
 
-	// Image manager event reason list
+// Image manager event reason list
+const (
+	InvalidImageID      = "InvalidImageID"
 	InvalidDiskCapacity = "InvalidDiskCapacity"
 	FreeDiskSpaceFailed = "FreeDiskSpaceFailed"
+)
 
-	// Probe event reason list
-	ContainerUnhealthy = "Unhealthy"
+// Probe event reason list
+const (
+	ContainerUnhealthy    = "Unhealthy"
+	ContainerProbeWarning = "ProbeWarning"
+)
 
-	// Pod worker event reason list
+// Pod worker event reason list
+const (
 	FailedSync = "FailedSync"
+)
 
-	// Config event reason list
+// Config event reason list
+const (
 	FailedValidation = "FailedValidation"
+)
 
-	// Lifecycle hooks
-	FailedPostStartHook   = "FailedPostStartHook"
-	FailedPreStopHook     = "FailedPreStopHook"
-	UnfinishedPreStopHook = "UnfinishedPreStopHook"
+// Lifecycle hooks
+const (
+	FailedPostStartHook = "FailedPostStartHook"
+	FailedPreStopHook   = "FailedPreStopHook"
 )

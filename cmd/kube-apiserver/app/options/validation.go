@@ -17,63 +17,97 @@ limitations under the License.
 package options
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"strings"
+
+	genericoptions "k8s.io/apiserver/pkg/server/options"
+	netutils "k8s.io/utils/net"
+
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver/options"
+	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
 )
 
 // TODO: Longer term we should read this from some config store, rather than a flag.
-func validateClusterIPFlags(options *ServerRunOptions) []error {
-	errors := []error{}
-	if options.ServiceClusterIPRange.IP == nil {
-		errors = append(errors, fmt.Errorf("no --service-cluster-ip-range specified"))
+// validateClusterIPFlags is expected to be called after Complete()
+func validateClusterIPFlags(options Extra) []error {
+	var errs []error
+
+	// validate that primary has been processed by user provided values or it has been defaulted
+	if options.PrimaryServiceClusterIPRange.IP == nil {
+		errs = append(errs, errors.New("--service-cluster-ip-range must contain at least one valid cidr"))
 	}
-	var ones, bits = options.ServiceClusterIPRange.Mask.Size()
-	if bits-ones > 20 {
-		errors = append(errors, fmt.Errorf("specified --service-cluster-ip-range is too large"))
+
+	serviceClusterIPRangeList := strings.Split(options.ServiceClusterIPRanges, ",")
+	if len(serviceClusterIPRangeList) > 2 {
+		errs = append(errs, errors.New("--service-cluster-ip-range must not contain more than two entries"))
 	}
-	return errors
+
+	secondaryServiceClusterIPRangeUsed := (options.SecondaryServiceClusterIPRange.IP != nil)
+	// note: While the cluster might be dualstack (i.e. pods with multiple IPs), the user may choose
+	// to only ingress traffic within and into the cluster on one IP family only. this family is decided
+	// by the range set on --service-cluster-ip-range. If/when the user decides to use dual stack services
+	// the Secondary* must be of different IPFamily than --service-cluster-ip-range
+	if secondaryServiceClusterIPRangeUsed {
+		// Should be dualstack IPFamily(PrimaryServiceClusterIPRange) != IPFamily(SecondaryServiceClusterIPRange)
+		dualstack, err := netutils.IsDualStackCIDRs([]*net.IPNet{&options.PrimaryServiceClusterIPRange, &options.SecondaryServiceClusterIPRange})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error attempting to validate dualstack for --service-cluster-ip-range value error:%v", err))
+		}
+
+		if !dualstack {
+			errs = append(errs, errors.New("--service-cluster-ip-range[0] and --service-cluster-ip-range[1] must be of different IP family"))
+		}
+	}
+
+	return errs
 }
 
-func validateServiceNodePort(options *ServerRunOptions) []error {
-	errors := []error{}
+func validateServiceNodePort(options Extra) []error {
+	var errs []error
+
 	if options.KubernetesServiceNodePort < 0 || options.KubernetesServiceNodePort > 65535 {
-		errors = append(errors, fmt.Errorf("--kubernetes-service-node-port %v must be between 0 and 65535, inclusive. If 0, the Kubernetes master service will be of type ClusterIP", options.KubernetesServiceNodePort))
+		errs = append(errs, fmt.Errorf("--kubernetes-service-node-port %v must be between 0 and 65535, inclusive. If 0, the Kubernetes master service will be of type ClusterIP", options.KubernetesServiceNodePort))
 	}
 
 	if options.KubernetesServiceNodePort > 0 && !options.ServiceNodePortRange.Contains(options.KubernetesServiceNodePort) {
-		errors = append(errors, fmt.Errorf("kubernetes service port range %v doesn't contain %v", options.ServiceNodePortRange, (options.KubernetesServiceNodePort)))
+		errs = append(errs, fmt.Errorf("kubernetes service node port range %v doesn't contain %v", options.ServiceNodePortRange, options.KubernetesServiceNodePort))
 	}
-	return errors
+	return errs
 }
 
-// Validate checks ServerRunOptions and return a slice of found errors.
-func (options *ServerRunOptions) Validate() []error {
-	var errors []error
-	if errs := options.Etcd.Validate(); len(errs) > 0 {
-		errors = append(errors, errs...)
+func validatePublicIPServiceClusterIPRangeIPFamilies(extra Extra, generic genericoptions.ServerRunOptions) []error {
+	// The "kubernetes.default" Service is SingleStack based on the configured ServiceIPRange.
+	// If the bootstrap controller reconcile the kubernetes.default Service and Endpoints, it must
+	// guarantee that the Service ClusterIPRepairConfig and the associated Endpoints have the same IP family, or
+	// it will not work for clients because of the IP family mismatch.
+	// TODO: revisit for dual-stack https://github.com/kubernetes/enhancements/issues/2438
+	if reconcilers.Type(extra.EndpointReconcilerType) != reconcilers.NoneEndpointReconcilerType {
+		serviceIPRange, _, err := controlplaneapiserver.ServiceIPRange(extra.PrimaryServiceClusterIPRange)
+		if err != nil {
+			return []error{fmt.Errorf("error determining service IP ranges: %w", err)}
+		}
+		if netutils.IsIPv4CIDR(&serviceIPRange) != netutils.IsIPv4(generic.AdvertiseAddress) {
+			return []error{fmt.Errorf("service IP family %q must match public address family %q", extra.PrimaryServiceClusterIPRange.String(), generic.AdvertiseAddress.String())}
+		}
 	}
-	if errs := validateClusterIPFlags(options); len(errs) > 0 {
-		errors = append(errors, errs...)
+
+	return nil
+}
+
+// Validate checks ServerRunOptions and return a slice of found errs.
+func (s CompletedOptions) Validate() []error {
+	var errs []error
+
+	errs = append(errs, s.CompletedOptions.Validate()...)
+	errs = append(errs, validateClusterIPFlags(s.Extra)...)
+	errs = append(errs, validateServiceNodePort(s.Extra)...)
+	errs = append(errs, validatePublicIPServiceClusterIPRangeIPFamilies(s.Extra, *s.GenericServerRunOptions)...)
+
+	if s.MasterCount <= 0 {
+		errs = append(errs, fmt.Errorf("--apiserver-count should be a positive number, but value '%d' provided", s.MasterCount))
 	}
-	if errs := validateServiceNodePort(options); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if errs := options.SecureServing.Validate(); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if errs := options.Authentication.Validate(); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if errs := options.Audit.Validate(); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if errs := options.Admission.Validate(); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if errs := options.InsecureServing.Validate("insecure-port"); len(errs) > 0 {
-		errors = append(errors, errs...)
-	}
-	if options.MasterCount <= 0 {
-		errors = append(errors, fmt.Errorf("--apiserver-count should be a positive number, but value '%d' provided", options.MasterCount))
-	}
-	return errors
+
+	return errs
 }

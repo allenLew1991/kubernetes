@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -14,37 +14,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# shellcheck disable=SC2034 # Variables sourced in other scripts.
+
 # Common utilities, variables and checks for all build scripts.
 set -o errexit
 set -o nounset
 set -o pipefail
 
-USER_ID=$(id -u)
-GROUP_ID=$(id -g)
+# Unset CDPATH, having it set messes up with script import paths
+unset CDPATH
 
 DOCKER_OPTS=${DOCKER_OPTS:-""}
-DOCKER=(docker ${DOCKER_OPTS})
+IFS=" " read -r -a DOCKER <<< "docker ${DOCKER_OPTS}"
 DOCKER_HOST=${DOCKER_HOST:-""}
-DOCKER_MACHINE_NAME=${DOCKER_MACHINE_NAME:-"kube-dev"}
-readonly DOCKER_MACHINE_DRIVER=${DOCKER_MACHINE_DRIVER:-"virtualbox --virtualbox-cpu-count -1"}
+GOPROXY=${GOPROXY:-""}
 
 # This will canonicalize the path
-KUBE_ROOT=$(cd $(dirname "${BASH_SOURCE}")/.. && pwd -P)
+KUBE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd -P)
 
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 # Constants
-readonly KUBE_BUILD_IMAGE_REPO=kube-build
-readonly KUBE_BUILD_IMAGE_CROSS_TAG="$(cat ${KUBE_ROOT}/build/build-image/cross/VERSION)"
+KUBE_BUILD_IMAGE_CROSS_TAG="${KUBE_CROSS_VERSION:-"$(cat "${KUBE_ROOT}/build/build-image/cross/VERSION")"}"
+readonly KUBE_BUILD_IMAGE_CROSS_TAG
 
-# This version number is used to cause everyone to rebuild their data containers
-# and build image.  This is especially useful for automated build systems like
-# Jenkins.
-#
-# Increment/change this number if you change the build image (anything under
-# build/build-image) or change the set of volumes in the data container.
-readonly KUBE_BUILD_IMAGE_VERSION_BASE="$(cat ${KUBE_ROOT}/build/build-image/VERSION)"
-readonly KUBE_BUILD_IMAGE_VERSION="${KUBE_BUILD_IMAGE_VERSION_BASE}-${KUBE_BUILD_IMAGE_CROSS_TAG}"
+readonly KUBE_DOCKER_REGISTRY="${KUBE_DOCKER_REGISTRY:-registry.k8s.io}"
+KUBE_BASE_IMAGE_REGISTRY="${KUBE_BASE_IMAGE_REGISTRY:-registry.k8s.io/build-image}"
+readonly KUBE_BASE_IMAGE_REGISTRY
+
+# Make it possible to override the `kube-cross` image, and tag independent of `KUBE_BASE_IMAGE_REGISTRY`
+KUBE_CROSS_IMAGE="${KUBE_CROSS_IMAGE:-"${KUBE_BASE_IMAGE_REGISTRY}/kube-cross"}"
+readonly KUBE_CROSS_IMAGE
+KUBE_CROSS_VERSION="${KUBE_CROSS_VERSION:-"${KUBE_BUILD_IMAGE_CROSS_TAG}"}"
+readonly KUBE_CROSS_VERSION
+KUBE_CROSS_CONTAINER_ROOT="/go/src/k8s.io/kubernetes"
+readonly KUBE_CROSS_CONTAINER_ROOT
 
 # Here we map the output directories across both the local and remote _output
 # directories:
@@ -65,82 +69,92 @@ readonly LOCAL_OUTPUT_IMAGE_STAGING="${LOCAL_OUTPUT_ROOT}/images"
 # This is a symlink to binaries for "this platform" (e.g. build tools).
 readonly THIS_PLATFORM_BIN="${LOCAL_OUTPUT_ROOT}/bin"
 
+readonly KUBE_GO_PACKAGE=k8s.io/kubernetes
 readonly REMOTE_ROOT="/go/src/${KUBE_GO_PACKAGE}"
 readonly REMOTE_OUTPUT_ROOT="${REMOTE_ROOT}/_output"
 readonly REMOTE_OUTPUT_SUBPATH="${REMOTE_OUTPUT_ROOT}/dockerized"
 readonly REMOTE_OUTPUT_BINPATH="${REMOTE_OUTPUT_SUBPATH}/bin"
 readonly REMOTE_OUTPUT_GOPATH="${REMOTE_OUTPUT_SUBPATH}/go"
 
-# This is the port on the workstation host to expose RSYNC on.  Set this if you
-# are doing something fancy with ssh tunneling.
-readonly KUBE_RSYNC_PORT="${KUBE_RSYNC_PORT:-}"
+# These are the default versions (image tags) for their respective base images.
+readonly __default_distroless_iptables_version=v0.11.2
+readonly __default_go_runner_version=v2.4.0-go1.27.3-trixie.0
+readonly __default_setcap_version=trixie-v1.0.1
 
-# This is the port that rsync is running on *inside* the container. This may be
-# mapped to KUBE_RSYNC_PORT via docker networking.
-readonly KUBE_CONTAINER_RSYNC_PORT=8730
+# The default image for all binaries which are dynamically linked.
+# Includes everything that is required by kube-proxy, which uses it
+# by default. Other commands only use this when dynamically linking
+# them gets requested.
+readonly __default_dynamic_base_image="$KUBE_BASE_IMAGE_REGISTRY/distroless-iptables:$__default_distroless_iptables_version"
+
+# KUBE_GORUNNER_IMAGE is the default image for commands which are built statically.
+# It can be overridden to change the image for all such commands.
+# When the per-command env variable is set, that env variable is
+# used without considering KUBE_GORUNNER_IMAGE.
+# TODO: this should be replaced with a plain distroless base image
+readonly KUBE_GORUNNER_IMAGE="${KUBE_GORUNNER_IMAGE:-$KUBE_BASE_IMAGE_REGISTRY/go-runner:$__default_go_runner_version}"
+
+# __default_base_image takes the canonical build target for a Kubernetes command (e.g. k8s.io/kubernetes/cmd/kube-scheduler)
+# and prints the right default base image for it, depending on whether that command gets built dynamically or statically.
+__default_base_image() {
+  if kube::golang::is_statically_linked "$1"; then
+    echo "$KUBE_GORUNNER_IMAGE"
+  else
+    echo "$__default_dynamic_base_image"
+  fi
+}
+
+# These are the base images for the Docker-wrapped binaries.
+# These can be overridden on a case-by-case basis.
+readonly KUBE_APISERVER_BASE_IMAGE="${KUBE_APISERVER_BASE_IMAGE:-$(__default_base_image k8s.io/kubernetes/cmd/kube-apiserver)}"
+readonly KUBE_CONTROLLER_MANAGER_BASE_IMAGE="${KUBE_CONTROLLER_MANAGER_BASE_IMAGE:-$(__default_base_image k8s.io/kubernetes/cmd/kube-controller-manager)}"
+readonly KUBE_SCHEDULER_BASE_IMAGE="${KUBE_SCHEDULER_BASE_IMAGE:-$(__default_base_image k8s.io/kubernetes/cmd/kube-scheduler)}"
+readonly KUBE_PROXY_BASE_IMAGE="${KUBE_PROXY_BASE_IMAGE:-$__default_dynamic_base_image}"
+readonly KUBECTL_BASE_IMAGE="${KUBECTL_BASE_IMAGE:-$(__default_base_image k8s.io/kubernetes/cmd/kubectl)}"
+
+# This is the image used in a multi-stage build to apply capabilities to Docker-wrapped binaries.
+readonly KUBE_BUILD_SETCAP_IMAGE="${KUBE_BUILD_SETCAP_IMAGE:-$KUBE_BASE_IMAGE_REGISTRY/setcap:$__default_setcap_version}"
 
 # Get the set of master binaries that run in Docker (on Linux)
-# Entry format is "<name-of-binary>,<base-image>".
+# Entry format is "<binary-name>,<base-image>".
 # Binaries are placed in /usr/local/bin inside the image.
+# `make` users can override any or all of the base images using the associated
+# environment variables.
 #
 # $1 - server architecture
 kube::build::get_docker_wrapped_binaries() {
-  debian_iptables_version=v10
   ### If you change any of these lists, please also update DOCKERIZED_BINARIES
-  ### in build/BUILD.
-  case $1 in
-    "amd64")
-        local targets=(
-          cloud-controller-manager,busybox
-          kube-apiserver,busybox
-          kube-controller-manager,busybox
-          kube-scheduler,busybox
-          kube-aggregator,busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-amd64:${debian_iptables_version}
-        );;
-    "arm")
-        local targets=(
-          cloud-controller-manager,arm32v7/busybox
-          kube-apiserver,arm32v7/busybox
-          kube-controller-manager,arm32v7/busybox
-          kube-scheduler,arm32v7/busybox
-          kube-aggregator,arm32v7/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-arm:${debian_iptables_version}
-        );;
-    "arm64")
-        local targets=(
-          cloud-controller-manager,arm64v8/busybox
-          kube-apiserver,arm64v8/busybox
-          kube-controller-manager,arm64v8/busybox
-          kube-scheduler,arm64v8/busybox
-          kube-aggregator,arm64v8/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-arm64:${debian_iptables_version}
-        );;
-    "ppc64le")
-        local targets=(
-          cloud-controller-manager,ppc64le/busybox
-          kube-apiserver,ppc64le/busybox
-          kube-controller-manager,ppc64le/busybox
-          kube-scheduler,ppc64le/busybox
-          kube-aggregator,ppc64le/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-ppc64le:${debian_iptables_version}
-        );;
-    "s390x")
-        local targets=(
-          cloud-controller-manager,s390x/busybox
-          kube-apiserver,s390x/busybox
-          kube-controller-manager,s390x/busybox
-          kube-scheduler,s390x/busybox
-          kube-aggregator,s390x/busybox
-          kube-proxy,gcr.io/google-containers/debian-iptables-s390x:${debian_iptables_version}
-        );;
-  esac
+  ### in build/BUILD. And kube::golang::server_image_targets
+  local targets=(
+    "kube-apiserver,${KUBE_APISERVER_BASE_IMAGE}"
+    "kube-controller-manager,${KUBE_CONTROLLER_MANAGER_BASE_IMAGE}"
+    "kube-scheduler,${KUBE_SCHEDULER_BASE_IMAGE}"
+    "kube-proxy,${KUBE_PROXY_BASE_IMAGE}"
+    "kubectl,${KUBECTL_BASE_IMAGE}"
+  )
 
   echo "${targets[@]}"
 }
 
 # ---------------------------------------------------------------------------
 # Basic setup functions
+
+# Set up dynamic constants for build environment.
+# This function sets up variables that are needed by both verification and cleaning.
+#
+# Vars set:
+#   KUBE_ROOT_HASH
+#   KUBE_BUILD_CONTAINER_NAME_BASE
+#   KUBE_BUILD_CONTAINER_NAME
+function kube::build::setup_vars() {
+  KUBE_GIT_BRANCH=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+  KUBE_ROOT_HASH=$(kube::build::short_hash "${HOSTNAME:-}:${KUBE_ROOT}:${KUBE_GIT_BRANCH}")
+  KUBE_BUILD_CONTAINER_NAME_BASE="kube-build-${KUBE_ROOT_HASH}"
+  # 6 here is out of a wild excess of caution to match previous behavior where
+  # this was the kube-build image version which surfaced in the name of the container
+  # the last real image version was 5
+  KUBE_BUILD_CONTAINER_NAME="${KUBE_BUILD_CONTAINER_NAME_BASE}-6"
+}
 
 # Verify that the right utilities and such are installed for building Kube. Set
 # up some dynamic constants.
@@ -149,22 +163,13 @@ kube::build::get_docker_wrapped_binaries() {
 #
 # Vars set:
 #   KUBE_ROOT_HASH
-#   KUBE_BUILD_IMAGE_TAG_BASE
-#   KUBE_BUILD_IMAGE_TAG
-#   KUBE_BUILD_IMAGE
 #   KUBE_BUILD_CONTAINER_NAME_BASE
 #   KUBE_BUILD_CONTAINER_NAME
-#   KUBE_DATA_CONTAINER_NAME_BASE
-#   KUBE_DATA_CONTAINER_NAME
-#   KUBE_RSYNC_CONTAINER_NAME_BASE
-#   KUBE_RSYNC_CONTAINER_NAME
-#   DOCKER_MOUNT_ARGS
-#   LOCAL_OUTPUT_BUILD_CONTEXT
+# shellcheck disable=SC2120 # optional parameters
 function kube::build::verify_prereqs() {
   local -r require_docker=${1:-true}
   kube::log::status "Verifying Prerequisites...."
   kube::build::ensure_tar || return 1
-  kube::build::ensure_rsync || return 1
   if ${require_docker}; then
     kube::build::ensure_docker_in_path || return 1
     if kube::build::is_osx; then
@@ -172,28 +177,19 @@ function kube::build::verify_prereqs() {
     fi
     kube::util::ensure_docker_daemon_connectivity || return 1
 
-    if (( ${KUBE_VERBOSE} > 6 )); then
+    if (( KUBE_VERBOSE > 6 )); then
       kube::log::status "Docker Version:"
       "${DOCKER[@]}" version | kube::log::info_from_stdin
     fi
   fi
 
-  KUBE_GIT_BRANCH=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
-  KUBE_ROOT_HASH=$(kube::build::short_hash "${HOSTNAME:-}:${KUBE_ROOT}:${KUBE_GIT_BRANCH}")
-  KUBE_BUILD_IMAGE_TAG_BASE="build-${KUBE_ROOT_HASH}"
-  KUBE_BUILD_IMAGE_TAG="${KUBE_BUILD_IMAGE_TAG_BASE}-${KUBE_BUILD_IMAGE_VERSION}"
-  KUBE_BUILD_IMAGE="${KUBE_BUILD_IMAGE_REPO}:${KUBE_BUILD_IMAGE_TAG}"
-  KUBE_BUILD_CONTAINER_NAME_BASE="kube-build-${KUBE_ROOT_HASH}"
-  KUBE_BUILD_CONTAINER_NAME="${KUBE_BUILD_CONTAINER_NAME_BASE}-${KUBE_BUILD_IMAGE_VERSION}"
-  KUBE_RSYNC_CONTAINER_NAME_BASE="kube-rsync-${KUBE_ROOT_HASH}"
-  KUBE_RSYNC_CONTAINER_NAME="${KUBE_RSYNC_CONTAINER_NAME_BASE}-${KUBE_BUILD_IMAGE_VERSION}"
-  KUBE_DATA_CONTAINER_NAME_BASE="kube-build-data-${KUBE_ROOT_HASH}"
-  KUBE_DATA_CONTAINER_NAME="${KUBE_DATA_CONTAINER_NAME_BASE}-${KUBE_BUILD_IMAGE_VERSION}"
-  DOCKER_MOUNT_ARGS=(--volumes-from "${KUBE_DATA_CONTAINER_NAME}")
-  LOCAL_OUTPUT_BUILD_CONTEXT="${LOCAL_OUTPUT_IMAGE_STAGING}/${KUBE_BUILD_IMAGE}"
+  kube::build::setup_vars
 
   kube::version::get_version_vars
   kube::version::save_version_vars "${KUBE_ROOT}/.dockerized-kube-version-defs"
+
+  # Without this, the user's umask can leak through.
+  umask 0022
 }
 
 # ---------------------------------------------------------------------------
@@ -201,63 +197,16 @@ function kube::build::verify_prereqs() {
 
 function kube::build::docker_available_on_osx() {
   if [[ -z "${DOCKER_HOST}" ]]; then
-    if [[ -S "/var/run/docker.sock" ]]; then
-      kube::log::status "Using Docker for MacOS"
+    if [[ -S "/var/run/docker.sock" ]] || [[ -S "$(docker context inspect --format  '{{.Endpoints.docker.Host}}' | awk -F 'unix://' '{print $2}')" ]]; then
+      kube::log::status "Using docker on macOS"
       return 0
     fi
 
-    kube::log::status "No docker host is set. Checking options for setting one..."
-    if [[ -z "$(which docker-machine)" ]]; then
-      kube::log::status "It looks like you're running Mac OS X, yet neither Docker for Mac nor docker-machine can be found."
-      kube::log::status "See: https://docs.docker.com/engine/installation/mac/ for installation instructions."
-      return 1
-    elif [[ -n "$(which docker-machine)" ]]; then
-      kube::build::prepare_docker_machine
-    fi
+    kube::log::status "No docker host is set."
+    kube::log::status "It looks like you're running Mac OS X, but Docker for Mac cannot be found."
+    kube::log::status "See: https://docs.docker.com/engine/installation/mac/ for installation instructions."
+    return 1
   fi
-}
-
-function kube::build::prepare_docker_machine() {
-  kube::log::status "docker-machine was found."
-
-  local available_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null)
-
-  local bytes_in_mb=1048576
-
-  # Give virtualbox 1/2 the system memory. Its necessary to divide by 2, instead
-  # of multiple by .5, because bash can only multiply by ints.
-  local memory_divisor=2
-
-  local virtualbox_memory_mb=$(( ${available_memory_bytes} / (${bytes_in_mb} * ${memory_divisor}) ))
-
-  docker-machine inspect "${DOCKER_MACHINE_NAME}" &> /dev/null || {
-    kube::log::status "Creating a machine to build Kubernetes"
-    docker-machine create --driver ${DOCKER_MACHINE_DRIVER} \
-      --virtualbox-memory "${virtualbox_memory_mb}" \
-      --engine-env HTTP_PROXY="${KUBERNETES_HTTP_PROXY:-}" \
-      --engine-env HTTPS_PROXY="${KUBERNETES_HTTPS_PROXY:-}" \
-      --engine-env NO_PROXY="${KUBERNETES_NO_PROXY:-127.0.0.1}" \
-      "${DOCKER_MACHINE_NAME}" > /dev/null || {
-      kube::log::error "Something went wrong creating a machine."
-      kube::log::error "Try the following: "
-      kube::log::error "docker-machine create -d ${DOCKER_MACHINE_DRIVER} --virtualbox-memory ${virtualbox_memory_mb} ${DOCKER_MACHINE_NAME}"
-      return 1
-    }
-  }
-  docker-machine start "${DOCKER_MACHINE_NAME}" &> /dev/null
-  # it takes `docker-machine env` a few seconds to work if the machine was just started
-  local docker_machine_out
-  while ! docker_machine_out=$(docker-machine env "${DOCKER_MACHINE_NAME}" 2>&1); do
-    if [[ ${docker_machine_out} =~ "Error checking TLS connection" ]]; then
-      echo ${docker_machine_out}
-      docker-machine regenerate-certs ${DOCKER_MACHINE_NAME}
-    else
-      sleep 1
-    fi
-  done
-  eval $(docker-machine env "${DOCKER_MACHINE_NAME}")
-  kube::log::status "A Docker host using docker-machine named '${DOCKER_MACHINE_NAME}' is ready to go!"
-  return 0
 }
 
 function kube::build::is_osx() {
@@ -266,34 +215,6 @@ function kube::build::is_osx() {
 
 function kube::build::is_gnu_sed() {
   [[ $(sed --version 2>&1) == *GNU* ]]
-}
-
-function kube::build::ensure_rsync() {
-  if [[ -z "$(which rsync)" ]]; then
-    kube::log::error "Can't find 'rsync' in PATH, please fix and retry."
-    return 1
-  fi
-}
-
-function kube::build::update_dockerfile() {
-  if kube::build::is_gnu_sed; then
-    sed_opts=(-i)
-  else
-    sed_opts=(-i '')
-  fi
-  sed "${sed_opts[@]}" "s/KUBE_BUILD_IMAGE_CROSS_TAG/${KUBE_BUILD_IMAGE_CROSS_TAG}/" "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-}
-
-function  kube::build::set_proxy() {
-  if [[ -n "${KUBERNETES_HTTPS_PROXY:-}" ]]; then
-    echo "ENV https_proxy $KUBERNETES_HTTPS_PROXY" >> "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-  fi
-  if [[ -n "${KUBERNETES_HTTP_PROXY:-}" ]]; then
-    echo "ENV http_proxy $KUBERNETES_HTTP_PROXY" >> "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-  fi
-  if [[ -n "${KUBERNETES_NO_PROXY:-}" ]]; then
-    echo "ENV no_proxy $KUBERNETES_NO_PROXY" >> "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-  fi
 }
 
 function kube::build::ensure_docker_in_path() {
@@ -336,7 +257,7 @@ function kube::build::has_ip() {
 # Detect if a specific image exists
 #
 # $1 - image repo name
-# #2 - image tag
+# $2 - image tag
 function kube::build::docker_image_exists() {
   [[ -n $1 && -n $2 ]] || {
     kube::log::error "Internal error. Image not specified in docker_image_exists."
@@ -344,29 +265,6 @@ function kube::build::docker_image_exists() {
   }
 
   [[ $("${DOCKER[@]}" images -q "${1}:${2}") ]]
-}
-
-# Delete all images that match a tag prefix except for the "current" version
-#
-# $1: The image repo/name
-# $2: The tag base. We consider any image that matches $2*
-# $3: The current image not to delete if provided
-function kube::build::docker_delete_old_images() {
-  # In Docker 1.12, we can replace this with
-  #    docker images "$1" --format "{{.Tag}}"
-  for tag in $("${DOCKER[@]}" images ${1} | tail -n +2 | awk '{print $2}') ; do
-    if [[ "${tag}" != "${2}"* ]] ; then
-      V=3 kube::log::status "Keeping image ${1}:${tag}"
-      continue
-    fi
-
-    if [[ -z "${3:-}" || "${tag}" != "${3}" ]] ; then
-      V=2 kube::log::status "Deleting image ${1}:${tag}"
-      "${DOCKER[@]}" rmi "${1}:${tag}" >/dev/null
-    else
-      V=3 kube::log::status "Keeping image ${1}:${tag}"
-    fi
-  done
 }
 
 # Stop and delete all containers that match a pattern
@@ -390,7 +288,7 @@ function kube::build::docker_delete_old_containers() {
   done
 }
 
-# Takes $1 and computes a short has for it. Useful for unique tag generation
+# Takes $1 and computes a short hash for it. Useful for unique tag generation
 function kube::build::short_hash() {
   [[ $# -eq 1 ]] || {
     kube::log::error "Internal error.  No data based to short_hash."
@@ -403,7 +301,7 @@ function kube::build::short_hash() {
   else
     short_hash=$(echo -n "$1" | md5sum)
   fi
-  echo ${short_hash:0:10}
+  echo "${short_hash:0:10}"
 }
 
 # Pedantically kill, wait-on and remove a container. The -f -v options
@@ -422,6 +320,10 @@ function kube::build::destroy_container() {
   "${DOCKER[@]}" rm -f -v "$1" >/dev/null 2>&1 || true
 }
 
+function kube::build::is_docker_rootless() {
+  "${DOCKER[@]}" info --format '{{json .SecurityOptions}}' | grep -q "name=rootless"
+}
+
 # ---------------------------------------------------------------------------
 # Building
 
@@ -429,118 +331,25 @@ function kube::build::destroy_container() {
 function kube::build::clean() {
   if kube::build::has_docker ; then
     kube::build::docker_delete_old_containers "${KUBE_BUILD_CONTAINER_NAME_BASE}"
-    kube::build::docker_delete_old_containers "${KUBE_RSYNC_CONTAINER_NAME_BASE}"
-    kube::build::docker_delete_old_containers "${KUBE_DATA_CONTAINER_NAME_BASE}"
-    kube::build::docker_delete_old_images "${KUBE_BUILD_IMAGE_REPO}" "${KUBE_BUILD_IMAGE_TAG_BASE}"
 
     V=2 kube::log::status "Cleaning all untagged docker images"
-    "${DOCKER[@]}" rmi $("${DOCKER[@]}" images -q --filter 'dangling=true') 2> /dev/null || true
+    "${DOCKER[@]}" rmi "$("${DOCKER[@]}" images -q --filter 'dangling=true')" 2> /dev/null || true
   fi
 
   if [[ -d "${LOCAL_OUTPUT_ROOT}" ]]; then
     kube::log::status "Removing _output directory"
-    rm -rf "${LOCAL_OUTPUT_ROOT}"
-  fi
-}
-
-# Set up the context directory for the kube-build image and build it.
-function kube::build::build_image() {
-  mkdir -p "${LOCAL_OUTPUT_BUILD_CONTEXT}"
-  # Make sure the context directory owned by the right user for syncing sources to container.
-  chown -R ${USER_ID}:${GROUP_ID} "${LOCAL_OUTPUT_BUILD_CONTEXT}"
-
-  cp /etc/localtime "${LOCAL_OUTPUT_BUILD_CONTEXT}/"
-
-  cp build/build-image/Dockerfile "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
-  cp build/build-image/rsyncd.sh "${LOCAL_OUTPUT_BUILD_CONTEXT}/"
-  dd if=/dev/urandom bs=512 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | dd bs=32 count=1 2>/dev/null > "${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password"
-  chmod go= "${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password"
-
-  kube::build::update_dockerfile
-  kube::build::set_proxy
-  kube::build::docker_build "${KUBE_BUILD_IMAGE}" "${LOCAL_OUTPUT_BUILD_CONTEXT}" 'false'
-
-  # Clean up old versions of everything
-  kube::build::docker_delete_old_containers "${KUBE_BUILD_CONTAINER_NAME_BASE}" "${KUBE_BUILD_CONTAINER_NAME}"
-  kube::build::docker_delete_old_containers "${KUBE_RSYNC_CONTAINER_NAME_BASE}" "${KUBE_RSYNC_CONTAINER_NAME}"
-  kube::build::docker_delete_old_containers "${KUBE_DATA_CONTAINER_NAME_BASE}" "${KUBE_DATA_CONTAINER_NAME}"
-  kube::build::docker_delete_old_images "${KUBE_BUILD_IMAGE_REPO}" "${KUBE_BUILD_IMAGE_TAG_BASE}" "${KUBE_BUILD_IMAGE_TAG}"
-
-  kube::build::ensure_data_container
-  kube::build::sync_to_container
-}
-
-# Build a docker image from a Dockerfile.
-# $1 is the name of the image to build
-# $2 is the location of the "context" directory, with the Dockerfile at the root.
-# $3 is the value to set the --pull flag for docker build; true by default
-function kube::build::docker_build() {
-  local -r image=$1
-  local -r context_dir=$2
-  local -r pull="${3:-true}"
-  local -ra build_cmd=("${DOCKER[@]}" build -t "${image}" "--pull=${pull}" "${context_dir}")
-
-  kube::log::status "Building Docker image ${image}"
-  local docker_output
-  docker_output=$("${build_cmd[@]}" 2>&1) || {
-    cat <<EOF >&2
-+++ Docker build command failed for ${image}
-
-${docker_output}
-
-To retry manually, run:
-
-${build_cmd[*]}
-
-EOF
-    return 1
-  }
-}
-
-function kube::build::ensure_data_container() {
-  # If the data container exists AND exited successfully, we can use it.
-  # Otherwise nuke it and start over.
-  local ret=0
-  local code=$(docker inspect \
-      -f '{{.State.ExitCode}}' \
-      "${KUBE_DATA_CONTAINER_NAME}" 2>/dev/null || ret=$?)
-  if [[ "${ret}" == 0 && "${code}" != 0 ]]; then
-    kube::build::destroy_container "${KUBE_DATA_CONTAINER_NAME}"
-    ret=1
-  fi
-  if [[ "${ret}" != 0 ]]; then
-    kube::log::status "Creating data container ${KUBE_DATA_CONTAINER_NAME}"
-    # We have to ensure the directory exists, or else the docker run will
-    # create it as root.
-    mkdir -p "${LOCAL_OUTPUT_GOPATH}"
-    # We want this to run as root to be able to chown, so non-root users can
-    # later use the result as a data container.  This run both creates the data
-    # container and chowns the GOPATH.
+    # This ensures we can clean _output/local/go/cache which is not rw by default.
     #
-    # The data container creates volumes for all of the directories that store
-    # intermediates for the Go build. This enables incremental builds across
-    # Docker sessions. The *_cgo paths are re-compiled versions of the go std
-    # libraries for true static building.
-    local -ra docker_cmd=(
-      "${DOCKER[@]}" run
-      --volume "${REMOTE_ROOT}"   # white-out the whole output dir
-      --volume /usr/local/go/pkg/linux_386_cgo
-      --volume /usr/local/go/pkg/linux_amd64_cgo
-      --volume /usr/local/go/pkg/linux_arm_cgo
-      --volume /usr/local/go/pkg/linux_arm64_cgo
-      --volume /usr/local/go/pkg/linux_ppc64le_cgo
-      --volume /usr/local/go/pkg/darwin_amd64_cgo
-      --volume /usr/local/go/pkg/darwin_386_cgo
-      --volume /usr/local/go/pkg/windows_amd64_cgo
-      --volume /usr/local/go/pkg/windows_386_cgo
-      --name "${KUBE_DATA_CONTAINER_NAME}"
-      --hostname "${HOSTNAME}"
-      "${KUBE_BUILD_IMAGE}"
-      chown -R ${USER_ID}:${GROUP_ID}
-        "${REMOTE_ROOT}"
-        /usr/local/go/pkg/
-    )
-    "${docker_cmd[@]}"
+    # We only do this path specifically instead of the entire output root
+    # because recursive chmod is slow.
+    # We don't need to do this at all for dockerized builds
+    if [[ -d "${LOCAL_OUTPUT_ROOT}/local/go/cache" ]]; then
+      chmod -R +w "${LOCAL_OUTPUT_ROOT}/local/go/cache"
+    fi
+    if [[ -d "${LOCAL_OUTPUT_ROOT}/dockerized/go/cache" ]]; then
+      chmod -R +w "${LOCAL_OUTPUT_ROOT}/dockerized/go/cache"
+    fi
+    rm -rf "${LOCAL_OUTPUT_ROOT}"
   fi
 }
 
@@ -563,10 +372,11 @@ function kube::build::run_build_command_ex() {
 
   local -a docker_run_opts=(
     "--name=${container_name}"
-    "--user=$(id -u):$(id -g)"
     "--hostname=${HOSTNAME}"
-    "${DOCKER_MOUNT_ARGS[@]}"
+    "-e=GOPROXY=${GOPROXY}"
   )
+
+  kube::build::is_docker_rootless || docker_run_opts+=("--user=$(id -u):$(id -g)")
 
   local detach=false
 
@@ -596,10 +406,50 @@ function kube::build::run_build_command_ex() {
     --env "KUBE_FASTBUILD=${KUBE_FASTBUILD:-false}"
     --env "KUBE_BUILDER_OS=${OSTYPE:-notdetected}"
     --env "KUBE_VERBOSE=${KUBE_VERBOSE}"
+    --env "KUBE_BUILD_WITH_COVERAGE=${KUBE_BUILD_WITH_COVERAGE:-}"
+    --env "KUBE_BUILD_PLATFORMS=${KUBE_BUILD_PLATFORMS:-}"
+    --env "KUBE_CGO_OVERRIDES=' ${KUBE_CGO_OVERRIDES[*]:-} '"
+    --env "KUBE_STATIC_OVERRIDES=' ${KUBE_STATIC_OVERRIDES[*]:-} '"
+    --env "KUBE_RACE=${KUBE_RACE:-}"
+    --env "FORCE_HOST_GO=${FORCE_HOST_GO:-}"
+    --env "GO_VERSION=${GO_VERSION:-}"
+    --env "GOTOOLCHAIN=${GOTOOLCHAIN:-}"
     --env "GOFLAGS=${GOFLAGS:-}"
-    --env "GOLDFLAGS=${GOLDFLAGS:-}"
     --env "GOGCFLAGS=${GOGCFLAGS:-}"
+    --env "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-}"
+    # mount source code / output dir
+    --volume "${KUBE_ROOT}:${KUBE_CROSS_CONTAINER_ROOT}"
+    # env migrated from build-image, we could consider setting this in kube-cross
+    --env 'KUBE_OUTPUT_SUBPATH=_output/dockerized'
+    --workdir "${KUBE_CROSS_CONTAINER_ROOT}"
+    --env 'GIT_AUTHOR_EMAIL=nobody@k8s.io'
+    --env 'GIT_AUTHOR_NAME=kube-build-image'
   )
+
+  # if host has localtime, mount it so we log in local time
+  if [ -f /etc/localtime ]; then
+    docker_run_opts+=(
+      --mount 'type=bind,source=/etc/localtime,target=/etc/localtime,readonly'
+    )
+  fi
+
+  # use GOLDFLAGS only if it is set explicitly.
+  if [[ -v GOLDFLAGS ]]; then
+    docker_run_opts+=(
+      --env "GOLDFLAGS=${GOLDFLAGS:-}"
+    )
+  fi
+
+  if [[ -n "${DOCKER_CGROUP_PARENT:-}" ]]; then
+    kube::log::status "Using ${DOCKER_CGROUP_PARENT} as container cgroup parent"
+    docker_run_opts+=(--cgroup-parent "${DOCKER_CGROUP_PARENT}")
+  fi
+
+  # copy KUBE_GIT_VERSION_FILE to .dockerized-kube-version-defs and set environment variable.
+  if [[ -n "${KUBE_GIT_VERSION_FILE:-}" ]]; then
+    cp "${KUBE_GIT_VERSION_FILE}" "${KUBE_ROOT}/.dockerized-kube-version-defs"
+    docker_run_opts+=(--env "KUBE_GIT_VERSION_FILE=${KUBE_CROSS_CONTAINER_ROOT}/.dockerized-kube-version-defs")
+  fi
 
   # If we have stdin we can run interactive.  This allows things like 'shell.sh'
   # to work.  However, if we run this way and don't have stdin, then it ends up
@@ -608,11 +458,11 @@ function kube::build::run_build_command_ex() {
   if [[ -t 0 ]]; then
     docker_run_opts+=(--interactive --tty)
   elif [[ "${detach}" == false ]]; then
-    docker_run_opts+=(--attach=stdout --attach=stderr)
+    docker_run_opts+=("--attach=stdout" "--attach=stderr")
   fi
 
   local -ra docker_cmd=(
-    "${DOCKER[@]}" run "${docker_run_opts[@]}" "${KUBE_BUILD_IMAGE}")
+    "${DOCKER[@]}" run "${docker_run_opts[@]}" "${KUBE_CROSS_IMAGE}:${KUBE_CROSS_VERSION}")
 
   # Clean up container from any previous run
   kube::build::destroy_container "${container_name}"
@@ -620,151 +470,4 @@ function kube::build::run_build_command_ex() {
   if [[ "${detach}" == false ]]; then
     kube::build::destroy_container "${container_name}"
   fi
-}
-
-function kube::build::rsync_probe {
-  # Wait unil rsync is up and running.
-  local tries=20
-  while (( ${tries} > 0 )) ; do
-    if rsync "rsync://k8s@${1}:${2}/" \
-         --password-file="${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password" \
-         &> /dev/null ; then
-      return 0
-    fi
-    tries=$(( ${tries} - 1))
-    sleep 0.1
-  done
-
-  return 1
-}
-
-# Start up the rsync container in the background. This should be explicitly
-# stopped with kube::build::stop_rsyncd_container.
-#
-# This will set the global var KUBE_RSYNC_ADDR to the effective port that the
-# rsync daemon can be reached out.
-function kube::build::start_rsyncd_container() {
-  IPTOOL=ifconfig
-  if kube::build::has_ip ; then
-    IPTOOL="ip address"
-  fi
-  kube::build::stop_rsyncd_container
-  V=3 kube::log::status "Starting rsyncd container"
-  kube::build::run_build_command_ex \
-    "${KUBE_RSYNC_CONTAINER_NAME}" -p 127.0.0.1:${KUBE_RSYNC_PORT}:${KUBE_CONTAINER_RSYNC_PORT} -d \
-    -e ALLOW_HOST="$(${IPTOOL} | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1')" \
-    -- /rsyncd.sh >/dev/null
-
-  local mapped_port
-  if ! mapped_port=$("${DOCKER[@]}" port "${KUBE_RSYNC_CONTAINER_NAME}" ${KUBE_CONTAINER_RSYNC_PORT} 2> /dev/null | cut -d: -f 2) ; then
-    kube::log::error "Could not get effective rsync port"
-    return 1
-  fi
-
-  local container_ip
-  container_ip=$("${DOCKER[@]}" inspect --format '{{ .NetworkSettings.IPAddress }}' "${KUBE_RSYNC_CONTAINER_NAME}")
-
-  # Sometimes we can reach rsync through localhost and a NAT'd port.  Other
-  # times (when we are running in another docker container on the Jenkins
-  # machines) we have to talk directly to the container IP.  There is no one
-  # strategy that works in all cases so we test to figure out which situation we
-  # are in.
-  if kube::build::rsync_probe 127.0.0.1 ${mapped_port}; then
-    KUBE_RSYNC_ADDR="127.0.0.1:${mapped_port}"
-    return 0
-  elif kube::build::rsync_probe "${container_ip}" ${KUBE_CONTAINER_RSYNC_PORT}; then
-    KUBE_RSYNC_ADDR="${container_ip}:${KUBE_CONTAINER_RSYNC_PORT}"
-    return 0
-  fi
-
-  kube::log::error "Could not connect to rsync container. See build/README.md for setting up remote Docker engine."
-  return 1
-}
-
-function kube::build::stop_rsyncd_container() {
-  V=3 kube::log::status "Stopping any currently running rsyncd container"
-  unset KUBE_RSYNC_ADDR
-  kube::build::destroy_container "${KUBE_RSYNC_CONTAINER_NAME}"
-}
-
-function kube::build::rsync {
-  local -a rsync_opts=(
-    --archive
-    --password-file="${LOCAL_OUTPUT_BUILD_CONTEXT}/rsyncd.password"
-  )
-  if (( ${KUBE_VERBOSE} >= 6 )); then
-    rsync_opts+=("-iv")
-  fi
-  if (( ${KUBE_RSYNC_COMPRESS} > 0 )); then
-     rsync_opts+=("--compress-level=${KUBE_RSYNC_COMPRESS}")
-  fi
-  V=3 kube::log::status "Running rsync"
-  rsync "${rsync_opts[@]}" "$@"
-}
-
-# This will launch rsyncd in a container and then sync the source tree to the
-# container over the local network.
-function kube::build::sync_to_container() {
-  kube::log::status "Syncing sources to container"
-
-  kube::build::start_rsyncd_container
-
-  # rsync filters are a bit confusing.  Here we are syncing everything except
-  # output only directories and things that are not necessary like the git
-  # directory and generated files. The '- /' filter prevents rsync
-  # from trying to set the uid/gid/perms on the root of the sync tree.
-  # As an exception, we need to sync generated files in staging/, because
-  # they will not be re-generated by 'make'. Note that the 'H' filtered files
-  # are hidden from rsync so they will be deleted in the target container if
-  # they exist. This will allow them to be re-created in the container if
-  # necessary.
-  kube::build::rsync \
-    --delete \
-    --filter='H /.git' \
-    --filter='- /.make/' \
-    --filter='- /_tmp/' \
-    --filter='- /_output/' \
-    --filter='- /' \
-    --filter='H zz_generated.*' \
-    --filter='H generated.proto' \
-    "${KUBE_ROOT}/" "rsync://k8s@${KUBE_RSYNC_ADDR}/k8s/"
-
-  kube::build::stop_rsyncd_container
-}
-
-# Copy all build results back out.
-function kube::build::copy_output() {
-  kube::log::status "Syncing out of container"
-
-  kube::build::start_rsyncd_container
-
-  local rsync_extra=""
-  if (( ${KUBE_VERBOSE} >= 6 )); then
-    rsync_extra="-iv"
-  fi
-
-  # The filter syntax for rsync is a little obscure. It filters on files and
-  # directories.  If you don't go in to a directory you won't find any files
-  # there.  Rules are evaluated in order.  The last two rules are a little
-  # magic. '+ */' says to go in to every directory and '- /**' says to ignore
-  # any file or directory that isn't already specifically allowed.
-  #
-  # We are looking to copy out all of the built binaries along with various
-  # generated files.
-  kube::build::rsync \
-    --prune-empty-dirs \
-    --filter='- /_temp/' \
-    --filter='+ /vendor/' \
-    --filter='+ /Godeps/' \
-    --filter='+ /staging/***/Godeps/**' \
-    --filter='+ /_output/dockerized/bin/**' \
-    --filter='+ zz_generated.*' \
-    --filter='+ generated.proto' \
-    --filter='+ *.pb.go' \
-    --filter='+ types.go' \
-    --filter='+ */' \
-    --filter='- /**' \
-    "rsync://k8s@${KUBE_RSYNC_ADDR}/k8s/" "${KUBE_ROOT}"
-
-  kube::build::stop_rsyncd_container
 }

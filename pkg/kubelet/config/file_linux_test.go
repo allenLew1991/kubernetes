@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -21,22 +21,20 @@ package config
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utiltesting "k8s.io/client-go/util/testing"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/ktesting"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
@@ -45,21 +43,22 @@ import (
 )
 
 func TestExtractFromNonExistentFile(t *testing.T) {
-	ch := make(chan interface{}, 1)
-	c := newSourceFile("/some/fake/file", "localhost", time.Millisecond, ch)
-	err := c.watch()
+	logger, _ := ktesting.NewTestContext(t)
+	ch := make(chan sourceUpdate, 1)
+	lw := newSourceFile("/some/fake/file", "localhost", time.Millisecond, ch)
+	err := lw.doWatch(logger)
 	if err == nil {
 		t.Errorf("Expected error")
 	}
 }
 
 func TestUpdateOnNonExistentFile(t *testing.T) {
-	ch := make(chan interface{})
-	NewSourceFile("random_non_existent_path", "localhost", time.Millisecond, ch)
+	logger, _ := ktesting.NewTestContext(t)
+	ch := make(chan sourceUpdate)
+	NewSourceFile(logger, "random_non_existent_path", "localhost", time.Millisecond, ch)
 	select {
-	case got := <-ch:
-		update := got.(kubetypes.PodUpdate)
-		expected := CreatePodUpdate(kubetypes.SET, kubetypes.FileSource)
+	case update := <-ch:
+		expected := createSourceUpdate() // Expect empty update.
 		if !apiequality.Semantic.DeepDerivative(expected, update) {
 			t.Fatalf("expected %#v, Got %#v", expected, update)
 		}
@@ -70,30 +69,30 @@ func TestUpdateOnNonExistentFile(t *testing.T) {
 }
 
 func TestReadPodsFromFileExistAlready(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	hostname := types.NodeName("random-test-hostname")
 	var testCases = getTestCases(hostname)
 
 	for _, testCase := range testCases {
 		func() {
-			dirName, err := utiltesting.MkTmpdir("file-test")
+			dirName, err := mkTempDir("file-test")
 			if err != nil {
 				t.Fatalf("unable to create temp dir: %v", err)
 			}
 			defer os.RemoveAll(dirName)
 			file := testCase.writeToFile(dirName, "test_pod_manifest", t)
 
-			ch := make(chan interface{})
-			NewSourceFile(file, hostname, time.Millisecond, ch)
+			ch := make(chan sourceUpdate)
+			NewSourceFile(logger, file, hostname, time.Millisecond, ch)
 			select {
-			case got := <-ch:
-				update := got.(kubetypes.PodUpdate)
+			case update := <-ch:
 				for _, pod := range update.Pods {
 					// TODO: remove the conversion when validation is performed on versioned objects.
 					internalPod := &api.Pod{}
 					if err := k8s_api_v1.Convert_v1_Pod_To_core_Pod(pod, internalPod, nil); err != nil {
 						t.Fatalf("%s: Cannot convert pod %#v, %#v", testCase.desc, pod, err)
 					}
-					if errs := validation.ValidatePod(internalPod); len(errs) > 0 {
+					if errs := validation.ValidatePodCreate(internalPod, validation.PodValidationOptions{}); len(errs) > 0 {
 						t.Fatalf("%s: Invalid pod %#v, %#v", testCase.desc, internalPod, errs)
 					}
 				}
@@ -107,75 +106,48 @@ func TestReadPodsFromFileExistAlready(t *testing.T) {
 	}
 }
 
-func TestReadPodsFromFileExistLater(t *testing.T) {
-	watchFileAdded(false, t)
+var (
+	testCases = []struct {
+		watchDir bool
+		symlink  bool
+		period   time.Duration
+	}{
+		// set the period to be long enough for the file to be changed
+		// and short enough to trigger the event
+		{true, true, 3 * time.Second},
+
+		// set the period to avoid periodic PodUpdate event
+		{true, false, 60 * time.Second},
+		{false, true, 60 * time.Second},
+		{false, false, 60 * time.Second},
+	}
+)
+
+func TestWatchFileAdded(t *testing.T) {
+	for _, testCase := range testCases {
+		watchFileAdded(testCase.watchDir, testCase.symlink, t)
+	}
 }
 
-func TestReadPodsFromFileChanged(t *testing.T) {
-	watchFileChanged(false, t)
-}
-
-func TestReadPodsFromFileInDirAdded(t *testing.T) {
-	watchFileAdded(true, t)
-}
-
-func TestReadPodsFromFileInDirChanged(t *testing.T) {
-	watchFileChanged(true, t)
-}
-
-func TestExtractFromBadDataFile(t *testing.T) {
-	dirName, err := utiltesting.MkTmpdir("file-test")
-	if err != nil {
-		t.Fatalf("unable to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(dirName)
-
-	fileName := filepath.Join(dirName, "test_pod_manifest")
-	err = ioutil.WriteFile(fileName, []byte{1, 2, 3}, 0555)
-	if err != nil {
-		t.Fatalf("unable to write test file %#v", err)
-	}
-
-	ch := make(chan interface{}, 1)
-	c := newSourceFile(fileName, "localhost", time.Millisecond, ch)
-	err = c.resetStoreFromPath()
-	if err == nil {
-		t.Fatalf("expected error, got nil")
-	}
-	expectEmptyChannel(t, ch)
-}
-
-func TestExtractFromEmptyDir(t *testing.T) {
-	dirName, err := utiltesting.MkTmpdir("file-test")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer os.RemoveAll(dirName)
-
-	ch := make(chan interface{}, 1)
-	c := newSourceFile(dirName, "localhost", time.Millisecond, ch)
-	err = c.resetStoreFromPath()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	update := (<-ch).(kubetypes.PodUpdate)
-	expected := CreatePodUpdate(kubetypes.SET, kubetypes.FileSource)
-	if !apiequality.Semantic.DeepEqual(expected, update) {
-		t.Fatalf("expected %#v, Got %#v", expected, update)
+func TestWatchFileChanged(t *testing.T) {
+	for _, testCase := range testCases {
+		watchFileChanged(testCase.watchDir, testCase.symlink, testCase.period, t)
 	}
 }
 
 type testCase struct {
+	lock     *sync.Mutex
 	desc     string
 	pod      runtime.Object
-	expected kubetypes.PodUpdate
+	expected sourceUpdate
 }
 
 func getTestCases(hostname types.NodeName) []*testCase {
 	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
 	return []*testCase{
 		{
+			lock: &sync.Mutex{},
 			desc: "Simple pod",
 			pod: &v1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -190,19 +162,18 @@ func getTestCases(hostname types.NodeName) []*testCase {
 				Spec: v1.PodSpec{
 					Containers:      []v1.Container{{Name: "image", Image: "test/image", SecurityContext: securitycontext.ValidSecurityContextWithContainerDefaults()}},
 					SecurityContext: &v1.PodSecurityContext{},
-					SchedulerName:   api.DefaultSchedulerName,
+					SchedulerName:   v1.DefaultSchedulerName,
 				},
 				Status: v1.PodStatus{
 					Phase: v1.PodPending,
 				},
 			},
-			expected: CreatePodUpdate(kubetypes.SET, kubetypes.FileSource, &v1.Pod{
+			expected: createSourceUpdate(&v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "test-" + string(hostname),
 					UID:         "12345",
 					Namespace:   "mynamespace",
 					Annotations: map[string]string{kubetypes.ConfigHashAnnotationKey: "12345"},
-					SelfLink:    getSelfLink("test-"+string(hostname), "mynamespace"),
 				},
 				Spec: v1.PodSpec{
 					NodeName:                      string(hostname),
@@ -214,15 +185,16 @@ func getTestCases(hostname types.NodeName) []*testCase {
 						Effect:   "NoExecute",
 					}},
 					Containers: []v1.Container{{
-						Name:  "image",
-						Image: "test/image",
+						Name:                     "image",
+						Image:                    "test/image",
 						TerminationMessagePath:   "/dev/termination-log",
 						ImagePullPolicy:          "Always",
 						SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
 						TerminationMessagePolicy: v1.TerminationMessageReadFile,
 					}},
-					SecurityContext: &v1.PodSecurityContext{},
-					SchedulerName:   api.DefaultSchedulerName,
+					SecurityContext:    &v1.PodSecurityContext{},
+					SchedulerName:      v1.DefaultSchedulerName,
+					EnableServiceLinks: &enableServiceLinks,
 				},
 				Status: v1.PodStatus{
 					Phase: v1.PodPending,
@@ -233,12 +205,7 @@ func getTestCases(hostname types.NodeName) []*testCase {
 }
 
 func (tc *testCase) writeToFile(dir, name string, t *testing.T) string {
-	var versionedPod runtime.Object
-	err := testapi.Default.Converter().Convert(&tc.pod, &versionedPod, nil)
-	if err != nil {
-		t.Fatalf("%s: error in versioning the pod: %v", tc.desc, err)
-	}
-	fileContents, err := runtime.Encode(testapi.Default.Codec(), versionedPod)
+	fileContents, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), tc.pod)
 	if err != nil {
 		t.Fatalf("%s: error in encoding the pod: %v", tc.desc, err)
 	}
@@ -250,36 +217,63 @@ func (tc *testCase) writeToFile(dir, name string, t *testing.T) string {
 	return fileName
 }
 
-func watchFileAdded(watchDir bool, t *testing.T) {
+func createSymbolicLink(link, target, name string, t *testing.T) string {
+	linkName := filepath.Join(link, name)
+	linkedFile := filepath.Join(target, name)
+
+	err := os.Symlink(linkedFile, linkName)
+	if err != nil {
+		t.Fatalf("unexpected error when create symbolic link: %v", err)
+	}
+	return linkName
+}
+
+func watchFileAdded(watchDir bool, symlink bool, t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	hostname := types.NodeName("random-test-hostname")
 	var testCases = getTestCases(hostname)
 
 	fileNamePre := "test_pod_manifest"
 	for index, testCase := range testCases {
 		func() {
-			dirName, err := utiltesting.MkTmpdir("dir-test")
+			dirName, err := mkTempDir("dir-test")
 			if err != nil {
 				t.Fatalf("unable to create temp dir: %v", err)
 			}
-			defer os.RemoveAll(dirName)
-			fileName := fmt.Sprintf("%s_%d", fileNamePre, index)
+			defer removeAll(dirName, t)
 
-			ch := make(chan interface{})
+			fileName := fmt.Sprintf("%s_%d", fileNamePre, index)
+			var linkedDirName string
+			if symlink {
+				linkedDirName, err = mkTempDir("linked-dir-test")
+				if err != nil {
+					t.Fatalf("unable to create temp dir for linked files: %v", err)
+				}
+				defer removeAll(linkedDirName, t)
+				createSymbolicLink(dirName, linkedDirName, fileName, t)
+			}
+
+			ch := make(chan sourceUpdate)
 			if watchDir {
-				NewSourceFile(dirName, hostname, 100*time.Millisecond, ch)
+				NewSourceFile(logger, dirName, hostname, 100*time.Millisecond, ch)
 			} else {
-				NewSourceFile(filepath.Join(dirName, fileName), hostname, 100*time.Millisecond, ch)
+				NewSourceFile(logger, filepath.Join(dirName, fileName), hostname, 100*time.Millisecond, ch)
 			}
 			expectEmptyUpdate(t, ch)
 
 			addFile := func() {
 				// Add a file
+				if symlink {
+					testCase.writeToFile(linkedDirName, fileName, t)
+					return
+				}
+
 				testCase.writeToFile(dirName, fileName, t)
 			}
 
 			go addFile()
 
-			// For !watchDir: expect an update by SourceFile.resetStoreFromPath().
+			// For !watchDir: expect an update by SourceFile.reloadConfig().
 			// For watchDir: expect at least one update from CREATE & MODIFY inotify event.
 			// Shouldn't expect two updates from CREATE & MODIFY because CREATE doesn't guarantee file written.
 			// In that case no update will be sent from CREATE event.
@@ -288,51 +282,69 @@ func watchFileAdded(watchDir bool, t *testing.T) {
 	}
 }
 
-func watchFileChanged(watchDir bool, t *testing.T) {
+func watchFileChanged(watchDir bool, symlink bool, period time.Duration, t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	hostname := types.NodeName("random-test-hostname")
 	var testCases = getTestCases(hostname)
 
 	fileNamePre := "test_pod_manifest"
 	for index, testCase := range testCases {
 		func() {
-			dirName, err := utiltesting.MkTmpdir("dir-test")
+			dirName, err := mkTempDir("dir-test")
 			fileName := fmt.Sprintf("%s_%d", fileNamePre, index)
 			if err != nil {
 				t.Fatalf("unable to create temp dir: %v", err)
 			}
-			defer os.RemoveAll(dirName)
+			defer removeAll(dirName, t)
+
+			var linkedDirName string
+			if symlink {
+				linkedDirName, err = mkTempDir("linked-dir-test")
+				if err != nil {
+					t.Fatalf("unable to create temp dir for linked files: %v", err)
+				}
+				defer removeAll(linkedDirName, t)
+				createSymbolicLink(dirName, linkedDirName, fileName, t)
+			}
 
 			var file string
-			lock := &sync.Mutex{}
-			ch := make(chan interface{})
+			ch := make(chan sourceUpdate)
 			func() {
-				lock.Lock()
-				defer lock.Unlock()
+				testCase.lock.Lock()
+				defer testCase.lock.Unlock()
+
+				if symlink {
+					file = testCase.writeToFile(linkedDirName, fileName, t)
+					return
+				}
+
 				file = testCase.writeToFile(dirName, fileName, t)
 			}()
 
 			if watchDir {
-				NewSourceFile(dirName, hostname, 100*time.Millisecond, ch)
-				defer func() {
-					// Remove the file
-					deleteFile(dirName, fileName, ch, t)
-				}()
+				NewSourceFile(logger, dirName, hostname, period, ch)
 			} else {
-				NewSourceFile(file, hostname, 100*time.Millisecond, ch)
+				NewSourceFile(logger, file, hostname, period, ch)
 			}
+
+			// await fsnotify to be ready
+			time.Sleep(time.Second)
+
 			// expect an update by SourceFile.resetStoreFromPath()
 			expectUpdate(t, ch, testCase)
 
+			pod := testCase.pod.(*v1.Pod)
+			pod.Spec.Containers[0].Name = "image2"
+
+			testCase.expected.Pods[0].Spec.Containers[0].Name = "image2"
 			changeFile := func() {
 				// Edit the file content
-				lock.Lock()
-				defer lock.Unlock()
+				if symlink {
+					file = testCase.writeToFile(linkedDirName, fileName, t)
+					return
+				}
 
-				pod := testCase.pod.(*v1.Pod)
-				pod.Spec.Containers[0].Name = "image2"
-
-				testCase.expected.Pods[0].Spec.Containers[0].Name = "image2"
-				testCase.writeToFile(dirName, fileName, t)
+				file = testCase.writeToFile(dirName, fileName, t)
 			}
 
 			go changeFile()
@@ -340,9 +352,7 @@ func watchFileChanged(watchDir bool, t *testing.T) {
 			expectUpdate(t, ch, testCase)
 
 			if watchDir {
-				from := fileName
-				fileName = fileName + "_ch"
-				go changeFileName(dirName, from, fileName, t)
+				go changeFileName(dirName, fileName, fileName+"_ch", t)
 				// expect an update by MOVED_FROM inotify event cause changing file name
 				expectEmptyUpdate(t, ch)
 				// expect an update by MOVED_TO inotify event cause changing file name
@@ -352,31 +362,22 @@ func watchFileChanged(watchDir bool, t *testing.T) {
 	}
 }
 
-func deleteFile(dir, file string, ch chan interface{}, t *testing.T) {
-	go func() {
-		path := filepath.Join(dir, file)
-		err := os.Remove(path)
-		if err != nil {
-			t.Errorf("unable to remove test file %s: %s", path, err)
-		}
-	}()
-
-	expectEmptyUpdate(t, ch)
-}
-
-func expectUpdate(t *testing.T, ch chan interface{}, testCase *testCase) {
+func expectUpdate(t *testing.T, ch chan sourceUpdate, testCase *testCase) {
 	timer := time.After(5 * time.Second)
 	for {
 		select {
-		case got := <-ch:
-			update := got.(kubetypes.PodUpdate)
+		case update := <-ch:
+			if len(update.Pods) == 0 {
+				// filter out the empty updates from reading a non-existing path
+				continue
+			}
 			for _, pod := range update.Pods {
 				// TODO: remove the conversion when validation is performed on versioned objects.
 				internalPod := &api.Pod{}
 				if err := k8s_api_v1.Convert_v1_Pod_To_core_Pod(pod, internalPod, nil); err != nil {
 					t.Fatalf("%s: Cannot convert pod %#v, %#v", testCase.desc, pod, err)
 				}
-				if errs := validation.ValidatePod(internalPod); len(errs) > 0 {
+				if errs := validation.ValidatePodCreate(internalPod, validation.PodValidationOptions{}); len(errs) > 0 {
 					t.Fatalf("%s: Invalid pod %#v, %#v", testCase.desc, internalPod, errs)
 				}
 			}
@@ -391,12 +392,11 @@ func expectUpdate(t *testing.T, ch chan interface{}, testCase *testCase) {
 	}
 }
 
-func expectEmptyUpdate(t *testing.T, ch chan interface{}) {
+func expectEmptyUpdate(t *testing.T, ch chan sourceUpdate) {
 	timer := time.After(5 * time.Second)
 	for {
 		select {
-		case got := <-ch:
-			update := got.(kubetypes.PodUpdate)
+		case update := <-ch:
 			if len(update.Pods) != 0 {
 				t.Fatalf("expected empty update, got %#v", update)
 			}
@@ -425,7 +425,7 @@ func writeFile(filename string, data []byte) error {
 func changeFileName(dir, from, to string, t *testing.T) {
 	fromPath := filepath.Join(dir, from)
 	toPath := filepath.Join(dir, to)
-	if err := exec.Command("mv", fromPath, toPath).Run(); err != nil {
+	if err := os.Rename(fromPath, toPath); err != nil {
 		t.Errorf("Fail to change file name: %s", err)
 	}
 }

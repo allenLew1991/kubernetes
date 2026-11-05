@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -17,43 +19,69 @@ limitations under the License.
 package ipvs
 
 import (
-	"k8s.io/apimachinery/pkg/util/sets"
-	utilipset "k8s.io/kubernetes/pkg/util/ipset"
-	utilversion "k8s.io/kubernetes/pkg/util/version"
+	"fmt"
+	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/util/sets"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/klog/v2"
+	utilipset "k8s.io/kubernetes/pkg/proxy/ipvs/ipset"
 )
 
 const (
 	// MinIPSetCheckVersion is the min ipset version we need.  IPv6 is supported in ipset 6.x
 	MinIPSetCheckVersion = "6.0"
 
-	// KubeLoopBackIPSet is used to store endpoints dst ip:port, source ip for solving hairpin purpose.
-	KubeLoopBackIPSet = "KUBE-LOOP-BACK"
+	kubeLoopBackIPSetComment = "Kubernetes endpoints dst ip:port, source ip for solving hairpin purpose"
+	kubeLoopBackIPSet        = "KUBE-LOOP-BACK"
 
-	// KubeClusterIPSet is used to store service cluster ip + port for masquerade purpose.
-	KubeClusterIPSet = "KUBE-CLUSTER-IP"
+	kubeClusterIPSetComment = "Kubernetes service cluster ip + port for masquerade purpose"
+	kubeClusterIPSet        = "KUBE-CLUSTER-IP"
 
-	// KubeExternalIPSet is used to store service external ip + port for masquerade and filter purpose.
-	KubeExternalIPSet = "KUBE-EXTERNAL-IP"
+	kubeExternalIPSetComment = "Kubernetes service external ip + port for masquerade and filter purpose"
+	kubeExternalIPSet        = "KUBE-EXTERNAL-IP"
 
-	// KubeLoadBalancerSet is used to store service load balancer ingress ip + port, it is the service lb portal.
-	KubeLoadBalancerSet = "KUBE-LOAD-BALANCER"
+	kubeExternalIPLocalSetComment = "Kubernetes service external ip + port with externalTrafficPolicy=local"
+	kubeExternalIPLocalSet        = "KUBE-EXTERNAL-IP-LOCAL"
 
-	// KubeLoadBalancerMasqSet is used to store service load balancer ingress ip + port for masquerade purpose.
-	KubeLoadBalancerMasqSet = "KUBE-LOAD-BALANCER-MASQ"
+	kubeLoadBalancerSetComment = "Kubernetes service lb portal"
+	kubeLoadBalancerSet        = "KUBE-LOAD-BALANCER"
 
-	// KubeLoadBalancerSourceIPSet is used to store service load balancer ingress ip + port + source IP for packet filter purpose.
-	KubeLoadBalancerSourceIPSet = "KUBE-LOAD-BALANCER-SOURCE-IP"
+	kubeLoadBalancerLocalSetComment = "Kubernetes service load balancer ip + port with externalTrafficPolicy=local"
+	kubeLoadBalancerLocalSet        = "KUBE-LOAD-BALANCER-LOCAL"
 
-	// KubeLoadBalancerSourceCIDRSet is used to store service load balancer ingress ip + port + source cidr for packet filter purpose.
-	KubeLoadBalancerSourceCIDRSet = "KUBE-LOAD-BALANCER-SOURCE-CIDR"
+	kubeLoadBalancerFWSetComment = "Kubernetes service load balancer ip + port for load balancer with sourceRange"
+	kubeLoadBalancerFWSet        = "KUBE-LOAD-BALANCER-FW"
 
-	// KubeNodePortSetTCP is used to store nodeport TCP port for masquerade purpose.
-	KubeNodePortSetTCP = "KUBE-NODE-PORT-TCP"
+	kubeLoadBalancerSourceIPSetComment = "Kubernetes service load balancer ip + port + source IP for packet filter purpose"
+	kubeLoadBalancerSourceIPSet        = "KUBE-LOAD-BALANCER-SOURCE-IP"
 
-	// KubeNodePortSetUDP is used to store nodeport UDP port for masquerade purpose.
-	KubeNodePortSetUDP = "KUBE-NODE-PORT-UDP"
+	kubeLoadBalancerSourceCIDRSetComment = "Kubernetes service load balancer ip + port + source cidr for packet filter purpose"
+	kubeLoadBalancerSourceCIDRSet        = "KUBE-LOAD-BALANCER-SOURCE-CIDR"
+
+	kubeNodePortSetTCPComment = "Kubernetes nodeport TCP port for masquerade purpose"
+	kubeNodePortSetTCP        = "KUBE-NODE-PORT-TCP"
+
+	kubeNodePortLocalSetTCPComment = "Kubernetes nodeport TCP port with externalTrafficPolicy=local"
+	kubeNodePortLocalSetTCP        = "KUBE-NODE-PORT-LOCAL-TCP"
+
+	kubeNodePortSetUDPComment = "Kubernetes nodeport UDP port for masquerade purpose"
+	kubeNodePortSetUDP        = "KUBE-NODE-PORT-UDP"
+
+	kubeNodePortLocalSetUDPComment = "Kubernetes nodeport UDP port with externalTrafficPolicy=local"
+	kubeNodePortLocalSetUDP        = "KUBE-NODE-PORT-LOCAL-UDP"
+
+	kubeNodePortSetSCTPComment = "Kubernetes nodeport SCTP port for masquerade purpose with type 'hash ip:port'"
+	kubeNodePortSetSCTP        = "KUBE-NODE-PORT-SCTP-HASH"
+
+	kubeNodePortLocalSetSCTPComment = "Kubernetes nodeport SCTP port with externalTrafficPolicy=local with type 'hash ip:port'"
+	kubeNodePortLocalSetSCTP        = "KUBE-NODE-PORT-LOCAL-SCTP-HASH"
+
+	kubeHealthCheckNodePortSetComment = "Kubernetes health check node port"
+	kubeHealthCheckNodePortSet        = "KUBE-HEALTH-CHECK-NODE-PORT"
+
+	kubeIPVSSetComment = "Addresses on the ipvs interface"
+	kubeIPVSSet        = "KUBE-IPVS-IPS"
 )
 
 // IPSetVersioner can query the current ipset version.
@@ -66,78 +94,99 @@ type IPSetVersioner interface {
 type IPSet struct {
 	utilipset.IPSet
 	// activeEntries is the current active entries of the ipset.
-	activeEntries sets.String
+	activeEntries sets.Set[string]
 	// handle is the util ipset interface handle.
 	handle utilipset.Interface
 }
 
 // NewIPSet initialize a new IPSet struct
-func NewIPSet(handle utilipset.Interface, name string, setType utilipset.Type, isIPv6 bool) *IPSet {
+func NewIPSet(handle utilipset.Interface, name string, setType utilipset.Type, isIPv6 bool, comment string) *IPSet {
 	hashFamily := utilipset.ProtocolFamilyIPV4
 	if isIPv6 {
 		hashFamily = utilipset.ProtocolFamilyIPV6
+		// In dual-stack both ipv4 and ipv6 ipset's can co-exist. To
+		// ensure unique names the prefix for ipv6 is changed from
+		// "KUBE-" to "KUBE-6-". The "KUBE-" prefix is kept for
+		// backward compatibility. The maximum name length of an ipset
+		// is 31 characters which must be taken into account.  The
+		// ipv4 names are not altered to minimize the risk for
+		// problems on upgrades.
+		if strings.HasPrefix(name, "KUBE-") {
+			name = strings.Replace(name, "KUBE-", "KUBE-6-", 1)
+			if len(name) > 31 {
+				klog.InfoS("Ipset name truncated", "ipSetName", name, "truncatedName", name[:31])
+				name = name[:31]
+			}
+		}
 	}
 	set := &IPSet{
 		IPSet: utilipset.IPSet{
 			Name:       name,
 			SetType:    setType,
 			HashFamily: hashFamily,
+			Comment:    comment,
 		},
-		activeEntries: sets.NewString(),
+		activeEntries: sets.New[string](),
 		handle:        handle,
 	}
 	return set
 }
 
+func (set *IPSet) validateEntry(entry *utilipset.Entry) bool {
+	return entry.Validate(&set.IPSet)
+}
+
 func (set *IPSet) isEmpty() bool {
-	return len(set.activeEntries.UnsortedList()) == 0
+	return set.activeEntries.Len() == 0
+}
+
+func (set *IPSet) getComment() string {
+	return fmt.Sprintf("\"%s\"", set.Comment)
 }
 
 func (set *IPSet) resetEntries() {
-	set.activeEntries = sets.NewString()
+	set.activeEntries = sets.New[string]()
 }
 
 func (set *IPSet) syncIPSetEntries() {
 	appliedEntries, err := set.handle.ListEntries(set.Name)
 	if err != nil {
-		glog.Errorf("Failed to list ip set entries, error: %v", err)
+		klog.ErrorS(err, "Failed to list ip set entries")
 		return
 	}
 
 	// currentIPSetEntries represents Endpoints watched from API Server.
-	currentIPSetEntries := sets.NewString()
+	currentIPSetEntries := sets.New[string]()
 	for _, appliedEntry := range appliedEntries {
 		currentIPSetEntries.Insert(appliedEntry)
 	}
 
 	if !set.activeEntries.Equal(currentIPSetEntries) {
 		// Clean legacy entries
-		for _, entry := range currentIPSetEntries.Difference(set.activeEntries).List() {
+		for _, entry := range currentIPSetEntries.Difference(set.activeEntries).UnsortedList() {
 			if err := set.handle.DelEntry(entry, set.Name); err != nil {
 				if !utilipset.IsNotFoundError(err) {
-					glog.Errorf("Failed to delete ip set entry: %s from ip set: %s, error: %v", entry, set.Name, err)
+					klog.ErrorS(err, "Failed to delete ip set entry from ip set", "ipSetEntry", entry, "ipSet", set.Name)
 				}
 			} else {
-				glog.V(3).Infof("Successfully delete legacy ip set entry: %s from ip set: %s", entry, set.Name)
+				klog.V(3).InfoS("Successfully deleted legacy ip set entry from ip set", "ipSetEntry", entry, "ipSet", set.Name)
 			}
 		}
 		// Create active entries
-		for _, entry := range set.activeEntries.Difference(currentIPSetEntries).List() {
-			if err := set.handle.AddEntry(entry, set.Name, true); err != nil {
-				glog.Errorf("Failed to add entry: %v to ip set: %s, error: %v", entry, set.Name, err)
+		for _, entry := range set.activeEntries.Difference(currentIPSetEntries).UnsortedList() {
+			if err := set.handle.AddEntry(entry, &set.IPSet, true); err != nil {
+				klog.ErrorS(err, "Failed to add ip set entry to ip set", "ipSetEntry", entry, "ipSet", set.Name)
 			} else {
-				glog.V(3).Infof("Successfully add entry: %v to ip set: %s", entry, set.Name)
+				klog.V(3).InfoS("Successfully added ip set entry to ip set", "ipSetEntry", entry, "ipSet", set.Name)
 			}
 		}
 	}
 }
 
-func ensureIPSets(ipSets ...*IPSet) error {
-	for _, set := range ipSets {
-		if err := set.handle.CreateSet(&set.IPSet, true); err != nil {
-			glog.Errorf("Failed to make sure ip set: %v exist, error: %v", set, err)
-			return err
-		}
+func ensureIPSet(set *IPSet) error {
+	if err := set.handle.CreateSet(&set.IPSet, true); err != nil {
+		klog.ErrorS(err, "Failed to make sure existence of ip set", "ipSet", set)
+		return err
 	}
 	return nil
 }
@@ -146,13 +195,13 @@ func ensureIPSets(ipSets ...*IPSet) error {
 func checkMinVersion(vstring string) bool {
 	version, err := utilversion.ParseGeneric(vstring)
 	if err != nil {
-		glog.Errorf("vstring (%s) is not a valid version string: %v", vstring, err)
+		klog.ErrorS(err, "Got invalid version string", "versionString", vstring)
 		return false
 	}
 
 	minVersion, err := utilversion.ParseGeneric(MinIPSetCheckVersion)
 	if err != nil {
-		glog.Errorf("MinCheckVersion (%s) is not a valid version string: %v", MinIPSetCheckVersion, err)
+		klog.ErrorS(err, "Got invalid version string", "versionString", MinIPSetCheckVersion)
 		return false
 	}
 	return !version.LessThan(minVersion)

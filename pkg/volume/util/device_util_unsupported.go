@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -27,4 +27,16 @@ func (handler *deviceHandler) FindMultipathDeviceForDevice(device string) string
 func (handler *deviceHandler) FindSlaveDevicesOnMultipath(disk string) []string {
 	out := []string{}
 	return out
+}
+
+// GetISCSIPortalHostMapForTarget unsupported returns nil
+func (handler *deviceHandler) GetISCSIPortalHostMapForTarget(targetIqn string) (map[string]int, error) {
+	portalHostMap := make(map[string]int)
+	return portalHostMap, nil
+}
+
+// FindDevicesForISCSILun unsupported returns nil
+func (handler *deviceHandler) FindDevicesForISCSILun(targetIqn string, lun int) ([]string, error) {
+	devices := []string{}
+	return devices, nil
 }

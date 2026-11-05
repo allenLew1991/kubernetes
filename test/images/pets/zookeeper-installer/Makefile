@@ -13,9 +13,9 @@
 # limitations under the License.
 
 SRCS = peer-finder
+OS ?= linux
 ARCH ?= amd64
 TARGET ?= $(CURDIR)
-GOLANG_VERSION ?= latest
 SRC_DIR = pets/peer-finder
 export
 

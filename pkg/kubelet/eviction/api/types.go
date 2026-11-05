@@ -32,14 +32,28 @@ const (
 	SignalNodeFsAvailable Signal = "nodefs.available"
 	// SignalNodeFsInodesFree is amount of inodes available on filesystem that kubelet uses for volumes, daemon logs, etc.
 	SignalNodeFsInodesFree Signal = "nodefs.inodesFree"
-	// SignalImageFsAvailable is amount of storage available on filesystem that container runtime uses for storing images and container writable layers.
+	// SignalImageFsAvailable is amount of storage available on filesystem that container runtime uses for storing images layers.
+	// If the container filesystem and image filesystem are not separate,
+	// than imagefs can store both image layers and writeable layers.
 	SignalImageFsAvailable Signal = "imagefs.available"
-	// SignalImageFsInodesFree is amount of inodes available on filesystem that container runtime uses for storing images and container writeable layers.
+	// SignalImageFsInodesFree is amount of inodes available on filesystem that container runtime uses for storing images layers.
+	// If the container filesystem and image filesystem are not separate,
+	// than imagefs can store both image layers and writeable layers.
 	SignalImageFsInodesFree Signal = "imagefs.inodesFree"
+	// SignalContainerFsAvailable is amount of storage available on filesystem that container runtime uses for container writable layers.
+	// In case of a single filesystem, containerfs=nodefs.
+	// In case of a image filesystem, containerfs=imagefs.
+	// We will override user settings and set to either imagefs or nodefs depending on configuration.
+	SignalContainerFsAvailable Signal = "containerfs.available"
+	// SignalContainerFsInodesFree is amount of inodes available on filesystem that container runtime uses for container writable layers.
+	// In case of a single filesystem, containerfs=nodefs.
+	// In case of a image filesystem, containerfs=imagefs.
+	// We will override user settings and set to either imagefs or nodefs depending on configuration.
+	SignalContainerFsInodesFree Signal = "containerfs.inodesFree"
 	// SignalAllocatableMemoryAvailable is amount of memory available for pod allocation (i.e. allocatable - workingSet (of pods), in bytes.
 	SignalAllocatableMemoryAvailable Signal = "allocatableMemory.available"
-	// SignalAllocatableNodeFsAvailable is amount of local storage available for pod allocation
-	SignalAllocatableNodeFsAvailable Signal = "allocatableNodeFs.available"
+	// SignalPIDAvailable is amount of PID available for pod allocation
+	SignalPIDAvailable Signal = "pid.available"
 )
 
 // ThresholdOperator is the operator used to express a Threshold.
@@ -63,8 +77,10 @@ var OpForSignal = map[Signal]ThresholdOperator{
 	SignalNodeFsInodesFree:           OpLessThan,
 	SignalImageFsAvailable:           OpLessThan,
 	SignalImageFsInodesFree:          OpLessThan,
+	SignalContainerFsAvailable:       OpLessThan,
+	SignalContainerFsInodesFree:      OpLessThan,
 	SignalAllocatableMemoryAvailable: OpLessThan,
-	SignalAllocatableNodeFsAvailable: OpLessThan,
+	SignalPIDAvailable:               OpLessThan,
 }
 
 // ThresholdValue is a value holder that abstracts literal versus percentage based quantity
@@ -94,7 +110,8 @@ type Threshold struct {
 // GetThresholdQuantity returns the expected quantity value for a thresholdValue
 func GetThresholdQuantity(value ThresholdValue, capacity *resource.Quantity) *resource.Quantity {
 	if value.Quantity != nil {
-		return value.Quantity.Copy()
+		res := value.Quantity.DeepCopy()
+		return &res
 	}
 	return resource.NewQuantity(int64(float64(capacity.Value())*float64(value.Percentage)), resource.BinarySI)
 }

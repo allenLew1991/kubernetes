@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 // +k8s:deepcopy-gen=package
-// +groupName=example2.k8s.io
+// +groupName=example2.apiserver.k8s.io
 //
 // package example2 contains an example API whose internal version is defined in
 // another group ("example"). This happens if a type is moved to a different
 // group. It's not recommended to move types across groups, though Kubernetes
 // have a few cases due to historical reasons. This package is for tests.
-package example2 // import "k8s.io/apiserver/pkg/apis/example2"
+package example2

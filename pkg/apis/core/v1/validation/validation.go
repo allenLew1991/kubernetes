@@ -17,109 +17,21 @@ limitations under the License.
 package validation
 
 import (
-	"fmt"
-	"strings"
-
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/kubernetes/pkg/apis/core/helper"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 )
 
 const isNegativeErrorMsg string = `must be greater than or equal to 0`
-const isNotIntegerErrorMsg string = `must be an integer`
 
-func ValidateResourceRequirements(requirements *v1.ResourceRequirements, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-	limPath := fldPath.Child("limits")
-	reqPath := fldPath.Child("requests")
-	for resourceName, quantity := range requirements.Limits {
-		fldPath := limPath.Key(string(resourceName))
-		// Validate resource name.
-		allErrs = append(allErrs, validateContainerResourceName(string(resourceName), fldPath)...)
+var validLogStreams = sets.New[string](
+	v1.LogStreamStdout,
+	v1.LogStreamStderr,
+	v1.LogStreamAll,
+)
 
-		// Validate resource quantity.
-		allErrs = append(allErrs, ValidateResourceQuantityValue(string(resourceName), quantity, fldPath)...)
-
-	}
-	for resourceName, quantity := range requirements.Requests {
-		fldPath := reqPath.Key(string(resourceName))
-		// Validate resource name.
-		allErrs = append(allErrs, validateContainerResourceName(string(resourceName), fldPath)...)
-		// Validate resource quantity.
-		allErrs = append(allErrs, ValidateResourceQuantityValue(string(resourceName), quantity, fldPath)...)
-
-		// Check that request <= limit.
-		limitQuantity, exists := requirements.Limits[resourceName]
-		if exists {
-			// For GPUs, not only requests can't exceed limits, they also can't be lower, i.e. must be equal.
-			if quantity.Cmp(limitQuantity) != 0 && !v1helper.IsOvercommitAllowed(resourceName) {
-				allErrs = append(allErrs, field.Invalid(reqPath, quantity.String(), fmt.Sprintf("must be equal to %s limit", resourceName)))
-			} else if quantity.Cmp(limitQuantity) > 0 {
-				allErrs = append(allErrs, field.Invalid(reqPath, quantity.String(), fmt.Sprintf("must be less than or equal to %s limit", resourceName)))
-			}
-		} else if resourceName == v1.ResourceNvidiaGPU {
-			allErrs = append(allErrs, field.Invalid(reqPath, quantity.String(), fmt.Sprintf("must be equal to %s request", v1.ResourceNvidiaGPU)))
-		}
-	}
-
-	return allErrs
-}
-
-func validateContainerResourceName(value string, fldPath *field.Path) field.ErrorList {
-	allErrs := validateResourceName(value, fldPath)
-	if len(strings.Split(value, "/")) == 1 {
-		if !helper.IsStandardContainerResourceName(value) {
-			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource for containers"))
-		}
-	}
-	return allErrs
-}
-
-// ValidateResourceQuantityValue enforces that specified quantity is valid for specified resource
-func ValidateResourceQuantityValue(resource string, value resource.Quantity, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, ValidateNonnegativeQuantity(value, fldPath)...)
-	if helper.IsIntegerResourceName(resource) {
-		if value.MilliValue()%int64(1000) != int64(0) {
-			allErrs = append(allErrs, field.Invalid(fldPath, value, isNotIntegerErrorMsg))
-		}
-	}
-	return allErrs
-}
-
-// Validates that a Quantity is not negative
-func ValidateNonnegativeQuantity(value resource.Quantity, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-	if value.Cmp(resource.Quantity{}) < 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath, value.String(), isNegativeErrorMsg))
-	}
-	return allErrs
-}
-
-// Validate compute resource typename.
-// Refer to docs/design/resources.md for more details.
-func validateResourceName(value string, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-	for _, msg := range validation.IsQualifiedName(value) {
-		allErrs = append(allErrs, field.Invalid(fldPath, value, msg))
-	}
-	if len(allErrs) != 0 {
-		return allErrs
-	}
-
-	if len(strings.Split(value, "/")) == 1 {
-		if !helper.IsStandardResourceName(value) {
-			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource type or fully qualified"))
-		}
-	}
-
-	return allErrs
-}
-
+// ValidatePodLogOptions checks if options that are set are at the correct
+// value. Any incorrect value will be returned to the ErrorList.
 func ValidatePodLogOptions(opts *v1.PodLogOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if opts.TailLines != nil && *opts.TailLines < 0 {
@@ -136,27 +48,13 @@ func ValidatePodLogOptions(opts *v1.PodLogOptions) field.ErrorList {
 			allErrs = append(allErrs, field.Invalid(field.NewPath("sinceSeconds"), *opts.SinceSeconds, "must be greater than 0"))
 		}
 	}
-	return allErrs
-}
-
-func AccumulateUniqueHostPorts(containers []v1.Container, accumulator *sets.String, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-
-	for ci, ctr := range containers {
-		idxPath := fldPath.Index(ci)
-		portsPath := idxPath.Child("ports")
-		for pi := range ctr.Ports {
-			idxPath := portsPath.Index(pi)
-			port := ctr.Ports[pi].HostPort
-			if port == 0 {
-				continue
-			}
-			str := fmt.Sprintf("%d/%s", port, ctr.Ports[pi].Protocol)
-			if accumulator.Has(str) {
-				allErrs = append(allErrs, field.Duplicate(idxPath.Child("hostPort"), str))
-			} else {
-				accumulator.Insert(str)
-			}
+	// opts.Stream can be nil because defaulting might not apply if no URL params are provided.
+	if opts.Stream != nil {
+		if !validLogStreams.Has(*opts.Stream) {
+			allErrs = append(allErrs, field.NotSupported(field.NewPath("stream"), *opts.Stream, validLogStreams.UnsortedList()))
+		}
+		if *opts.Stream != v1.LogStreamAll && opts.TailLines != nil {
+			allErrs = append(allErrs, field.Forbidden(field.NewPath(""), "`tailLines` and specific `stream` are mutually exclusive for now"))
 		}
 	}
 	return allErrs

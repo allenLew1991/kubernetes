@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -18,10 +18,20 @@ limitations under the License.
 
 package eviction
 
-import "fmt"
+import (
+	"context"
 
-// NewMemCGThresholdNotifier sends notifications when a cgroup threshold
-// is crossed (in either direction) for a given cgroup attribute
-func NewMemCGThresholdNotifier(path, attribute, threshold, description string, handler thresholdNotifierHandlerFunc) (ThresholdNotifier, error) {
-	return nil, fmt.Errorf("threshold notification not supported")
+	"k8s.io/klog/v2"
+)
+
+// NewCgroupNotifier creates a cgroup notifier that does nothing because cgroups do not exist on non-linux systems.
+func NewCgroupNotifier(logger klog.Logger, path, attribute string, threshold int64) (CgroupNotifier, error) {
+	logger.V(5).Info("cgroup notifications not supported")
+	return &unsupportedThresholdNotifier{}, nil
 }
+
+type unsupportedThresholdNotifier struct{}
+
+func (*unsupportedThresholdNotifier) Start(context.Context, chan<- struct{}) {}
+
+func (*unsupportedThresholdNotifier) Stop() {}

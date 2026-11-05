@@ -1,4 +1,4 @@
-// +build cgo,linux
+//go:build linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -19,27 +19,37 @@ limitations under the License.
 package cadvisor
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"path"
-	"strconv"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/google/cadvisor/cache/memory"
-	cadvisormetrics "github.com/google/cadvisor/container"
-	"github.com/google/cadvisor/events"
-	cadvisorhttp "github.com/google/cadvisor/http"
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"github.com/google/cadvisor/manager"
-	"github.com/google/cadvisor/metrics"
-	"github.com/google/cadvisor/utils/sysfs"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/kubelet/types"
+	// Register supported container handlers.
+	_ "github.com/google/cadvisor/lib/container/containerd/install"
+	_ "github.com/google/cadvisor/lib/container/crio/install"
+	_ "github.com/google/cadvisor/lib/container/systemd/install"
+
+	// Register filesystem plugins needed for container stats.
+	_ "github.com/google/cadvisor/lib/fs/btrfs/install"
+	_ "github.com/google/cadvisor/lib/fs/nfs/install"
+	_ "github.com/google/cadvisor/lib/fs/overlay/install"
+	_ "github.com/google/cadvisor/lib/fs/tmpfs/install"
+	_ "github.com/google/cadvisor/lib/fs/vfs/install"
+	_ "github.com/google/cadvisor/lib/fs/zfs/install"
+
+	"github.com/google/cadvisor/lib/cache/memory"
+	cadvisormetrics "github.com/google/cadvisor/lib/container"
+	"github.com/google/cadvisor/lib/manager"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
+	"github.com/google/cadvisor/lib/utils/sysfs"
+	"github.com/opencontainers/cgroups"
+	cgroupfs2 "github.com/opencontainers/cgroups/fs2"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/ptr"
 )
 
 type cadvisorClient struct {
@@ -71,50 +81,46 @@ func init() {
 			f.DefValue = defaultValue
 			f.Value.Set(defaultValue)
 		} else {
-			glog.Errorf("Expected cAdvisor flag %q not found", name)
+			ctx := context.Background()
+			klog.FromContext(ctx).Error(nil, "Expected cAdvisor flag not found", "flag", name)
 		}
 	}
 }
 
-func containerLabels(c *cadvisorapi.ContainerInfo) map[string]string {
-	// Prometheus requires that all metrics in the same family have the same labels,
-	// so we arrange to supply blank strings for missing labels
-	var name, image, podName, namespace, containerName string
-	if len(c.Aliases) > 0 {
-		name = c.Aliases[0]
-	}
-	image = c.Spec.Image
-	if v, ok := c.Spec.Labels[types.KubernetesPodNameLabel]; ok {
-		podName = v
-	}
-	if v, ok := c.Spec.Labels[types.KubernetesPodNamespaceLabel]; ok {
-		namespace = v
-	}
-	if v, ok := c.Spec.Labels[types.KubernetesContainerNameLabel]; ok {
-		containerName = v
-	}
-	set := map[string]string{
-		metrics.LabelID:    c.Name,
-		metrics.LabelName:  name,
-		metrics.LabelImage: image,
-		"pod_name":         podName,
-		"namespace":        namespace,
-		"container_name":   containerName,
-	}
-	return set
-}
-
-// New creates a cAdvisor and exports its API on the specified port if port > 0.
-func New(address string, port uint, imageFsInfoProvider ImageFsInfoProvider, rootPath string, usingLegacyStats bool) (Interface, error) {
+// New creates a new cAdvisor Interface for linux systems.
+func New(logger klog.Logger, imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupRoots []string, usingLegacyStats, localStorageCapacityIsolation, disableContainerDiscovery bool) (Interface, error) {
 	sysFs := sysfs.NewRealSysFs()
 
-	ignoreMetrics := cadvisormetrics.MetricSet{cadvisormetrics.NetworkTcpUsageMetrics: struct{}{}, cadvisormetrics.NetworkUdpUsageMetrics: struct{}{}}
-	if !usingLegacyStats {
-		ignoreMetrics[cadvisormetrics.DiskUsageMetrics] = struct{}{}
+	includedMetrics := cadvisormetrics.MetricSet{
+		cadvisormetrics.CpuUsageMetrics:     struct{}{},
+		cadvisormetrics.MemoryUsageMetrics:  struct{}{},
+		cadvisormetrics.DiskIOMetrics:       struct{}{},
+		cadvisormetrics.NetworkUsageMetrics: struct{}{},
+		cadvisormetrics.ProcessMetrics:      struct{}{},
+		cadvisormetrics.OOMMetrics:          struct{}{},
 	}
 
-	// Create and start the cAdvisor container manager.
-	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, maxHousekeepingInterval, allowDynamicHousekeeping, ignoreMetrics, http.DefaultClient)
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		if IsPsiEnabled(logger) {
+			includedMetrics[cadvisormetrics.PressureMetrics] = struct{}{}
+		} else {
+			logger.Info("PSI support not available")
+		}
+	}
+
+	if usingLegacyStats || localStorageCapacityIsolation {
+		includedMetrics[cadvisormetrics.DiskUsageMetrics] = struct{}{}
+	}
+
+	duration := maxHousekeepingInterval
+	housekeepingConfig := manager.HousekeepingConfig{
+		Interval:                  &duration,
+		AllowDynamic:              ptr.To(allowDynamicHousekeeping),
+		DisableContainerDiscovery: disableContainerDiscovery,
+	}
+
+	// Create the cAdvisor container manager.
+	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, housekeepingConfig, includedMetrics, cgroupRoots, nil /* containerEnvMetadataWhiteList */, "" /* perfEventsFile */, time.Duration(0) /*resctrlInterval*/)
 	if err != nil {
 		return nil, err
 	}
@@ -129,64 +135,18 @@ func New(address string, port uint, imageFsInfoProvider ImageFsInfoProvider, roo
 		}
 	}
 
-	cadvisorClient := &cadvisorClient{
+	return &cadvisorClient{
 		imageFsInfoProvider: imageFsInfoProvider,
 		rootPath:            rootPath,
 		Manager:             m,
-	}
-
-	err = cadvisorClient.exportHTTP(address, port)
-	if err != nil {
-		return nil, err
-	}
-	return cadvisorClient, nil
+	}, nil
 }
 
 func (cc *cadvisorClient) Start() error {
 	return cc.Manager.Start()
 }
 
-func (cc *cadvisorClient) exportHTTP(address string, port uint) error {
-	// Register the handlers regardless as this registers the prometheus
-	// collector properly.
-	mux := http.NewServeMux()
-	err := cadvisorhttp.RegisterHandlers(mux, cc, "", "", "", "")
-	if err != nil {
-		return err
-	}
-
-	cadvisorhttp.RegisterPrometheusHandler(mux, cc, "/metrics", containerLabels)
-
-	// Only start the http server if port > 0
-	if port > 0 {
-		serv := &http.Server{
-			Addr:    net.JoinHostPort(address, strconv.Itoa(int(port))),
-			Handler: mux,
-		}
-
-		// TODO(vmarmol): Remove this when the cAdvisor port is once again free.
-		// If export failed, retry in the background until we are able to bind.
-		// This allows an existing cAdvisor to be killed before this one registers.
-		go func() {
-			defer runtime.HandleCrash()
-
-			err := serv.ListenAndServe()
-			for err != nil {
-				glog.Infof("Failed to register cAdvisor on port %d, retrying. Error: %v", port, err)
-				time.Sleep(time.Minute)
-				err = serv.ListenAndServe()
-			}
-		}()
-	}
-
-	return nil
-}
-
-func (cc *cadvisorClient) ContainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error) {
-	return cc.GetContainerInfo(name, req)
-}
-
-func (cc *cadvisorClient) ContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error) {
+func (cc *cadvisorClient) ContainerInfoV2(name string, options cadvisorapi.RequestOptions) (map[string]cadvisorapi.ContainerInfo, error) {
 	return cc.GetContainerInfoV2(name, options)
 }
 
@@ -194,64 +154,62 @@ func (cc *cadvisorClient) VersionInfo() (*cadvisorapi.VersionInfo, error) {
 	return cc.GetVersionInfo()
 }
 
-func (cc *cadvisorClient) SubcontainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (map[string]*cadvisorapi.ContainerInfo, error) {
-	infos, err := cc.SubcontainersInfo(name, req)
-	if err != nil && len(infos) == 0 {
-		return nil, err
-	}
-
-	result := make(map[string]*cadvisorapi.ContainerInfo, len(infos))
-	for _, info := range infos {
-		result[info.Name] = info
-	}
-	return result, err
-}
-
-func (cc *cadvisorClient) MachineInfo() (*cadvisorapi.MachineInfo, error) {
+func (cc *cadvisorClient) MachineInfo(logger klog.Logger) (*cadvisorapi.MachineInfo, error) {
 	return cc.GetMachineInfo()
 }
 
-func (cc *cadvisorClient) ImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
+func (cc *cadvisorClient) ImagesFsInfo(ctx context.Context) (cadvisorapi.FsInfo, error) {
 	label, err := cc.imageFsInfoProvider.ImageFsInfoLabel()
 	if err != nil {
-		return cadvisorapiv2.FsInfo{}, err
+		return cadvisorapi.FsInfo{}, err
 	}
-	return cc.getFsInfo(label)
+	return cc.getFsInfo(ctx, label)
 }
 
-func (cc *cadvisorClient) RootFsInfo() (cadvisorapiv2.FsInfo, error) {
+// IsPsiEnabled checks whether PSI (Pressure Stall Information) is available on
+// the host by opening the root cgroup's cpu.pressure file using the same
+// opencontainers/cgroups library that cAdvisor uses to read actual PSI values.
+// PSI is a single kernel feature (CONFIG_PSI / boot param "psi=") so checking
+// cpu.pressure alone is sufficient to determine support for all three resources
+// (cpu, memory, io).
+func IsPsiEnabled(logger klog.Logger) bool {
+	return isPsiEnabled(logger, cgroupfs2.UnifiedMountpoint, "cpu.pressure")
+}
+
+func isPsiEnabled(logger klog.Logger, cgroupDir, psiFile string) bool {
+	f, err := cgroups.OpenFile(cgroupDir, psiFile, os.O_RDONLY)
+	if err != nil {
+		logger.V(4).Info("PSI not available", "dir", cgroupDir, "file", psiFile, "err", err)
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
+func (cc *cadvisorClient) RootFsInfo() (cadvisorapi.FsInfo, error) {
 	return cc.GetDirFsInfo(cc.rootPath)
 }
 
-func (cc *cadvisorClient) getFsInfo(label string) (cadvisorapiv2.FsInfo, error) {
+func (cc *cadvisorClient) getFsInfo(ctx context.Context, label string) (cadvisorapi.FsInfo, error) {
 	res, err := cc.GetFsInfo(label)
 	if err != nil {
-		return cadvisorapiv2.FsInfo{}, err
+		return cadvisorapi.FsInfo{}, err
 	}
 	if len(res) == 0 {
-		return cadvisorapiv2.FsInfo{}, fmt.Errorf("failed to find information for the filesystem labeled %q", label)
+		return cadvisorapi.FsInfo{}, fmt.Errorf("failed to find information for the filesystem labeled %q", label)
 	}
 	// TODO(vmarmol): Handle this better when a label has more than one image filesystem.
 	if len(res) > 1 {
-		glog.Warningf("More than one filesystem labeled %q: %#v. Only using the first one", label, res)
+		klog.FromContext(ctx).Info("More than one filesystem labeled. Only using the first one", "label", label, "fileSystem", res)
 	}
 
 	return res[0], nil
 }
 
-func (cc *cadvisorClient) WatchEvents(request *events.Request) (*events.EventChannel, error) {
-	return cc.WatchForEvents(request)
-}
-
-// HasDedicatedImageFs returns true if the imagefs has a dedicated device.
-func (cc *cadvisorClient) HasDedicatedImageFs() (bool, error) {
-	imageFsInfo, err := cc.ImagesFsInfo()
+func (cc *cadvisorClient) ContainerFsInfo(ctx context.Context) (cadvisorapi.FsInfo, error) {
+	label, err := cc.imageFsInfoProvider.ContainerFsInfoLabel()
 	if err != nil {
-		return false, err
+		return cadvisorapi.FsInfo{}, err
 	}
-	rootFsInfo, err := cc.RootFsInfo()
-	if err != nil {
-		return false, err
-	}
-	return imageFsInfo.Device != rootFsInfo.Device, nil
+	return cc.getFsInfo(ctx, label)
 }

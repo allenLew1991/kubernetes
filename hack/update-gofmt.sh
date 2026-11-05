@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -20,27 +20,32 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
-kube::golang::verify_go_version
+kube::golang::setup_env
 
 cd "${KUBE_ROOT}"
 
-find_files() {
-  find . -not \( \
-      \( \
-        -wholename './output' \
-        -o -wholename './_output' \
-        -o -wholename './_gopath' \
-        -o -wholename './release' \
-        -o -wholename './target' \
-        -o -wholename '*/third_party/*' \
-        -o -wholename '*/vendor/*' \
-        -o -wholename './staging/src/k8s.io/client-go/*vendor/*' \
-      \) -prune \
-    \) -name '*.go'
+function git_find() {
+    # Similar to find but faster and easier to understand.  We want to include
+    # modified and untracked files because this might be running against code
+    # which is not tracked by git yet.
+    git ls-files -cmo --exclude-standard \
+        ':!:vendor/*'        `# catches vendor/...` \
+        ':!:*/vendor/*'      `# catches any subdir/vendor/...` \
+        ':!:third_party/*'   `# catches third_party/...` \
+        ':!:*/third_party/*' `# catches third_party/...` \
+        ':!:*/testdata/*'    `# catches any subdir/testdata/...` \
+        ':(glob)**/*.go' \
+        "$@"
 }
+# GOTOOLCHAIN has no effect on the version of gofmt.
+# We need to find right gofmt, otherwise the one in PATH will be used.
+gofmt="$(go env GOROOT)/bin/gofmt"
+if [[ ! -x "${gofmt}" ]]; then
+  echo "Failed to find $gofmt" >&2
+  exit 1
+fi
 
-GOFMT="gofmt -s -w"
-find_files | xargs $GOFMT
+git_find -z | xargs -0 "${gofmt}" -s -w

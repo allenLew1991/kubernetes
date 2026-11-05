@@ -23,13 +23,13 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestSimpleQueue(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
-	q := newDelayingQueue(fakeClock, "")
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	q := NewDelayingQueueWithConfig(DelayingQueueConfig{Clock: fakeClock})
 
 	first := "foo"
 
@@ -60,7 +60,7 @@ func TestSimpleQueue(t *testing.T) {
 
 		return false, nil
 	})
-	if err != wait.ErrWaitTimeout {
+	if !wait.Interrupted(err) {
 		t.Errorf("expected timeout, got: %v", err)
 	}
 
@@ -70,8 +70,8 @@ func TestSimpleQueue(t *testing.T) {
 }
 
 func TestDeduping(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
-	q := newDelayingQueue(fakeClock, "")
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	q := NewDelayingQueueWithConfig(DelayingQueueConfig{Clock: fakeClock})
 
 	first := "foo"
 
@@ -123,14 +123,11 @@ func TestDeduping(t *testing.T) {
 	if q.Len() != 0 {
 		t.Errorf("should not have added")
 	}
-	if q.Len() != 0 {
-		t.Errorf("should not have added")
-	}
 }
 
 func TestAddTwoFireEarly(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
-	q := newDelayingQueue(fakeClock, "")
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	q := NewDelayingQueueWithConfig(DelayingQueueConfig{Clock: fakeClock})
 
 	first := "foo"
 	second := "bar"
@@ -178,8 +175,8 @@ func TestAddTwoFireEarly(t *testing.T) {
 }
 
 func TestCopyShifting(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
-	q := newDelayingQueue(fakeClock, "")
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	q := NewDelayingQueueWithConfig(DelayingQueueConfig{Clock: fakeClock})
 
 	first := "foo"
 	second := "bar"
@@ -216,15 +213,13 @@ func TestCopyShifting(t *testing.T) {
 }
 
 func BenchmarkDelayingQueue_AddAfter(b *testing.B) {
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-
-	fakeClock := clock.NewFakeClock(time.Now())
-	q := newDelayingQueue(fakeClock, "")
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	q := NewTypedDelayingQueueWithConfig(TypedDelayingQueueConfig[string]{Clock: fakeClock})
 
 	// Add items
 	for n := 0; n < b.N; n++ {
 		data := fmt.Sprintf("%d", n)
-		q.AddAfter(data, time.Duration(r.Int63n(int64(10*time.Minute))))
+		q.AddAfter(data, time.Duration(rand.Int63n(int64(10*time.Minute))))
 	}
 
 	// Exercise item removal as well
@@ -246,7 +241,7 @@ func waitForAdded(q DelayingInterface, depth int) error {
 
 func waitForWaitingQueueToFill(q DelayingInterface) error {
 	return wait.Poll(1*time.Millisecond, 10*time.Second, func() (done bool, err error) {
-		if len(q.(*delayingType).waitingForAddCh) == 0 {
+		if len(q.(*pausableDelayingType[any]).waitingForAddCh) == 0 {
 			return true, nil
 		}
 

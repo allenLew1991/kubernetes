@@ -41,6 +41,26 @@ func TestUnstructuredList(t *testing.T) {
 	assert.Equal(t, "test", val)
 }
 
+func TestUnstructuredListShardInfo(t *testing.T) {
+	list := &UnstructuredList{Object: map[string]interface{}{"kind": "List", "apiVersion": "v1"}}
+	assert.Nil(t, list.GetShardInfo())
+
+	selector := "shardRange(object.metadata.uid, '0x0000000000000000', '0x8000000000000000')"
+	list.SetShardInfo(&metav1.ShardInfo{Selector: selector})
+	assert.Equal(t, &metav1.ShardInfo{Selector: selector}, list.GetShardInfo())
+
+	val, found, err := NestedString(list.UnstructuredContent(), "metadata", "shardInfo", "selector")
+	require.True(t, found)
+	require.NoError(t, err)
+	assert.Equal(t, selector, val)
+
+	list.SetShardInfo(nil)
+	assert.Nil(t, list.GetShardInfo())
+	_, found, err = NestedFieldNoCopy(list.Object, "metadata", "shardInfo")
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
 func TestNilDeletionTimestamp(t *testing.T) {
 	var u Unstructured
 	del := u.GetDeletionTimestamp()
@@ -71,7 +91,7 @@ func TestEmptyCreationTimestampIsOmitted(t *testing.T) {
 	// set an initial creationTimestamp and ensure the field exists
 	u.SetCreationTimestamp(now)
 	metadata := u.Object["metadata"].(map[string]interface{})
-	creationTimestamp, exists := metadata["creationTimestamp"]
+	_, exists := metadata["creationTimestamp"]
 	if !exists {
 		t.Fatalf("unexpected missing creationTimestamp")
 	}
@@ -79,7 +99,7 @@ func TestEmptyCreationTimestampIsOmitted(t *testing.T) {
 	// set an empty timestamp and ensure the field no longer exists
 	u.SetCreationTimestamp(metav1.Time{})
 	metadata = u.Object["metadata"].(map[string]interface{})
-	creationTimestamp, exists = metadata["creationTimestamp"]
+	creationTimestamp, exists := metadata["creationTimestamp"]
 	if exists {
 		t.Errorf("unexpected creation timestamp field: %q", creationTimestamp)
 	}

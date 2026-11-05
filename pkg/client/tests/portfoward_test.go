@@ -18,6 +18,8 @@ package tests
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -30,11 +32,12 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/types"
+	"github.com/gorilla/websocket"
 	restclient "k8s.io/client-go/rest"
 	. "k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
-	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
+	"k8s.io/cri-streaming/pkg/streaming/portforward"
+	"k8s.io/streaming/pkg/httpstream/wsstream"
 )
 
 // fakePortForwarder simulates port forwarding for testing. It implements
@@ -51,7 +54,7 @@ type fakePortForwarder struct {
 
 var _ portforward.PortForwarder = &fakePortForwarder{}
 
-func (pf *fakePortForwarder) PortForward(name string, uid types.UID, port int32, stream io.ReadWriteCloser) error {
+func (pf *fakePortForwarder) PortForward(_ context.Context, name string, uid string, port int32, stream io.ReadWriteCloser) error {
 	defer stream.Close()
 
 	// read from the client
@@ -113,10 +116,10 @@ func TestForwardPorts(t *testing.T) {
 		serverSends map[int32]string
 	}{
 		"forward 1 port with no data either direction": {
-			ports: []string{"5000"},
+			ports: []string{":5000"},
 		},
 		"forward 2 ports with bidirectional data": {
-			ports: []string{"5001", "6000"},
+			ports: []string{":5001", ":6000"},
 			clientSends: map[int32]string{
 				5001: "abcd",
 				6000: "ghij",
@@ -129,71 +132,80 @@ func TestForwardPorts(t *testing.T) {
 	}
 
 	for testName, test := range tests {
-		server := httptest.NewServer(fakePortForwardServer(t, testName, test.serverSends, test.clientSends))
+		t.Run(testName, func(t *testing.T) {
+			server := httptest.NewServer(fakePortForwardServer(t, testName, test.serverSends, test.clientSends))
+			defer server.Close()
 
-		transport, upgrader, err := spdy.RoundTripperFor(&restclient.Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		url, _ := url.Parse(server.URL)
-		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url)
-
-		stopChan := make(chan struct{}, 1)
-		readyChan := make(chan struct{})
-
-		pf, err := New(dialer, test.ports, stopChan, readyChan, os.Stdout, os.Stderr)
-		if err != nil {
-			t.Fatalf("%s: unexpected error calling New: %v", testName, err)
-		}
-
-		doneChan := make(chan error)
-		go func() {
-			doneChan <- pf.ForwardPorts()
-		}()
-		<-pf.Ready
-
-		for port, data := range test.clientSends {
-			clientConn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+			transport, upgrader, err := spdy.RoundTripperFor(&restclient.Config{})
 			if err != nil {
-				t.Errorf("%s: error dialing %d: %s", testName, port, err)
-				server.Close()
-				continue
+				t.Fatal(err)
 			}
-			defer clientConn.Close()
+			url, _ := url.Parse(server.URL)
+			dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url)
 
-			n, err := clientConn.Write([]byte(data))
-			if err != nil && err != io.EOF {
-				t.Errorf("%s: Error sending data '%s': %s", testName, data, err)
-				server.Close()
-				continue
-			}
-			if n == 0 {
-				t.Errorf("%s: unexpected write of 0 bytes", testName)
-				server.Close()
-				continue
-			}
-			b := make([]byte, 4)
-			n, err = clientConn.Read(b)
-			if err != nil && err != io.EOF {
-				t.Errorf("%s: Error reading data: %s", testName, err)
-				server.Close()
-				continue
-			}
-			if !bytes.Equal([]byte(test.serverSends[port]), b) {
-				t.Errorf("%s: expected to read '%s', got '%s'", testName, test.serverSends[port], b)
-				server.Close()
-				continue
-			}
-		}
-		// tell r.ForwardPorts to stop
-		close(stopChan)
+			stopChan := make(chan struct{}, 1)
+			readyChan := make(chan struct{})
 
-		// wait for r.ForwardPorts to actually return
-		err = <-doneChan
-		if err != nil {
-			t.Errorf("%s: unexpected error: %s", testName, err)
-		}
-		server.Close()
+			pf, err := New(dialer, test.ports, stopChan, readyChan, os.Stdout, os.Stderr)
+			if err != nil {
+				t.Fatalf("%s: unexpected error calling New: %v", testName, err)
+			}
+
+			doneChan := make(chan error)
+			go func() {
+				doneChan <- pf.ForwardPorts()
+			}()
+			<-pf.Ready
+
+			forwardedPorts, err := pf.GetPorts()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			remoteToLocalMap := map[int32]int32{}
+			for _, forwardedPort := range forwardedPorts {
+				remoteToLocalMap[int32(forwardedPort.Remote)] = int32(forwardedPort.Local)
+			}
+
+			clientSend := func(port int32, data string) error {
+				clientConn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", remoteToLocalMap[port]))
+				if err != nil {
+					return fmt.Errorf("%s: error dialing %d: %s", testName, port, err)
+
+				}
+				defer clientConn.Close()
+
+				n, err := clientConn.Write([]byte(data))
+				if err != nil && err != io.EOF {
+					return fmt.Errorf("%s: Error sending data '%s': %s", testName, data, err)
+				}
+				if n == 0 {
+					return fmt.Errorf("%s: unexpected write of 0 bytes", testName)
+				}
+				b := make([]byte, 4)
+				_, err = clientConn.Read(b)
+				if err != nil && err != io.EOF {
+					return fmt.Errorf("%s: Error reading data: %s", testName, err)
+				}
+				if !bytes.Equal([]byte(test.serverSends[port]), b) {
+					return fmt.Errorf("%s: expected to read '%s', got '%s'", testName, test.serverSends[port], b)
+				}
+				return nil
+			}
+			for port, data := range test.clientSends {
+				if err := clientSend(port, data); err != nil {
+					t.Error(err)
+				}
+			}
+			// tell r.ForwardPorts to stop
+			close(stopChan)
+
+			// wait for r.ForwardPorts to actually return
+			err = <-doneChan
+			if err != nil {
+				t.Errorf("%s: unexpected error: %s", testName, err)
+			}
+		})
 	}
 
 }
@@ -213,20 +225,134 @@ func TestForwardPortsReturnsErrorWhenAllBindsFailed(t *testing.T) {
 	defer close(stopChan1)
 	readyChan1 := make(chan struct{})
 
-	pf1, err := New(dialer, []string{"5555"}, stopChan1, readyChan1, os.Stdout, os.Stderr)
+	pf1, err := New(dialer, []string{":5555"}, stopChan1, readyChan1, os.Stdout, os.Stderr)
 	if err != nil {
 		t.Fatalf("error creating pf1: %v", err)
 	}
 	go pf1.ForwardPorts()
 	<-pf1.Ready
 
+	forwardedPorts, err := pf1.GetPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forwardedPorts) != 1 {
+		t.Fatalf("expected 1 forwarded port, got %#v", forwardedPorts)
+	}
+	duplicateSpec := fmt.Sprintf("%d:%d", forwardedPorts[0].Local, forwardedPorts[0].Remote)
+
 	stopChan2 := make(chan struct{}, 1)
 	readyChan2 := make(chan struct{})
-	pf2, err := New(dialer, []string{"5555"}, stopChan2, readyChan2, os.Stdout, os.Stderr)
+	pf2, err := New(dialer, []string{duplicateSpec}, stopChan2, readyChan2, os.Stdout, os.Stderr)
 	if err != nil {
 		t.Fatalf("error creating pf2: %v", err)
 	}
 	if err := pf2.ForwardPorts(); err == nil {
 		t.Fatal("expected non-nil error for pf2.ForwardPorts")
+	}
+}
+
+func TestForwardPortsWebSocketV4Framing(t *testing.T) {
+	const testPort int32 = 5001
+	const clientPayload = "abcd"
+	const serverPayload = "1234"
+
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		defer close(done)
+
+		opts, err := portforward.NewV4Options(req)
+		if err != nil {
+			t.Errorf("failed to build v4 options: %v", err)
+			return
+		}
+
+		pf := &fakePortForwarder{
+			expected: map[int32]string{testPort: clientPayload},
+			received: make(map[int32]string),
+			send:     map[int32]string{testPort: serverPayload},
+		}
+		portforward.ServePortForward(w, req, pf, "pod", "uid", opts, 0, 10*time.Second, portforward.SupportedProtocols)
+
+		got, ok := pf.received[testPort]
+		if !ok {
+			t.Errorf("server did not receive data for port %d", testPort)
+			return
+		}
+		if got != clientPayload {
+			t.Errorf("server expected %q, got %q for port %d", clientPayload, got, testPort)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + fmt.Sprintf("?port=%d", testPort)
+	dialer := &websocket.Dialer{
+		Subprotocols: []string{"v4." + wsstream.ChannelWebSocketProtocol},
+	}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	expectedPortBytes := make([]byte, 2)
+	binary.LittleEndian.PutUint16(expectedPortBytes, uint16(testPort))
+
+	seenDataPreamble := false
+	seenErrorPreamble := false
+	for !(seenDataPreamble && seenErrorPreamble) {
+		_, frame, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("failed reading websocket preamble frame: %v", err)
+		}
+		if len(frame) == 0 {
+			continue
+		}
+		channel := frame[0]
+		payload := frame[1:]
+		switch channel {
+		case 0:
+			if !bytes.Equal(expectedPortBytes, payload) {
+				t.Fatalf("unexpected data-channel preamble payload: %q", payload)
+			}
+			seenDataPreamble = true
+		case 1:
+			if !bytes.Equal(expectedPortBytes, payload) {
+				t.Fatalf("unexpected error-channel preamble payload: %q", payload)
+			}
+			seenErrorPreamble = true
+		}
+	}
+
+	frame := append([]byte{0}, []byte(clientPayload)...)
+	if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+		t.Fatalf("failed writing data frame: %v", err)
+	}
+
+	gotServerPayload := false
+	for !gotServerPayload {
+		_, frame, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("failed reading websocket response frame: %v", err)
+		}
+		if len(frame) == 0 {
+			continue
+		}
+		if frame[0] != 0 {
+			continue
+		}
+		if bytes.Equal(frame[1:], []byte(serverPayload)) {
+			gotServerPayload = true
+		}
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("failed closing websocket connection: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for websocket portforward handler to complete")
 	}
 }

@@ -17,28 +17,29 @@ limitations under the License.
 package lifecycle
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilcache "k8s.io/apimachinery/pkg/util/cache"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/utils/clock"
 )
 
 const (
-	// Name of admission plug-in
+	// PluginName indicates the name of admission plug-in
 	PluginName = "NamespaceLifecycle"
 	// how long a namespace stays in the force live lookup cache before expiration.
 	forceLiveLookupTTL = 30 * time.Second
@@ -53,7 +54,7 @@ const (
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
 	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
-		return NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
+		return NewLifecycle(sets.New[string](metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
 	})
 }
 
@@ -62,7 +63,7 @@ func Register(plugins *admission.Plugins) {
 type Lifecycle struct {
 	*admission.Handler
 	client             kubernetes.Interface
-	immortalNamespaces sets.String
+	immortalNamespaces sets.Set[string]
 	namespaceLister    corelisters.NamespaceLister
 	// forceLiveLookupCache holds a list of entries for namespaces that we have a strong reason to believe are stale in our local cache.
 	// if a namespace is in this cache, then we will ignore our local state and always fetch latest from api server.
@@ -72,7 +73,8 @@ type Lifecycle struct {
 var _ = initializer.WantsExternalKubeInformerFactory(&Lifecycle{})
 var _ = initializer.WantsExternalKubeClientSet(&Lifecycle{})
 
-func (l *Lifecycle) Admit(a admission.Attributes) error {
+// Admit makes an admission decision based on the request attributes
+func (l *Lifecycle) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
 	// prevent deletion of immortal namespaces
 	if a.GetOperation() == admission.Delete && a.GetKind().GroupKind() == v1.SchemeGroupVersion.WithKind("Namespace").GroupKind() && l.immortalNamespaces.Has(a.GetName()) {
 		return errors.NewForbidden(a.GetResource().GroupResource(), a.GetName(), fmt.Errorf("this namespace may not be deleted"))
@@ -97,6 +99,11 @@ func (l *Lifecycle) Admit(a admission.Attributes) error {
 
 	// always allow deletion of other resources
 	if a.GetOperation() == admission.Delete {
+		return nil
+	}
+
+	// always allow updates to other resources
+	if a.GetOperation() == admission.Update {
 		return nil
 	}
 
@@ -138,7 +145,7 @@ func (l *Lifecycle) Admit(a admission.Attributes) error {
 			exists = true
 		}
 		if exists {
-			glog.V(4).Infof("found %s in cache after waiting", a.GetNamespace())
+			klog.V(4).InfoS("Namespace existed in cache after waiting", "namespace", klog.KRef("", a.GetNamespace()))
 		}
 	}
 
@@ -152,14 +159,15 @@ func (l *Lifecycle) Admit(a admission.Attributes) error {
 	// refuse to operate on non-existent namespaces
 	if !exists || forceLiveLookup {
 		// as a last resort, make a call directly to storage
-		namespace, err = l.client.CoreV1().Namespaces().Get(a.GetNamespace(), metav1.GetOptions{})
+		namespace, err = l.client.CoreV1().Namespaces().Get(context.TODO(), a.GetNamespace(), metav1.GetOptions{})
 		switch {
 		case errors.IsNotFound(err):
 			return err
 		case err != nil:
 			return errors.NewInternalError(err)
 		}
-		glog.V(4).Infof("found %s via storage lookup", a.GetNamespace())
+
+		klog.V(4).InfoS("Found namespace via storage lookup", "namespace", klog.KRef("", a.GetNamespace()))
 	}
 
 	// ensure that we're not trying to create objects in terminating namespaces
@@ -168,19 +176,26 @@ func (l *Lifecycle) Admit(a admission.Attributes) error {
 			return nil
 		}
 
-		// TODO: This should probably not be a 403
-		return admission.NewForbidden(a, fmt.Errorf("unable to create new content in namespace %s because it is being terminated", a.GetNamespace()))
+		err := admission.NewForbidden(a, fmt.Errorf("unable to create new content in namespace %s because it is being terminated", a.GetNamespace()))
+		if apierr, ok := err.(*errors.StatusError); ok {
+			apierr.ErrStatus.Details.Causes = append(apierr.ErrStatus.Details.Causes, metav1.StatusCause{
+				Type:    v1.NamespaceTerminatingCause,
+				Message: fmt.Sprintf("namespace %s is being terminated", a.GetNamespace()),
+				Field:   "metadata.namespace",
+			})
+		}
+		return err
 	}
 
 	return nil
 }
 
 // NewLifecycle creates a new namespace Lifecycle admission control handler
-func NewLifecycle(immortalNamespaces sets.String) (*Lifecycle, error) {
+func NewLifecycle(immortalNamespaces sets.Set[string]) (*Lifecycle, error) {
 	return newLifecycleWithClock(immortalNamespaces, clock.RealClock{})
 }
 
-func newLifecycleWithClock(immortalNamespaces sets.String, clock utilcache.Clock) (*Lifecycle, error) {
+func newLifecycleWithClock(immortalNamespaces sets.Set[string], clock utilcache.Clock) (*Lifecycle, error) {
 	forceLiveLookupCache := utilcache.NewLRUExpireCacheWithClock(100, clock)
 	return &Lifecycle{
 		Handler:              admission.NewHandler(admission.Create, admission.Update, admission.Delete),

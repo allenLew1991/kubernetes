@@ -24,15 +24,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"k8s.io/api/core/v1"
+	"github.com/google/go-cmp/cmp"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/testing/fuzzer"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	_ "k8s.io/kubernetes/pkg/apis/extensions"
@@ -40,7 +40,7 @@ import (
 )
 
 func TestUniversalDeserializer(t *testing.T) {
-	expected := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+	expected := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test"}, TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}}
 	d := legacyscheme.Codecs.UniversalDeserializer()
 	for _, mediaType := range []string{"application/json", "application/yaml", "application/vnd.kubernetes.protobuf"} {
 		info, ok := runtime.SerializerInfoForMediaType(legacyscheme.Codecs.SupportedMediaTypes(), mediaType)
@@ -79,7 +79,7 @@ func TestAllFieldsHaveTags(t *testing.T) {
 
 func fieldsHaveProtobufTags(obj reflect.Type) error {
 	switch obj.Kind() {
-	case reflect.Slice, reflect.Map, reflect.Ptr, reflect.Array:
+	case reflect.Slice, reflect.Map, reflect.Pointer, reflect.Array:
 		return fieldsHaveProtobufTags(obj.Elem())
 	case reflect.Struct:
 		for i := 0; i < obj.NumField(); i++ {
@@ -88,7 +88,8 @@ func fieldsHaveProtobufTags(obj reflect.Type) error {
 				// TypeMeta is not included in external protobuf because we use an envelope type with TypeMeta
 				continue
 			}
-			if len(f.Tag.Get("json")) > 0 && len(f.Tag.Get("protobuf")) == 0 {
+			_, jsonTagExists := f.Tag.Lookup("json")
+			if jsonTagExists && len(f.Tag.Get("protobuf")) == 0 {
 				return fmt.Errorf("field %s in %s has a 'json' tag but no protobuf tag", f.Name, obj)
 			}
 		}
@@ -98,7 +99,7 @@ func fieldsHaveProtobufTags(obj reflect.Type) error {
 
 func TestProtobufRoundTrip(t *testing.T) {
 	obj := &v1.Pod{}
-	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs).Fuzz(obj)
+	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs).Fill(obj)
 	// InitContainers are turned into annotations by conversion.
 	obj.Spec.InitContainers = nil
 	obj.Status.InitContainerStatuses = nil
@@ -112,7 +113,7 @@ func TestProtobufRoundTrip(t *testing.T) {
 	}
 	if !apiequality.Semantic.Equalities.DeepEqual(out, obj) {
 		t.Logf("marshal\n%s", hex.Dump(data))
-		t.Fatalf("Unmarshal is unequal\n%s", diff.ObjectGoPrintDiff(out, obj))
+		t.Fatalf("Unmarshal is unequal\n%s", cmp.Diff(out, obj))
 	}
 }
 
@@ -121,7 +122,7 @@ func TestProtobufRoundTrip(t *testing.T) {
 func BenchmarkEncodeCodecProtobuf(b *testing.B) {
 	items := benchmarkItems(b)
 	width := len(items)
-	s := protobuf.NewSerializer(nil, nil, "application/arbitrary.content.type")
+	s := protobuf.NewSerializer(nil, nil)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := runtime.Encode(s, &items[i%width]); err != nil {
@@ -142,7 +143,7 @@ func BenchmarkEncodeCodecFromInternalProtobuf(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	s := protobuf.NewSerializer(nil, nil, "application/arbitrary.content.type")
+	s := protobuf.NewSerializer(nil, nil)
 	codec := legacyscheme.Codecs.EncoderForVersion(s, v1.SchemeGroupVersion)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -165,12 +166,45 @@ func BenchmarkEncodeProtobufGeneratedMarshal(b *testing.B) {
 	b.StopTimer()
 }
 
+func BenchmarkEncodeProtobufGeneratedMarshalList10(b *testing.B) {
+	item := benchmarkItemsList(b, 10)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := item.Marshal(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkEncodeProtobufGeneratedMarshalList100(b *testing.B) {
+	item := benchmarkItemsList(b, 100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := item.Marshal(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkEncodeProtobufGeneratedMarshalList1000(b *testing.B) {
+	item := benchmarkItemsList(b, 1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := item.Marshal(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+}
+
 // BenchmarkDecodeCodecToInternalProtobuf measures the cost of performing a codec decode,
 // including conversions and any type setting. This is a "full" decode.
 func BenchmarkDecodeCodecToInternalProtobuf(b *testing.B) {
 	items := benchmarkItems(b)
 	width := len(items)
-	s := protobuf.NewSerializer(legacyscheme.Scheme, legacyscheme.Scheme, "application/arbitrary.content.type")
+	s := protobuf.NewSerializer(legacyscheme.Scheme, legacyscheme.Scheme)
 	encoder := legacyscheme.Codecs.EncoderForVersion(s, v1.SchemeGroupVersion)
 	var encoded [][]byte
 	for i := range items {
@@ -191,7 +225,7 @@ func BenchmarkDecodeCodecToInternalProtobuf(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkDecodeJSON provides a baseline for regular JSON decode performance
+// BenchmarkDecodeIntoProtobuf provides a baseline for regular protobuf decode performance
 func BenchmarkDecodeIntoProtobuf(b *testing.B) {
 	items := benchmarkItems(b)
 	width := len(items)
@@ -203,14 +237,16 @@ func BenchmarkDecodeIntoProtobuf(b *testing.B) {
 		}
 		encoded[i] = data
 		validate := &v1.Pod{}
-		if err := proto.Unmarshal(data, validate); err != nil {
+		validate.Reset() // decode normally resets internally
+		if err := validate.Unmarshal(data); err != nil {
 			b.Fatalf("Failed to unmarshal %d: %v\n%#v", i, err, items[i])
 		}
 	}
 
 	for i := 0; i < b.N; i++ {
-		obj := v1.Pod{}
-		if err := proto.Unmarshal(encoded[i%width], &obj); err != nil {
+		obj := &v1.Pod{}
+		obj.Reset() // decode normally resets internally
+		if err := obj.Unmarshal(encoded[i%width]); err != nil {
 			b.Fatal(err)
 		}
 	}

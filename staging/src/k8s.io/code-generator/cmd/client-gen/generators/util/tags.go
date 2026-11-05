@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2"
 )
 
 var supportedTags = []string{
@@ -41,11 +41,14 @@ var SupportedVerbs = []string{
 	"update",
 	"updateStatus",
 	"delete",
+	"deleteWithResult",
 	"deleteCollection",
 	"get",
 	"list",
 	"watch",
 	"patch",
+	"apply",
+	"applyStatus",
 }
 
 // ReadonlyVerbs represents a list of read-only verbs.
@@ -62,6 +65,7 @@ const genClientPrefix = "genclient:"
 // extension client functions for.
 var unsupportedExtensionVerbs = []string{
 	"updateStatus",
+	"deleteWithResult",
 	"deleteCollection",
 	"watch",
 	"delete",
@@ -72,6 +76,7 @@ var unsupportedExtensionVerbs = []string{
 var inputTypeSupportedVerbs = []string{
 	"create",
 	"update",
+	"apply",
 }
 
 // resultTypeSupportedVerbs is a list of verb types that supports overriding the
@@ -82,6 +87,7 @@ var resultTypeSupportedVerbs = []string{
 	"get",
 	"list",
 	"patch",
+	"apply",
 }
 
 // Extensions allows to extend the default set of client verbs
@@ -101,7 +107,6 @@ var resultTypeSupportedVerbs = []string{
 // The 'input' is the input type used for creation (function argument).
 // The 'result' (not needed in this case) is the result type returned from the
 // client function.
-//
 type extension struct {
 	// VerbName is the name of the custom verb (Scale, Instantiate, etc..)
 	VerbName string
@@ -189,8 +194,8 @@ func MustParseClientGenTags(lines []string) Tags {
 // tags are provided.
 func ParseClientGenTags(lines []string) (Tags, error) {
 	ret := Tags{}
-	values := types.ExtractCommentTags("+", lines)
-	value := []string{}
+	values := gengo.ExtractCommentTags("+", lines)
+	var value []string
 	value, ret.GenerateClient = values["genclient"]
 	// Check the old format and error when used to avoid generating client when //+genclient=false
 	if len(value) > 0 && len(value[0]) > 0 {

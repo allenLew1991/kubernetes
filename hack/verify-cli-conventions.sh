@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Kubernetes Authors.
 #
@@ -14,23 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script checks the description format of help message of kubectl command
+# is valid or not. And this checking is done for all kubectl sub-commands.
+# Usage: `hack/verify-cli-conventions.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
 
-BINS=(
-	cmd/clicheck
-)
-make -C "${KUBE_ROOT}" WHAT="${BINS[*]}"
+GOPROXY=off go install ./cmd/clicheck
 
-clicheck=$(kube::util::find-binary "clicheck")
-
-if ! output=`$clicheck 2>&1`
+if ! output=$(clicheck 2>&1)
 then
 	echo "$output"
 	echo

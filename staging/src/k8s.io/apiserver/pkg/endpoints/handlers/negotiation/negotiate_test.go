@@ -17,12 +17,19 @@ limitations under the License.
 package negotiation
 
 import (
+	"mime"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
 
 // statusError is an object that can be converted into an metav1.Status
@@ -39,7 +46,23 @@ type fakeNegotiater struct {
 func (n *fakeNegotiater) SupportedMediaTypes() []runtime.SerializerInfo {
 	var out []runtime.SerializerInfo
 	for _, s := range n.types {
-		info := runtime.SerializerInfo{Serializer: n.serializer, MediaType: s, EncodesAsText: true}
+		mediaType, _, err := mime.ParseMediaType(s)
+		if err != nil {
+			panic(err)
+		}
+		parts := strings.SplitN(mediaType, "/", 2)
+		if len(parts) == 1 {
+			// this is an error on the server side
+			parts = append(parts, "")
+		}
+
+		info := runtime.SerializerInfo{
+			Serializer:       n.serializer,
+			MediaType:        s,
+			MediaTypeType:    parts[0],
+			MediaTypeSubType: parts[1],
+			EncodesAsText:    true,
+		}
 		for _, t := range n.streamTypes {
 			if t == s {
 				info.StreamSerializer = &runtime.StreamSerializerInfo{
@@ -184,7 +207,7 @@ func TestNegotiate(t *testing.T) {
 		{
 			req: &http.Request{
 				Header: http.Header{
-					"Accept": []string{"application/json;as=BOGUS;v=v1alpha1;g=meta.k8s.io, application/json"},
+					"Accept": []string{"application/json;as=BOGUS;v=v1beta1;g=meta.k8s.io, application/json"},
 				},
 			},
 			contentType: "application/json",
@@ -231,7 +254,7 @@ func TestNegotiate(t *testing.T) {
 			req = &http.Request{Header: http.Header{}}
 			req.Header.Set("Accept", test.accept)
 		}
-		s, err := NegotiateOutputSerializer(req, test.ns)
+		_, s, err := NegotiateOutputMediaType(req, test.ns, DefaultEndpointRestrictions)
 		switch {
 		case err == nil && test.errFn != nil:
 			t.Errorf("%d: failed: expected error", i)
@@ -259,6 +282,95 @@ func TestNegotiate(t *testing.T) {
 		}
 		if s.Serializer != test.serializer {
 			t.Errorf("%d: unexpected %s %s", i, test.serializer, s.Serializer)
+		}
+	}
+}
+
+func fakeSerializerInfoSlice() []runtime.SerializerInfo {
+	result := make([]runtime.SerializerInfo, 2)
+	result[0] = runtime.SerializerInfo{
+		MediaType:        "application/json",
+		MediaTypeType:    "application",
+		MediaTypeSubType: "json",
+	}
+	result[1] = runtime.SerializerInfo{
+		MediaType:        "application/vnd.kubernetes.protobuf",
+		MediaTypeType:    "application",
+		MediaTypeSubType: "vnd.kubernetes.protobuf",
+	}
+	return result
+}
+
+// tableEndpointRestrictions also allows conversion to Table.
+type tableEndpointRestrictions struct{ emptyEndpointRestrictions }
+
+func (tableEndpointRestrictions) AllowsMediaTypeTransform(_, _ string, gvk *schema.GroupVersionKind) bool {
+	return gvk == nil || *gvk == metav1.SchemeGroupVersion.WithKind("Table")
+}
+
+func TestNegotiateDrop(t *testing.T) {
+	testCases := []struct {
+		name         string
+		accept       string
+		gateDisabled bool
+		drop         []string
+	}{
+		{
+			name:   "managedFields",
+			accept: "application/json;drop=metadata.managedFields",
+			drop:   []string{"metadata.managedFields"},
+		},
+		{
+			name:         "ignored while the gate is disabled",
+			accept:       "application/json;drop=metadata.managedFields",
+			gateDisabled: true,
+		},
+		{
+			name:   "empty value",
+			accept: "application/json;drop=",
+		},
+		{
+			name:   "unsupported value falls back to the next clause",
+			accept: "application/json;drop=spec, application/json",
+		},
+		{
+			name:   "with pretty",
+			accept: "application/json;drop=metadata.managedFields;pretty=1",
+			drop:   []string{"metadata.managedFields"},
+		},
+		{
+			name:   "with Table",
+			accept: "application/json;as=Table;g=meta.k8s.io;v=v1;drop=metadata.managedFields",
+			drop:   []string{"metadata.managedFields"},
+		},
+		{
+			name:   "protobuf",
+			accept: "application/vnd.kubernetes.protobuf;drop=metadata.managedFields",
+			drop:   []string{"metadata.managedFields"},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ManagedFieldsOptOut, !tc.gateDisabled)
+			options, ok := NegotiateMediaTypeOptions(tc.accept, fakeSerializerInfoSlice(), tableEndpointRestrictions{})
+			if !ok {
+				t.Fatal("expected a match")
+			}
+			if !slices.Equal(options.Drop, tc.drop) {
+				t.Errorf("expected drop %v, got %v", tc.drop, options.Drop)
+			}
+		})
+	}
+}
+
+func BenchmarkNegotiateMediaTypeOptions(b *testing.B) {
+	accepted := fakeSerializerInfoSlice()
+	header := "application/vnd.kubernetes.protobuf,*/*"
+
+	for i := 0; i < b.N; i++ {
+		options, _ := NegotiateMediaTypeOptions(header, accepted, DefaultEndpointRestrictions)
+		if options.Accepted != accepted[1] {
+			b.Errorf("Unexpected result")
 		}
 	}
 }

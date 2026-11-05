@@ -45,12 +45,12 @@ func TestGVPackageFlag(t *testing.T) {
 			args: []string{"foo/bar/v1", "foo/bar/v2", "foo/bar/", "foo/v1"},
 			expectedGroups: []types.GroupVersions{
 				{PackageName: "bar", Group: types.Group("bar"), Versions: []types.PackageVersion{
-					{"v1", "foo/bar/v1"},
-					{"v2", "foo/bar/v2"},
-					{"", "foo/bar"},
+					{Version: "v1", Package: "foo/bar/v1"},
+					{Version: "v2", Package: "foo/bar/v2"},
+					{Version: "", Package: "foo/bar"},
 				}},
 				{PackageName: "foo", Group: types.Group("foo"), Versions: []types.PackageVersion{
-					{"v1", "foo/v1"},
+					{Version: "v1", Package: "foo/v1"},
 				}},
 			},
 		},
@@ -59,21 +59,21 @@ func TestGVPackageFlag(t *testing.T) {
 			def:  []string{"foo/bar/v1alpha1", "foo/v1"},
 			expectedGroups: []types.GroupVersions{
 				{PackageName: "bar", Group: types.Group("bar"), Versions: []types.PackageVersion{
-					{"v1", "foo/bar/v1"},
-					{"v2", "foo/bar/v2"},
-					{"", "foo/bar"},
+					{Version: "v1", Package: "foo/bar/v1"},
+					{Version: "v2", Package: "foo/bar/v2"},
+					{Version: "", Package: "foo/bar"},
 				}},
 				{PackageName: "foo", Group: types.Group("foo"), Versions: []types.PackageVersion{
-					{"v1", "foo/v1"},
+					{Version: "v1", Package: "foo/v1"},
 				}},
 			},
 		},
 		{
 			args: []string{"api/v1", "api"},
 			expectedGroups: []types.GroupVersions{
-				{PackageName: "core", Group: types.Group("api"), Versions: []types.PackageVersion{
-					{"v1", "core/v1"},
-					{"", "core"},
+				{PackageName: "api", Group: types.Group("api"), Versions: []types.PackageVersion{
+					{Version: "v1", Package: "api/v1"},
+					{Version: "", Package: "api"},
 				}},
 			},
 		},
@@ -82,7 +82,7 @@ func TestGVPackageFlag(t *testing.T) {
 			importBasePath: "k8s.io/api",
 			expectedGroups: []types.GroupVersions{
 				{PackageName: "foo", Group: types.Group("foo"), Versions: []types.PackageVersion{
-					{"v1", "k8s.io/api/foo/v1"},
+					{Version: "v1", Package: "k8s.io/api/foo/v1"},
 				}},
 			},
 		},

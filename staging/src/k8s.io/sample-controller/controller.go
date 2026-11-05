@@ -17,31 +17,33 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
+	"golang.org/x/time/rate"
+
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kubeinformers "k8s.io/client-go/informers"
+	appsinformers "k8s.io/client-go/informers/apps/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	appslisters "k8s.io/client-go/listers/apps/v1beta2"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 
 	samplev1alpha1 "k8s.io/sample-controller/pkg/apis/samplecontroller/v1alpha1"
-	clientset "k8s.io/sample-controller/pkg/client/clientset/versioned"
-	samplescheme "k8s.io/sample-controller/pkg/client/clientset/versioned/scheme"
-	informers "k8s.io/sample-controller/pkg/client/informers/externalversions"
-	listers "k8s.io/sample-controller/pkg/client/listers/samplecontroller/v1alpha1"
+	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
+	samplescheme "k8s.io/sample-controller/pkg/generated/clientset/versioned/scheme"
+	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions/samplecontroller/v1alpha1"
+	listers "k8s.io/sample-controller/pkg/generated/listers/samplecontroller/v1alpha1"
 )
 
 const controllerAgentName = "sample-controller"
@@ -59,6 +61,8 @@ const (
 	// MessageResourceSynced is the message used for an Event fired when a Foo
 	// is synced successfully
 	MessageResourceSynced = "Foo synced successfully"
+	// FieldManager distinguishes this controller from other things writing to API objects
+	FieldManager = controllerAgentName
 )
 
 // Controller is the controller implementation for Foo resources
@@ -78,7 +82,7 @@ type Controller struct {
 	// means we can ensure we only process a fixed amount of resources at a
 	// time, and makes it easy to ensure we are never processing the same item
 	// simultaneously in two different workers.
-	workqueue workqueue.RateLimitingInterface
+	workqueue workqueue.TypedRateLimitingInterface[cache.ObjectName]
 	// recorder is an event recorder for recording Event resources to the
 	// Kubernetes API.
 	recorder record.EventRecorder
@@ -86,25 +90,27 @@ type Controller struct {
 
 // NewController returns a new sample controller
 func NewController(
+	ctx context.Context,
 	kubeclientset kubernetes.Interface,
 	sampleclientset clientset.Interface,
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
-	sampleInformerFactory informers.SharedInformerFactory) *Controller {
-
-	// obtain references to shared index informers for the Deployment and Foo
-	// types.
-	deploymentInformer := kubeInformerFactory.Apps().V1beta2().Deployments()
-	fooInformer := sampleInformerFactory.Samplecontroller().V1alpha1().Foos()
+	deploymentInformer appsinformers.DeploymentInformer,
+	fooInformer informers.FooInformer) *Controller {
+	logger := klog.FromContext(ctx)
 
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
 	// logged for sample-controller types.
-	samplescheme.AddToScheme(scheme.Scheme)
-	glog.V(4).Info("Creating event broadcaster")
-	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
+	utilruntime.Must(samplescheme.AddToScheme(scheme.Scheme))
+	logger.V(4).Info("Creating event broadcaster")
+
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+	ratelimiter := workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[cache.ObjectName](5*time.Millisecond, 1000*time.Second),
+		&workqueue.TypedBucketRateLimiter[cache.ObjectName]{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
+	)
 
 	controller := &Controller{
 		kubeclientset:     kubeclientset,
@@ -113,29 +119,31 @@ func NewController(
 		deploymentsSynced: deploymentInformer.Informer().HasSynced,
 		foosLister:        fooInformer.Lister(),
 		foosSynced:        fooInformer.Informer().HasSynced,
-		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
-		recorder:          recorder,
+		workqueue: workqueue.NewTypedRateLimitingQueueWithConfig(ratelimiter, workqueue.TypedRateLimitingQueueConfig[cache.ObjectName]{
+			Logger: &logger,
+		}),
+		recorder: recorder,
 	}
 
-	glog.Info("Setting up event handlers")
+	logger.Info("Setting up event handlers")
 	// Set up an event handler for when Foo resources change
-	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = fooInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueFoo,
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueFoo(new)
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	// Set up an event handler for when Deployment resources change. This
 	// handler will lookup the owner of the given Deployment, and if it is
-	// owned by a Foo resource will enqueue that Foo resource for
+	// owned by a Foo resource then the handler will enqueue that Foo resource for
 	// processing. This way, we don't need to implement custom logic for
 	// handling Deployment resources. More info on this pattern:
 	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
-	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = deploymentInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleObject,
 		UpdateFunc: func(old, new interface{}) {
-			newDepl := new.(*appsv1beta2.Deployment)
-			oldDepl := old.(*appsv1beta2.Deployment)
+			newDepl := new.(*appsv1.Deployment)
+			oldDepl := old.(*appsv1.Deployment)
 			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
 				// Periodic resync will send update events for all known Deployments.
 				// Two different versions of the same Deployment will always have different RVs.
@@ -144,7 +152,7 @@ func NewController(
 			controller.handleObject(new)
 		},
 		DeleteFunc: controller.handleObject,
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 
 	return controller
 }
@@ -153,28 +161,30 @@ func NewController(
 // as syncing informer caches and starting workers. It will block until stopCh
 // is closed, at which point it will shutdown the workqueue and wait for
 // workers to finish processing their current work items.
-func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
-	defer runtime.HandleCrash()
+func (c *Controller) Run(ctx context.Context, workers int) error {
+	defer utilruntime.HandleCrashWithContext(ctx)
 	defer c.workqueue.ShutDown()
+	logger := klog.FromContext(ctx)
 
 	// Start the informer factories to begin populating the informer caches
-	glog.Info("Starting Foo controller")
+	logger.Info("Starting Foo controller")
 
 	// Wait for the caches to be synced before starting workers
-	glog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.foosSynced); !ok {
+	logger.Info("Waiting for informer caches to sync")
+
+	if ok := cache.WaitForCacheSync(ctx.Done(), c.deploymentsSynced, c.foosSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	glog.Info("Starting workers")
+	logger.Info("Starting workers", "count", workers)
 	// Launch two workers to process Foo resources
-	for i := 0; i < threadiness; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	glog.Info("Started workers")
-	<-stopCh
-	glog.Info("Shutting down workers")
+	logger.Info("Started workers")
+	<-ctx.Done()
+	logger.Info("Shutting down workers")
 
 	return nil
 }
@@ -182,82 +192,64 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 // runWorker is a long-running function that will continually call the
 // processNextWorkItem function in order to read and process a message on the
 // workqueue.
-func (c *Controller) runWorker() {
-	for c.processNextWorkItem() {
+func (c *Controller) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem will read a single work item off the workqueue and
 // attempt to process it, by calling the syncHandler.
-func (c *Controller) processNextWorkItem() bool {
-	obj, shutdown := c.workqueue.Get()
+func (c *Controller) processNextWorkItem(ctx context.Context) bool {
+	objRef, shutdown := c.workqueue.Get()
+	logger := klog.FromContext(ctx)
 
 	if shutdown {
 		return false
 	}
 
-	// We wrap this block in a func so we can defer c.workqueue.Done.
-	err := func(obj interface{}) error {
-		// We call Done here so the workqueue knows we have finished
-		// processing this item. We also must remember to call Forget if we
-		// do not want this work item being re-queued. For example, we do
-		// not call Forget if a transient error occurs, instead the item is
-		// put back on the workqueue and attempted again after a back-off
-		// period.
-		defer c.workqueue.Done(obj)
-		var key string
-		var ok bool
-		// We expect strings to come off the workqueue. These are of the
-		// form namespace/name. We do this as the delayed nature of the
-		// workqueue means the items in the informer cache may actually be
-		// more up to date that when the item was initially put onto the
-		// workqueue.
-		if key, ok = obj.(string); !ok {
-			// As the item in the workqueue is actually invalid, we call
-			// Forget here else we'd go into a loop of attempting to
-			// process a work item that is invalid.
-			c.workqueue.Forget(obj)
-			runtime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
-			return nil
-		}
-		// Run the syncHandler, passing it the namespace/name string of the
-		// Foo resource to be synced.
-		if err := c.syncHandler(key); err != nil {
-			return fmt.Errorf("error syncing '%s': %s", key, err.Error())
-		}
-		// Finally, if no error occurs we Forget this item so it does not
-		// get queued again until another change happens.
-		c.workqueue.Forget(obj)
-		glog.Infof("Successfully synced '%s'", key)
-		return nil
-	}(obj)
+	// We call Done at the end of this func so the workqueue knows we have
+	// finished processing this item. We also must remember to call Forget
+	// if we do not want this work item being re-queued. For example, we do
+	// not call Forget if a transient error occurs, instead the item is
+	// put back on the workqueue and attempted again after a back-off
+	// period.
+	defer c.workqueue.Done(objRef)
 
-	if err != nil {
-		runtime.HandleError(err)
+	// Run the syncHandler, passing it the structured reference to the object to be synced.
+	err := c.syncHandler(ctx, objRef)
+	if err == nil {
+		// If no error occurs then we Forget this item so it does not
+		// get queued again until another change happens.
+		c.workqueue.Forget(objRef)
+		logger.Info("Successfully synced", "objectName", objRef)
 		return true
 	}
-
+	// there was a failure so be sure to report it.  This method allows for
+	// pluggable error handling which can be used for things like
+	// cluster-monitoring.
+	utilruntime.HandleErrorWithContext(ctx, err, "Error syncing; requeuing for later retry", "objectReference", objRef)
+	// since we failed, we should requeue the item to work on later.  This
+	// method will add a backoff to avoid hotlooping on particular items
+	// (they're probably still not going to work right away) and overall
+	// controller protection (everything I've done is broken, this controller
+	// needs to calm down or it can starve other useful work) cases.
+	c.workqueue.AddRateLimited(objRef)
 	return true
 }
 
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
-func (c *Controller) syncHandler(key string) error {
-	// Convert the namespace/name string into a distinct namespace and name
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
-		return nil
-	}
+func (c *Controller) syncHandler(ctx context.Context, objectRef cache.ObjectName) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "objectRef", objectRef)
 
 	// Get the Foo resource with this namespace/name
-	foo, err := c.foosLister.Foos(namespace).Get(name)
+	foo, err := c.foosLister.Foos(objectRef.Namespace).Get(objectRef.Name)
 	if err != nil {
 		// The Foo resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			runtime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			utilruntime.HandleErrorWithContext(ctx, err, "Foo referenced by item in work queue no longer exists", "objectReference", objectRef)
 			return nil
 		}
 
@@ -269,7 +261,7 @@ func (c *Controller) syncHandler(key string) error {
 		// We choose to absorb the error here as the worker would requeue the
 		// resource otherwise. Instead, the next time the resource is updated
 		// the resource will be queued again.
-		runtime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
+		utilruntime.HandleErrorWithContext(ctx, nil, "Deployment name missing from object reference", "objectReference", objectRef)
 		return nil
 	}
 
@@ -277,7 +269,7 @@ func (c *Controller) syncHandler(key string) error {
 	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
 	// If the resource doesn't exist, we'll create it
 	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1beta2().Deployments(foo.Namespace).Create(newDeployment(foo))
+		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(ctx, newDeployment(foo), metav1.CreateOptions{FieldManager: FieldManager})
 	}
 
 	// If an error occurs during Get/Create, we'll requeue the item so we can
@@ -288,23 +280,23 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and ret
+	// a warning to the event recorder and return error msg.
 	if !metav1.IsControlledBy(deployment, foo) {
 		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
 		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 
 	// If this number of the replicas on the Foo resource is specified, and the
 	// number does not equal the current desired replicas on the Deployment, we
 	// should update the Deployment resource.
 	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		glog.V(4).Infof("Foor: %d, deplR: %d", *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1beta2().Deployments(foo.Namespace).Update(newDeployment(foo))
+		logger.V(4).Info("Update deployment resource", "currentReplicas", *deployment.Spec.Replicas, "desiredReplicas", *foo.Spec.Replicas)
+		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(ctx, newDeployment(foo), metav1.UpdateOptions{FieldManager: FieldManager})
 	}
 
 	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. THis could have been caused by a
+	// attempt processing again later. This could have been caused by a
 	// temporary network failure, or any other transient reason.
 	if err != nil {
 		return err
@@ -312,7 +304,7 @@ func (c *Controller) syncHandler(key string) error {
 
 	// Finally, we update the status block of the Foo resource to reflect the
 	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
+	err = c.updateFooStatus(ctx, foo, deployment)
 	if err != nil {
 		return err
 	}
@@ -321,17 +313,17 @@ func (c *Controller) syncHandler(key string) error {
 	return nil
 }
 
-func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1beta2.Deployment) error {
+func (c *Controller) updateFooStatus(ctx context.Context, foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
 	// NEVER modify objects from the store. It's a read-only, local cache.
 	// You can use DeepCopy() to make a deep copy of original object and modify this copy
 	// Or create a copy manually for better performance
 	fooCopy := foo.DeepCopy()
 	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
-	// Until #38113 is merged, we must use Update instead of UpdateStatus to
-	// update the Status block of the Foo resource. UpdateStatus will not
-	// allow changes to the Spec of the resource, which is ideal for ensuring
-	// nothing other than resource status has been updated.
-	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).Update(fooCopy)
+	// If the CustomResourceSubresources feature gate is not enabled,
+	// we must use Update instead of UpdateStatus to update the Status block of the Foo resource.
+	// UpdateStatus will not allow changes to the Spec of the resource,
+	// which is ideal for ensuring nothing other than resource status has been updated.
+	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).UpdateStatus(ctx, fooCopy, metav1.UpdateOptions{FieldManager: FieldManager})
 	return err
 }
 
@@ -339,13 +331,12 @@ func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1
 // string which is then put onto the work queue. This method should *not* be
 // passed resources of any type other than Foo.
 func (c *Controller) enqueueFoo(obj interface{}) {
-	var key string
-	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
-		runtime.HandleError(err)
+	if objectRef, err := cache.ObjectToName(obj); err != nil {
+		utilruntime.HandleError(err)
 		return
+	} else {
+		c.workqueue.Add(objectRef)
 	}
-	c.workqueue.AddRateLimited(key)
 }
 
 // handleObject will take any resource implementing metav1.Object and attempt
@@ -356,20 +347,25 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 func (c *Controller) handleObject(obj interface{}) {
 	var object metav1.Object
 	var ok bool
+	logger := klog.FromContext(context.Background())
 	if object, ok = obj.(metav1.Object); !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
+			// If the object value is not too big and does not contain sensitive information then
+			// it may be useful to include it.
+			utilruntime.HandleErrorWithContext(context.Background(), nil, "Error decoding object, invalid type", "type", fmt.Sprintf("%T", obj))
 			return
 		}
 		object, ok = tombstone.Obj.(metav1.Object)
 		if !ok {
-			runtime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
+			// If the object value is not too big and does not contain sensitive information then
+			// it may be useful to include it.
+			utilruntime.HandleErrorWithContext(context.Background(), nil, "Error decoding object tombstone, invalid type", "type", fmt.Sprintf("%T", tombstone.Obj))
 			return
 		}
-		glog.V(4).Infof("Recovered deleted object '%s' from tombstone", object.GetName())
+		logger.V(4).Info("Recovered deleted object", "resourceName", object.GetName())
 	}
-	glog.V(4).Infof("Processing object: %s", object.GetName())
+	logger.V(4).Info("Processing object", "object", klog.KObj(object))
 	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
 		// If this object is not owned by a Foo, we should not do anything more
 		// with it.
@@ -379,7 +375,7 @@ func (c *Controller) handleObject(obj interface{}) {
 
 		foo, err := c.foosLister.Foos(object.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
-			glog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
+			logger.V(4).Info("Ignore orphaned object", "object", klog.KObj(object), "foo", ownerRef.Name)
 			return
 		}
 
@@ -391,24 +387,20 @@ func (c *Controller) handleObject(obj interface{}) {
 // newDeployment creates a new Deployment for a Foo resource. It also sets
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the Foo resource that 'owns' it.
-func newDeployment(foo *samplev1alpha1.Foo) *appsv1beta2.Deployment {
+func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 	labels := map[string]string{
 		"app":        "nginx",
 		"controller": foo.Name,
 	}
-	return &appsv1beta2.Deployment{
+	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      foo.Spec.DeploymentName,
 			Namespace: foo.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(foo, schema.GroupVersionKind{
-					Group:   samplev1alpha1.SchemeGroupVersion.Group,
-					Version: samplev1alpha1.SchemeGroupVersion.Version,
-					Kind:    "Foo",
-				}),
+				*metav1.NewControllerRef(foo, samplev1alpha1.SchemeGroupVersion.WithKind("Foo")),
 			},
 		},
-		Spec: appsv1beta2.DeploymentSpec{
+		Spec: appsv1.DeploymentSpec{
 			Replicas: foo.Spec.Replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,

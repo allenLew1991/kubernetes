@@ -1,0 +1,24 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+  - deads2k
+  - sttts
+  - liggitt
+  - caesarxuchao
+  - jpbetz
+reviewers:
+  - thockin
+  - wojtek-t
+  - deads2k
+  - derekwaynecarr
+  - caesarxuchao
+  - cheftako
+  - liggitt
+  - sttts
+  - jpbetz
+labels:
+  - sig/api-machinery
+emeritus_approvers:
+  - lavalamp
+emeritus_reviewers:
+  - ncdc

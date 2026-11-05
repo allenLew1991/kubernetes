@@ -17,32 +17,64 @@ limitations under the License.
 package cpumanager
 
 import (
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state"
+	cmqos "k8s.io/kubernetes/pkg/kubelet/cm/qos"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
+	"k8s.io/kubernetes/pkg/kubelet/config"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/status"
+	"k8s.io/utils/cpuset"
 )
 
 type fakeManager struct {
-	state state.State
+	logger klog.Logger
+	state  state.State
 }
 
-func (m *fakeManager) Start(activePods ActivePodsFunc, podStatusProvider status.PodStatusProvider, containerRuntime runtimeService) {
-	glog.Info("[fake cpumanager] Start()")
-}
-
-func (m *fakeManager) Policy() Policy {
-	glog.Info("[fake cpumanager] Policy()")
-	return NewNonePolicy()
-}
-
-func (m *fakeManager) AddContainer(pod *v1.Pod, container *v1.Container, containerID string) error {
-	glog.Infof("[fake cpumanager] AddContainer (pod: %s, container: %s, container id: %s)", pod.Name, container.Name, containerID)
+func (m *fakeManager) Start(ctx context.Context, _ ActivePodsFunc, _ config.SourcesReady, _ status.PodStatusProvider, _ runtimeService, _ containermap.ContainerMap) error {
+	logger := klog.FromContext(ctx)
+	logger.Info("Start()")
 	return nil
 }
 
-func (m *fakeManager) RemoveContainer(containerID string) error {
-	glog.Infof("[fake cpumanager] RemoveContainer (container id: %s)", containerID)
+func (m *fakeManager) Policy() Policy {
+	m.logger.Info("Policy()")
+	pol, _ := NewNonePolicy(nil)
+	return pol
+}
+
+func (m *fakeManager) Allocate(ctx context.Context, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) error {
+	logger := klog.FromContext(ctx)
+	logger.Info("Allocate", "pod", klog.KObj(pod), "containerName", container.Name, "operation", operation)
+	return nil
+}
+
+func (m *fakeManager) AddContainer(logger klog.Logger, pod *v1.Pod, container *v1.Container, containerID string) {
+	logger.Info("AddContainer", "pod", klog.KObj(pod), "containerName", container.Name, "containerID", containerID)
+}
+
+func (m *fakeManager) RemoveContainer(logger klog.Logger, containerID string) error {
+	logger.Info("RemoveContainer", "containerID", containerID)
+	return nil
+}
+
+func (m *fakeManager) GetTopologyHints(logger klog.Logger, _ *v1.Pod, _ *v1.Container, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	logger.Info("Get container topology hints", "operation", operation)
+	return map[string][]topologymanager.TopologyHint{}
+}
+
+func (m *fakeManager) GetPodTopologyHints(logger klog.Logger, _ *v1.Pod, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	logger.Info("Get pod topology hints", "operation", operation)
+	return map[string][]topologymanager.TopologyHint{}
+}
+
+func (m *fakeManager) AllocatePod(logger klog.Logger, pod *v1.Pod, operation lifecycle.Operation) error {
+	logger.Info("AllocatePod", "pod", klog.KObj(pod), "operation", operation)
 	return nil
 }
 
@@ -50,9 +82,44 @@ func (m *fakeManager) State() state.Reader {
 	return m.state
 }
 
+func (m *fakeManager) GetExclusiveCPUs(podUID, containerName string) cpuset.CPUSet {
+	m.logger.Info("GetExclusiveCPUs", "podUID", podUID, "containerName", containerName)
+	return cpuset.New()
+}
+
+func (m *fakeManager) GetPodCPUs(podUID string) cpuset.CPUSet {
+	m.logger.Info("GetPodCPUs", "podUID", podUID)
+	return cpuset.New()
+}
+
+func (m *fakeManager) GetAllocatableCPUs() cpuset.CPUSet {
+	m.logger.Info("Get Allocatable CPUs")
+	return cpuset.New()
+}
+
+func (m *fakeManager) GetCPUAffinity(podUID, containerName string) cpuset.CPUSet {
+	m.logger.Info("GetCPUAffinity", "podUID", podUID, "containerName", containerName)
+	return cpuset.New()
+}
+
+func (m *fakeManager) GetAllCPUs() cpuset.CPUSet {
+	m.logger.Info("GetAllCPUs")
+	return cpuset.New()
+}
+
+func (m *fakeManager) GetResourceIsolationLevel(_ *v1.Pod, _ *v1.Container) cmqos.ResourceIsolationLevel {
+	return cmqos.ResourceIsolationContainer
+}
+
+func (m *fakeManager) CanAllocateExclusively(res v1.ResourceName) bool {
+	return false
+}
+
 // NewFakeManager creates empty/fake cpu manager
-func NewFakeManager() Manager {
+func NewFakeManager(logger klog.Logger) Manager {
+	logger = klog.LoggerWithName(logger, "cpu.fake")
 	return &fakeManager{
-		state: state.NewMemoryState(),
+		logger: logger,
+		state:  state.NewMemoryState(logger),
 	}
 }

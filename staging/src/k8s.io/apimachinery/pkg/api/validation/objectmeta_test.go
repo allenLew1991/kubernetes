@@ -17,51 +17,147 @@ limitations under the License.
 package validation
 
 import (
+	"context"
+	"fmt"
 	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/api/validate"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 const (
 	maxLengthErrMsg = "must be no more than"
 	namePartErrMsg  = "name part must consist of"
-	nameErrMsg      = "a qualified name must consist of"
+	nameErrMsg      = "a valid label key must consist of"
 )
 
 // Ensure custom name functions are allowed
 func TestValidateObjectMetaCustomName(t *testing.T) {
-	errs := ValidateObjectMeta(
-		&metav1.ObjectMeta{Name: "test", GenerateName: "foo"},
-		false,
-		func(s string, prefix bool) []string {
-			if s == "test" {
-				return nil
-			}
-			return []string{"name-gen"}
-		},
-		field.NewPath("field"))
-	if len(errs) != 1 {
-		t.Fatalf("unexpected errors: %v", errs)
+	testCases := []struct {
+		name   string
+		input  metav1.ObjectMeta
+		nErrs  int
+		errStr string
+	}{{
+		name:  "valid name, empty generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: ""},
+	}, {
+		name:  "valid name and generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: "test"},
+	}, {
+		name:   "invalid name, empty generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: ""},
+		nErrs:  1,
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, valid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "test"},
+		nErrs:  1,
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, invalid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "invalid"},
+		nErrs:  2,
+		errStr: "wrong value",
+	}}
+
+	fn := func(s string, prefix bool) []string {
+		// Note: this is called on both name and generateName
+		if s == "test" {
+			return nil
+		}
+		return []string{"wrong value"}
 	}
-	if !strings.Contains(errs[0].Error(), "name-gen") {
-		t.Errorf("unexpected error message: %v", errs)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateObjectMeta(&tc.input, false, fn, field.NewPath("field"))
+
+			if len(errs) == 0 {
+				if len(tc.errStr) != 0 {
+					t.Fatalf("expected 1 error, got none")
+				}
+			} else {
+				if len(tc.errStr) == 0 {
+					t.Fatalf("expected no errors, got: %v", errs)
+				}
+				if len(errs) != tc.nErrs {
+					t.Fatalf("expected %d errors, got %d: %q", tc.nErrs, len(errs), errs)
+				}
+				if !strings.Contains(errs[0].Error(), "wrong value") {
+					t.Errorf("unexpected error message: %v", errs[0].Error())
+				}
+			}
+		})
+	}
+}
+
+// Ensure custom name functions work
+func TestValidateObjectMetaWithOptsName(t *testing.T) {
+	testCases := []struct {
+		name   string
+		input  metav1.ObjectMeta
+		errStr string
+	}{{
+		name:  "valid name, empty generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: ""},
+	}, {
+		name:  "valid name and generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: "test"},
+	}, {
+		name:   "invalid name, empty generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: ""},
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, valid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "test"},
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, invalid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "invalid"},
+		errStr: "wrong value",
+	}}
+
+	fn := func(fldPath *field.Path, s string) field.ErrorList {
+		if s == "test" {
+			return nil
+		}
+		return field.ErrorList{field.Invalid(fldPath, s, "wrong value")}
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateObjectMetaWithOpts(&tc.input, false, fn, field.NewPath("field"))
+
+			if len(errs) == 0 {
+				if len(tc.errStr) != 0 {
+					t.Fatalf("expected 1 error, got none")
+				}
+			} else {
+				if len(tc.errStr) == 0 {
+					t.Fatalf("expected no errors, got: %v", errs)
+				}
+				if len(errs) != 1 {
+					t.Fatalf("expected 1 error, got %d: %q", len(errs), errs)
+				}
+				if !strings.Contains(errs[0].Error(), "wrong value") {
+					t.Errorf("unexpected error message: %v", errs[0].Error())
+				}
+			}
+		})
 	}
 }
 
 // Ensure namespace names follow dns label format
 func TestValidateObjectMetaNamespaces(t *testing.T) {
-	errs := ValidateObjectMeta(
+	errs := validateObjectMetaAccessorWithOptsCommon(
 		&metav1.ObjectMeta{Name: "test", Namespace: "foo.bar"},
-		true,
-		func(s string, prefix bool) []string {
-			return nil
-		},
-		field.NewPath("field"))
+		true, field.NewPath("field"), nil)
 	if len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -74,13 +170,9 @@ func TestValidateObjectMetaNamespaces(t *testing.T) {
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
-	errs = ValidateObjectMeta(
+	errs = validateObjectMetaAccessorWithOptsCommon(
 		&metav1.ObjectMeta{Name: "test", Namespace: string(b)},
-		true,
-		func(s string, prefix bool) []string {
-			return nil
-		},
-		field.NewPath("field"))
+		true, field.NewPath("field"), nil)
 	if len(errs) != 2 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -125,6 +217,45 @@ func TestValidateObjectMetaOwnerReferences(t *testing.T) {
 			expectedErrorMessage: "is disallowed from being an owner",
 		},
 		{
+			description: "simple failures - invalid apiVersion with too many slashes",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "a/b/c",
+					Kind:       "Pod",
+					Name:       "name",
+					UID:        "1",
+				},
+			},
+			expectError:          true,
+			expectedErrorMessage: "must be <group>/<version> or <version>",
+		},
+		{
+			description: "simple failures - invalid apiVersion with empty version",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "foo/",
+					Kind:       "Pod",
+					Name:       "name",
+					UID:        "1",
+				},
+			},
+			expectError:          true,
+			expectedErrorMessage: "must be <group>/<version> or <version>",
+		},
+		{
+			description: "simple success - apiVersion with no slashes (legacy core group)",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "v1",
+					Kind:       "Pod",
+					Name:       "name",
+					UID:        "1",
+				},
+			},
+			expectError:          false,
+			expectedErrorMessage: "",
+		},
+		{
 			description: "simple controller ref success - one reference with Controller set",
 			ownerReferences: []metav1.OwnerReference{
 				{
@@ -163,45 +294,41 @@ func TestValidateObjectMetaOwnerReferences(t *testing.T) {
 			ownerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind1",
 					Name:       "name",
 					UID:        "1",
 					Controller: &falseVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind2",
 					Name:       "name",
 					UID:        "2",
 					Controller: &trueVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind3",
 					Name:       "name",
 					UID:        "3",
 					Controller: &trueVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind4",
 					Name:       "name",
 					UID:        "4",
 				},
 			},
 			expectError:          true,
-			expectedErrorMessage: "Only one reference can have Controller set to true",
+			expectedErrorMessage: "Only one reference can have Controller set to true. Found \"true\" in references for customresourceKind2/name and customresourceKind3/name",
 		},
 	}
 
 	for _, tc := range testCases {
-		errs := ValidateObjectMeta(
+		errs := validateObjectMetaAccessorWithOptsCommon(
 			&metav1.ObjectMeta{Name: "test", Namespace: "test", OwnerReferences: tc.ownerReferences},
-			true,
-			func(s string, prefix bool) []string {
-				return nil
-			},
-			field.NewPath("field"))
+			true, field.NewPath("field"), nil)
 		if len(errs) != 0 && !tc.expectError {
 			t.Errorf("unexpected error: %v in test case %v", errs, tc.description)
 		}
@@ -219,21 +346,21 @@ func TestValidateObjectMetaUpdateIgnoresCreationTimestamp(t *testing.T) {
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if errs := ValidateObjectMetaUpdate(
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if errs := ValidateObjectMetaUpdate(
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(11, 0))},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 }
@@ -288,7 +415,7 @@ func TestValidateFinalizersPreventConflictingFinalizers(t *testing.T) {
 		},
 	}
 	for name, tc := range testcases {
-		errs := ValidateObjectMeta(&tc.ObjectMeta, false, NameIsDNSSubdomain, field.NewPath("field"))
+		errs := validateObjectMetaAccessorWithOptsCommon(&tc.ObjectMeta, false, field.NewPath("field"), nil)
 		if len(errs) == 0 {
 			if len(tc.ExpectedErr) != 0 {
 				t.Errorf("case: %q, expected error to contain %q", name, tc.ExpectedErr)
@@ -328,38 +455,38 @@ func TestValidateObjectMetaUpdatePreventsDeletionFieldMutation(t *testing.T) {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: 1970-01-01 00:16:40 +0000 UTC: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: \"1970-01-01T00:16:40Z\": field is immutable"},
 		},
 		"invalid clear deletionTimestamp": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: null: field is immutable"},
 		},
 		"invalid change deletionTimestamp": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &later},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &later},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: \"1970-01-01T00:33:20Z\": field is immutable"},
 		},
 
 		"invalid set deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
-			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 30: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 30: field is immutable"},
 		},
 		"invalid clear deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: null: field is immutable"},
 		},
 		"invalid change deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodLong},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodLong},
-			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 40: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 40: field is immutable"},
 		},
 	}
 
@@ -373,7 +500,7 @@ func TestValidateObjectMetaUpdatePreventsDeletionFieldMutation(t *testing.T) {
 		}
 		for i := range errs {
 			if errs[i].Error() != tc.ExpectedErrs[i] {
-				t.Errorf("%s: error #%d: expected %q, got %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
+				t.Errorf("%s: error #%d:\n  expected: %q\n       got: %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
 			}
 		}
 		if !reflect.DeepEqual(tc.New, tc.ExpectedNew) {
@@ -419,14 +546,14 @@ func TestObjectMetaGenerationUpdate(t *testing.T) {
 		}
 		for i := range errList {
 			if errList[i] != tc.ExpectedErrs[i] {
-				t.Errorf("%s: error #%d: expected %q, got %q", k, i, tc.ExpectedErrs[i], errList[i])
+				t.Errorf("%s: error #%d:\n  expected: %q\n       got: %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
 			}
 		}
 	}
 }
 
-// Ensure trailing slash is allowed in generate name
-func TestValidateObjectMetaTrimsTrailingSlash(t *testing.T) {
+// Ensure trailing dash is allowed in generate name
+func TestValidateObjectMetaTrimsTrailingDash(t *testing.T) {
 	errs := ValidateObjectMeta(
 		&metav1.ObjectMeta{Name: "test", GenerateName: "foo-"},
 		false,
@@ -452,10 +579,10 @@ func TestValidateAnnotations(t *testing.T) {
 		{"1234/5678": "bar"},
 		{"1.2.3.4/5678": "bar"},
 		{"UpperCase123": "bar"},
-		{"a": strings.Repeat("b", totalAnnotationSizeLimitB-1)},
+		{"a": strings.Repeat("b", TotalAnnotationSizeLimitB-1)},
 		{
-			"a": strings.Repeat("b", totalAnnotationSizeLimitB/2-1),
-			"c": strings.Repeat("d", totalAnnotationSizeLimitB/2-1),
+			"a": strings.Repeat("b", TotalAnnotationSizeLimitB/2-1),
+			"c": strings.Repeat("d", TotalAnnotationSizeLimitB/2-1),
 		},
 	}
 	for i := range successCases {
@@ -485,10 +612,10 @@ func TestValidateAnnotations(t *testing.T) {
 		}
 	}
 	totalSizeErrorCases := []map[string]string{
-		{"a": strings.Repeat("b", totalAnnotationSizeLimitB)},
+		{"a": strings.Repeat("b", TotalAnnotationSizeLimitB)},
 		{
-			"a": strings.Repeat("b", totalAnnotationSizeLimitB/2),
-			"c": strings.Repeat("d", totalAnnotationSizeLimitB/2),
+			"a": strings.Repeat("b", TotalAnnotationSizeLimitB/2),
+			"c": strings.Repeat("d", TotalAnnotationSizeLimitB/2),
 		},
 	}
 	for i := range totalSizeErrorCases {
@@ -497,4 +624,385 @@ func TestValidateAnnotations(t *testing.T) {
 			t.Errorf("case[%d] expected failure", i)
 		}
 	}
+}
+
+func TestValidateObjectMetaDeclaratively(t *testing.T) {
+	ctx := context.Background()
+	fldPath := field.NewPath("metadata")
+	now := metav1.NewTime(time.Unix(1000, 0).UTC())
+	later := metav1.NewTime(time.Unix(2000, 0).UTC())
+	gracePeriod30 := int64(30)
+	gracePeriod40 := int64(40)
+
+	createCases := []struct {
+		name              string
+		obj               *metav1.ObjectMeta
+		requiresNamespace bool
+		expectedErrs      field.ErrorList
+	}{
+		{
+			name:              "valid metadata",
+			obj:               mkMeta(),
+			requiresNamespace: true,
+			expectedErrs:      nil,
+		},
+		{
+			name:              "invalid name format",
+			obj:               mkMeta(tweakName("invalid_name")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("name"), "invalid_name", "").MarkFromImperative(),
+			},
+		},
+		{
+			name:              "missing required namespace",
+			obj:               mkMeta(tweakNamespace("")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("namespace"), "").MarkFromImperative(),
+			},
+		},
+		{
+			name:              "negative generation",
+			obj:               mkMeta(tweakGeneration(-1)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("generation"), int64(-1), "").WithOrigin("minimum").MarkBeta(),
+			},
+		},
+		{
+			name:              "managedFields empty operation",
+			obj:               mkMeta(tweakManagedFields(metav1.ManagedFieldsEntry{FieldsType: "FieldsV1"})),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("managedFields").Index(0).Child("operation"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty apiVersion",
+			obj:               mkMeta(tweakOwnerRefs(mkOwnerRef(tweakRefAPIVersion("")))),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("apiVersion"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty kind",
+			obj:               mkMeta(tweakOwnerRefs(mkOwnerRef(tweakRefKind("")))),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("kind"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty name",
+			obj:               mkMeta(tweakOwnerRefs(mkOwnerRef(tweakRefName("")))),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("name"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty uid",
+			obj:               mkMeta(tweakOwnerRefs(mkOwnerRef(tweakRefUID("")))),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("uid"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences event is disallowed",
+			obj:               mkMeta(tweakOwnerRefs(mkOwnerRef(tweakRefKind("Event")))),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("ownerReferences").Index(0), metav1.OwnerReference{APIVersion: "v1", Kind: "Event", Name: "name", UID: "uid-1"}, "").MarkFromImperative(),
+			},
+		},
+		{
+			name:              "invalid annotation key",
+			obj:               mkMeta(tweakAnnotations(map[string]string{"-invalid": "val"})),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("annotations"), "-invalid", "").WithOrigin("format=k8s-label-key").MarkFromImperative(),
+			},
+		},
+		{
+			name:              "annotations size limit exceeded",
+			obj:               mkMeta(tweakAnnotations(map[string]string{"a": strings.Repeat("b", TotalAnnotationSizeLimitB)})),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.TooLong(fldPath.Child("annotations"), "", TotalAnnotationSizeLimitB).MarkFromImperative(),
+			},
+		},
+	}
+
+	matcher := field.ErrorMatcher{}.ByField().ByType().BySource().ByOrigin()
+
+	toExpectedErrs := func(allDeclarativeEnforced bool, betaEnabled bool, errs field.ErrorList) field.ErrorList {
+		expected := make(field.ErrorList, 0, len(errs))
+		for _, err := range errs {
+			e := *err
+			if !allDeclarativeEnforced && (e.IsAlpha() || (!betaEnabled && e.IsBeta())) {
+				_ = e.MarkFromImperative()
+				e.ValidationStabilityLevel = 0
+			}
+			expected = append(expected, &e)
+		}
+		return expected
+	}
+
+	for _, tc := range createCases {
+		for _, betaEnabled := range []bool{true, false} {
+			for _, allDeclarativeEnforced := range []bool{true, false} {
+				t.Run(fmt.Sprintf("Create: %s (betaEnabled=%v, allDeclarativeEnforced=%v)", tc.name, betaEnabled, allDeclarativeEnforced), func(t *testing.T) {
+					testCtx := ctx
+					if allDeclarativeEnforced {
+						testCtx = validate.WithAllDeclarativeEnforcedForTest(ctx)
+					}
+					errs := ValidateObjectMetaDeclaratively(testCtx, operation.Create, tc.obj, nil, tc.requiresNamespace, NameIsDNSSubdomain, fldPath, betaEnabled)
+					matcher.Test(t, toExpectedErrs(allDeclarativeEnforced, betaEnabled, tc.expectedErrs), errs)
+				})
+			}
+		}
+	}
+
+	updateCases := []struct {
+		name              string
+		obj               *metav1.ObjectMeta
+		oldObj            *metav1.ObjectMeta
+		requiresNamespace bool
+		expectedErrs      field.ErrorList
+	}{
+		{
+			name:              "valid update",
+			obj:               mkMeta(tweakResourceVersion("2")),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs:      nil,
+		},
+		{
+			name:              "valid generation zero on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakGeneration(0)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakGeneration(0)),
+			requiresNamespace: true,
+			expectedErrs:      nil,
+		},
+		{
+			name:              "decremented generation on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakGeneration(4)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakGeneration(5)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("generation"), int64(4), "must not be decremented").WithOrigin("monotonic").MarkAlpha(),
+			},
+		},
+		{
+			name:              "decremented generation to zero on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakGeneration(0)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakGeneration(1)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("generation"), int64(0), "field cannot be cleared once set").WithOrigin("update").MarkAlpha(),
+			},
+		},
+		{
+			name:              "negative generation on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakGeneration(-1)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakGeneration(0)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("generation"), int64(-1), "").WithOrigin("minimum").MarkBeta(),
+				field.Invalid(fldPath.Child("generation"), int64(-1), "must not be decremented").WithOrigin("monotonic").MarkAlpha(),
+			},
+		},
+		{
+			name:              "immutable namespace",
+			obj:               mkMeta(tweakNamespace("new-ns"), tweakResourceVersion("2")),
+			oldObj:            mkMeta(tweakNamespace("old-ns"), tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("namespace"), "new-ns", "").WithOrigin("immutable").MarkAlpha(),
+			},
+		},
+		{
+			name:              "ownerReferences empty apiVersion on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakOwnerRefs(mkOwnerRef(tweakRefAPIVersion("")))),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("apiVersion"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty kind on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakOwnerRefs(mkOwnerRef(tweakRefKind("")))),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("kind"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty name on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakOwnerRefs(mkOwnerRef(tweakRefName("")))),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("name"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "ownerReferences empty uid on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakOwnerRefs(mkOwnerRef(tweakRefUID("")))),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Required(fldPath.Child("ownerReferences").Index(0).Child("uid"), "").MarkBeta(),
+			},
+		},
+		{
+			name:              "invalid annotation key on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakAnnotations(map[string]string{"-invalid": "val"})),
+			oldObj:            mkMeta(tweakResourceVersion("1")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("annotations"), "-invalid", "").WithOrigin("format=k8s-label-key").MarkFromImperative(),
+			},
+		},
+		{
+			name:              "immutable uid on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakUID("uid-new")),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakUID("uid-old")),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("uid"), types.UID("uid-new"), "").WithOrigin("immutable").MarkBeta(),
+			},
+		},
+		{
+			name:              "immutable creationTimestamp on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakCreationTimestamp(later)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakCreationTimestamp(now)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("creationTimestamp"), later, "").WithOrigin("immutable").MarkBeta(),
+			},
+		},
+		{
+			name:              "immutable deletionTimestamp on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakDeletionTimestamp(&later)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakDeletionTimestamp(&now)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("deletionTimestamp"), &later, "").WithOrigin("immutable").MarkBeta(),
+			},
+		},
+		{
+			name:              "immutable deletionGracePeriodSeconds on update",
+			obj:               mkMeta(tweakResourceVersion("2"), tweakDeletionGracePeriodSeconds(&gracePeriod40)),
+			oldObj:            mkMeta(tweakResourceVersion("1"), tweakDeletionGracePeriodSeconds(&gracePeriod30)),
+			requiresNamespace: true,
+			expectedErrs: field.ErrorList{
+				field.Invalid(fldPath.Child("deletionGracePeriodSeconds"), &gracePeriod40, "").WithOrigin("immutable").MarkBeta(),
+			},
+		},
+	}
+
+	for _, tc := range updateCases {
+		for _, betaEnabled := range []bool{true, false} {
+			for _, allDeclarativeEnforced := range []bool{true, false} {
+				t.Run(fmt.Sprintf("Update: %s (betaEnabled=%v, allDeclarativeEnforced=%v)", tc.name, betaEnabled, allDeclarativeEnforced), func(t *testing.T) {
+					testCtx := ctx
+					if allDeclarativeEnforced {
+						testCtx = validate.WithAllDeclarativeEnforcedForTest(ctx)
+					}
+					errs := ValidateObjectMetaDeclaratively(testCtx, operation.Update, tc.obj, tc.oldObj, tc.requiresNamespace, NameIsDNSSubdomain, fldPath, betaEnabled)
+					matcher.Test(t, toExpectedErrs(allDeclarativeEnforced, betaEnabled, tc.expectedErrs), errs)
+				})
+			}
+		}
+	}
+}
+
+func mkMeta(tweaks ...func(*metav1.ObjectMeta)) *metav1.ObjectMeta {
+	obj := &metav1.ObjectMeta{
+		Name:      "valid-name",
+		Namespace: "valid-ns",
+	}
+	for _, tweak := range tweaks {
+		tweak(obj)
+	}
+	return obj
+}
+
+func tweakName(n string) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.Name = n }
+}
+
+func tweakNamespace(ns string) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.Namespace = ns }
+}
+
+func tweakResourceVersion(rv string) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.ResourceVersion = rv }
+}
+
+func tweakGeneration(g int64) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.Generation = g }
+}
+
+func tweakAnnotations(ann map[string]string) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.Annotations = ann }
+}
+
+func tweakManagedFields(entries ...metav1.ManagedFieldsEntry) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.ManagedFields = entries }
+}
+
+func tweakUID(u string) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.UID = types.UID(u) }
+}
+
+func tweakCreationTimestamp(t metav1.Time) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.CreationTimestamp = t }
+}
+
+func tweakDeletionTimestamp(t *metav1.Time) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.DeletionTimestamp = t }
+}
+
+func tweakDeletionGracePeriodSeconds(gps *int64) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.DeletionGracePeriodSeconds = gps }
+}
+
+func tweakRefAPIVersion(v string) func(*metav1.OwnerReference) {
+	return func(r *metav1.OwnerReference) { r.APIVersion = v }
+}
+
+func tweakRefKind(k string) func(*metav1.OwnerReference) {
+	return func(r *metav1.OwnerReference) { r.Kind = k }
+}
+
+func tweakRefName(n string) func(*metav1.OwnerReference) {
+	return func(r *metav1.OwnerReference) { r.Name = n }
+}
+
+func tweakRefUID(u string) func(*metav1.OwnerReference) {
+	return func(r *metav1.OwnerReference) { r.UID = types.UID(u) }
+}
+
+func tweakOwnerRefs(refs ...metav1.OwnerReference) func(*metav1.ObjectMeta) {
+	return func(o *metav1.ObjectMeta) { o.OwnerReferences = refs }
+}
+
+func mkOwnerRef(tweaks ...func(*metav1.OwnerReference)) metav1.OwnerReference {
+	r := &metav1.OwnerReference{
+		APIVersion: "v1",
+		Kind:       "Pod",
+		Name:       "name",
+		UID:        "uid-1",
+	}
+	for _, tweak := range tweaks {
+		tweak(r)
+	}
+	return *r
 }

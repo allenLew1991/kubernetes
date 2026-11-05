@@ -26,6 +26,7 @@ import (
 
 var _ runtime.Unstructured = &UnstructuredList{}
 var _ metav1.ListInterface = &UnstructuredList{}
+var _ metav1.ShardedListInterface = &UnstructuredList{}
 
 // UnstructuredList allows lists that do not have Golang structs
 // registered to be manipulated generically. This can be used to deal
@@ -52,20 +53,38 @@ func (u *UnstructuredList) EachListItem(fn func(runtime.Object) error) error {
 	return nil
 }
 
-// UnstructuredContent returns a map contain an overlay of the Items field onto
-// the Object field. Items always overwrites overlay. Changing "items" in the
-// returned object will affect items in the underlying Items field, but changing
-// the "items" slice itself will have no effect.
-// TODO: expose SetUnstructuredContent on runtime.Unstructured that allows
-// items to be changed.
-func (u *UnstructuredList) UnstructuredContent() map[string]interface{} {
-	out := u.Object
-	if out == nil {
-		out = make(map[string]interface{})
+func (u *UnstructuredList) EachListItemWithAlloc(fn func(runtime.Object) error) error {
+	for i := range u.Items {
+		if err := fn(&Unstructured{Object: u.Items[i].Object}); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// NewEmptyInstance returns a new instance of the concrete type containing only kind/apiVersion and no other data.
+// This should be called instead of reflect.New() for unstructured types because the go type alone does not preserve kind/apiVersion info.
+func (u *UnstructuredList) NewEmptyInstance() runtime.Unstructured {
+	out := new(UnstructuredList)
+	if u != nil {
+		out.SetGroupVersionKind(u.GroupVersionKind())
+	}
+	return out
+}
+
+// UnstructuredContent returns a map contain an overlay of the Items field onto
+// the Object field. Items always overwrites overlay.
+func (u *UnstructuredList) UnstructuredContent() map[string]interface{} {
+	out := make(map[string]interface{}, len(u.Object)+1)
+
+	// shallow copy every property
+	for k, v := range u.Object {
+		out[k] = v
+	}
+
 	items := make([]interface{}, len(u.Items))
 	for i, item := range u.Items {
-		items[i] = item.Object
+		items[i] = item.UnstructuredContent()
 	}
 	out["items"] = items
 	return out
@@ -165,6 +184,34 @@ func (u *UnstructuredList) GetContinue() string {
 
 func (u *UnstructuredList) SetContinue(c string) {
 	u.setNestedField(c, "metadata", "continue")
+}
+
+func (u *UnstructuredList) GetRemainingItemCount() *int64 {
+	return getNestedInt64Pointer(u.Object, "metadata", "remainingItemCount")
+}
+
+func (u *UnstructuredList) SetRemainingItemCount(c *int64) {
+	if c == nil {
+		RemoveNestedField(u.Object, "metadata", "remainingItemCount")
+	} else {
+		u.setNestedField(*c, "metadata", "remainingItemCount")
+	}
+}
+
+func (u *UnstructuredList) GetShardInfo() *metav1.ShardInfo {
+	selector, found, err := NestedString(u.Object, "metadata", "shardInfo", "selector")
+	if !found || err != nil {
+		return nil
+	}
+	return &metav1.ShardInfo{Selector: selector}
+}
+
+func (u *UnstructuredList) SetShardInfo(info *metav1.ShardInfo) {
+	if info == nil {
+		RemoveNestedField(u.Object, "metadata", "shardInfo")
+	} else {
+		u.setNestedField(map[string]interface{}{"selector": info.Selector}, "metadata", "shardInfo")
+	}
 }
 
 func (u *UnstructuredList) SetGroupVersionKind(gvk schema.GroupVersionKind) {

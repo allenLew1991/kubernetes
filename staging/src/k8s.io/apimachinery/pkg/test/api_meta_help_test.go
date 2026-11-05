@@ -20,16 +20,18 @@ import (
 	"reflect"
 	"testing"
 
-	fuzz "github.com/google/gofuzz"
+	"github.com/google/go-cmp/cmp"
+	"sigs.k8s.io/randfill"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metafuzzer "k8s.io/apimachinery/pkg/apis/meta/fuzzer"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/apis/testapigroup"
-	"k8s.io/apimachinery/pkg/apis/testapigroup/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/testapigroup/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
 func TestIsList(t *testing.T) {
@@ -281,7 +283,7 @@ func TestSetListToRuntimeObjectArray(t *testing.T) {
 	}
 	for i := range list {
 		if e, a := list[i], pl.Items[i]; e != a {
-			t.Fatalf("%d: unmatched: %s", i, diff.ObjectDiff(e, a))
+			t.Fatalf("%d: unmatched: %s", i, cmp.Diff(e, a))
 		}
 	}
 }
@@ -302,16 +304,18 @@ func TestSetListToMatchingType(t *testing.T) {
 	}
 	for i := range list {
 		if e, a := list[i], &pl.Items[i]; !reflect.DeepEqual(e, a) {
-			t.Fatalf("%d: unmatched: %s", i, diff.ObjectDiff(e, a))
+			t.Fatalf("%d: unmatched: %s", i, cmp.Diff(e, a))
 		}
 	}
 }
 
 func TestSetExtractListRoundTrip(t *testing.T) {
-	fuzzer := fuzz.New().NilChance(0).NumElements(1, 5)
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+	fuzzer := randfill.New().NilChance(0).NumElements(1, 5).Funcs(metafuzzer.Funcs(codecs)...).MaxDepth(10)
 	for i := 0; i < 5; i++ {
 		start := &testapigroup.CarpList{}
-		fuzzer.Fuzz(&start.Items)
+		fuzzer.Fill(&start.Items)
 
 		list, err := meta.ExtractList(start)
 		if err != nil {

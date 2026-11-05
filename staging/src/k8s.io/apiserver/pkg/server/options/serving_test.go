@@ -18,6 +18,7 @@ package options
 
 import (
 	"bytes"
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -25,37 +26,36 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/version"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
-	. "k8s.io/apiserver/pkg/server"
-	utilflag "k8s.io/apiserver/pkg/util/flag"
 	"k8s.io/client-go/discovery"
 	restclient "k8s.io/client-go/rest"
-	"strconv"
+	cliflag "k8s.io/component-base/cli/flag"
+	basecompatibility "k8s.io/component-base/compatibility"
+	baseversion "k8s.io/component-base/version"
+	"k8s.io/klog/v2/ktesting"
+	netutils "k8s.io/utils/net"
 )
 
-func setUp(t *testing.T) Config {
+func setUp(t *testing.T) server.Config {
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
 
-	config := NewConfig(codecs)
-	config.RequestContextMapper = genericapirequest.NewRequestContextMapper()
+	config := server.NewConfig(codecs)
 
 	return *config
 }
@@ -70,190 +70,6 @@ type NamedTestCertSpec struct {
 	explicitNames []string // as --tls-sni-cert-key explicit names
 }
 
-func TestGetNamedCertificateMap(t *testing.T) {
-	tests := []struct {
-		certs         []NamedTestCertSpec
-		explicitNames []string
-		expected      map[string]int // name to certs[*] index
-		errorString   string
-	}{
-		{
-			// empty certs
-			expected: map[string]int{},
-		},
-		{
-			// only one cert
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-					},
-				},
-			},
-			expected: map[string]int{
-				"test.com": 0,
-			},
-		},
-		{
-			// ips are ignored
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-						ips:  []string{"1.2.3.4"},
-					},
-				},
-			},
-			expected: map[string]int{
-				"test.com": 0,
-			},
-		},
-		{
-			// two certs with the same name
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-					},
-				},
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-					},
-				},
-			},
-			expected: map[string]int{
-				"test.com": 0,
-			},
-		},
-		{
-			// two certs with different names
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test2.com",
-					},
-				},
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test1.com",
-					},
-				},
-			},
-			expected: map[string]int{
-				"test1.com": 1,
-				"test2.com": 0,
-			},
-		},
-		{
-			// two certs with the same name, explicit trumps
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-					},
-				},
-				{
-					TestCertSpec: TestCertSpec{
-						host: "test.com",
-					},
-					explicitNames: []string{"test.com"},
-				},
-			},
-			expected: map[string]int{
-				"test.com": 1,
-			},
-		},
-		{
-			// certs with partial overlap; ips are ignored
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host:  "a",
-						names: []string{"a.test.com", "test.com"},
-					},
-				},
-				{
-					TestCertSpec: TestCertSpec{
-						host:  "b",
-						names: []string{"b.test.com", "test.com"},
-					},
-				},
-			},
-			expected: map[string]int{
-				"a": 0, "b": 1,
-				"a.test.com": 0, "b.test.com": 1,
-				"test.com": 0,
-			},
-		},
-		{
-			// wildcards
-			certs: []NamedTestCertSpec{
-				{
-					TestCertSpec: TestCertSpec{
-						host:  "a",
-						names: []string{"a.test.com", "test.com"},
-					},
-					explicitNames: []string{"*.test.com", "test.com"},
-				},
-				{
-					TestCertSpec: TestCertSpec{
-						host:  "b",
-						names: []string{"b.test.com", "test.com"},
-					},
-					explicitNames: []string{"dev.test.com", "test.com"},
-				}},
-			expected: map[string]int{
-				"test.com":     0,
-				"*.test.com":   0,
-				"dev.test.com": 1,
-			},
-		},
-	}
-
-NextTest:
-	for i, test := range tests {
-		var namedTLSCerts []NamedTLSCert
-		bySignature := map[string]int{} // index in test.certs by cert signature
-		for j, c := range test.certs {
-			cert, err := createTestTLSCerts(c.TestCertSpec)
-			if err != nil {
-				t.Errorf("%d - failed to create cert %d: %v", i, j, err)
-				continue NextTest
-			}
-
-			namedTLSCerts = append(namedTLSCerts, NamedTLSCert{
-				TLSCert: cert,
-				Names:   c.explicitNames,
-			})
-
-			sig, err := certSignature(cert)
-			if err != nil {
-				t.Errorf("%d - failed to get signature for %d: %v", i, j, err)
-				continue NextTest
-			}
-			bySignature[sig] = j
-		}
-
-		certMap, err := GetNamedCertificateMap(namedTLSCerts)
-		if err == nil && len(test.errorString) != 0 {
-			t.Errorf("%d - expected no error, got: %v", i, err)
-		} else if err != nil && err.Error() != test.errorString {
-			t.Errorf("%d - expected error %q, got: %v", i, test.errorString, err)
-		} else {
-			got := map[string]int{}
-			for name, cert := range certMap {
-				x509Certs, err := x509.ParseCertificates(cert.Certificate[0])
-				assert.NoError(t, err, "%d - invalid certificate for %q", i, name)
-				assert.True(t, len(x509Certs) > 0, "%d - expected at least one x509 cert in tls cert for %q", i, name)
-				got[name] = bySignature[x509CertSignature(x509Certs[0])]
-			}
-
-			assert.EqualValues(t, test.expected, got, "%d - wrong certificate map", i)
-		}
-	}
-}
-
 func TestServerRunWithSNI(t *testing.T) {
 	tests := map[string]struct {
 		Cert              TestCertSpec
@@ -265,7 +81,6 @@ func TestServerRunWithSNI(t *testing.T) {
 
 		// optional ip or hostname to pass to NewLoopbackClientConfig
 		LoopbackClientBindAddressOverride string
-		ExpectLoopbackClientError         bool
 	}{
 		"only one cert": {
 			Cert: TestCertSpec{
@@ -400,79 +215,73 @@ func TestServerRunWithSNI(t *testing.T) {
 		return strings.Replace(name, "*", "star", -1)
 	}
 
-NextTest:
-	for title, test := range tests {
-		// create server cert
-		certDir := "testdata/" + specToName(test.Cert)
-		serverCertBundleFile := filepath.Join(certDir, "cert")
-		serverKeyFile := filepath.Join(certDir, "key")
-		err := getOrCreateTestCertFiles(serverCertBundleFile, serverKeyFile, test.Cert)
-		if err != nil {
-			t.Errorf("%q - failed to create server cert: %v", title, err)
-			continue NextTest
-		}
-		ca, err := caCertFromBundle(serverCertBundleFile)
-		if err != nil {
-			t.Errorf("%q - failed to extract ca cert from server cert bundle: %v", title, err)
-			continue NextTest
-		}
-		caCerts := []*x509.Certificate{ca}
+	for title := range tests {
+		test := tests[title]
+		t.Run(title, func(t *testing.T) {
+			t.Parallel()
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancelCause(ctx)
+			defer cancel(errors.New("test has completed"))
 
-		// create SNI certs
-		var namedCertKeys []utilflag.NamedCertKey
-		serverSig, err := certFileSignature(serverCertBundleFile, serverKeyFile)
-		if err != nil {
-			t.Errorf("%q - failed to get server cert signature: %v", title, err)
-			continue NextTest
-		}
-		signatures := map[string]int{
-			serverSig: -1,
-		}
-		for j, c := range test.SNICerts {
-			sniDir := filepath.Join(certDir, specToName(c.TestCertSpec))
-			certBundleFile := filepath.Join(sniDir, "cert")
-			keyFile := filepath.Join(sniDir, "key")
-			err := getOrCreateTestCertFiles(certBundleFile, keyFile, c.TestCertSpec)
+			// create server cert
+			certDir := "testdata/" + specToName(test.Cert)
+			serverCertBundleFile := filepath.Join(certDir, "cert")
+			serverKeyFile := filepath.Join(certDir, "key")
+			err := getOrCreateTestCertFiles(serverCertBundleFile, serverKeyFile, test.Cert)
 			if err != nil {
-				t.Errorf("%q - failed to create SNI cert %d: %v", title, j, err)
-				continue NextTest
+				t.Fatalf("failed to create server cert: %v", err)
 			}
-
-			namedCertKeys = append(namedCertKeys, utilflag.NamedCertKey{
-				KeyFile:  keyFile,
-				CertFile: certBundleFile,
-				Names:    c.explicitNames,
-			})
-
-			ca, err := caCertFromBundle(certBundleFile)
+			ca, err := caCertFromBundle(serverCertBundleFile)
 			if err != nil {
-				t.Errorf("%q - failed to extract ca cert from SNI cert %d: %v", title, j, err)
-				continue NextTest
+				t.Fatalf("failed to extract ca cert from server cert bundle: %v", err)
 			}
-			caCerts = append(caCerts, ca)
+			caCerts := []*x509.Certificate{ca}
 
-			// store index in namedCertKeys with the signature as the key
-			sig, err := certFileSignature(certBundleFile, keyFile)
+			// create SNI certs
+			var namedCertKeys []cliflag.NamedCertKey
+			serverSig, err := certFileSignature(serverCertBundleFile, serverKeyFile)
 			if err != nil {
-				t.Errorf("%q - failed get SNI cert %d signature: %v", title, j, err)
-				continue NextTest
+				t.Fatalf("failed to get server cert signature: %v", err)
 			}
-			signatures[sig] = j
-		}
+			signatures := map[string]int{
+				serverSig: -1,
+			}
+			for j, c := range test.SNICerts {
+				sniDir := filepath.Join(certDir, specToName(c.TestCertSpec))
+				certBundleFile := filepath.Join(sniDir, "cert")
+				keyFile := filepath.Join(sniDir, "key")
+				err := getOrCreateTestCertFiles(certBundleFile, keyFile, c.TestCertSpec)
+				if err != nil {
+					t.Fatalf("failed to create SNI cert %d: %v", j, err)
+				}
 
-		stopCh := make(chan struct{})
-		func() {
-			defer close(stopCh)
+				namedCertKeys = append(namedCertKeys, cliflag.NamedCertKey{
+					KeyFile:  keyFile,
+					CertFile: certBundleFile,
+					Names:    c.explicitNames,
+				})
+
+				ca, err := caCertFromBundle(certBundleFile)
+				if err != nil {
+					t.Fatalf("failed to extract ca cert from SNI cert %d: %v", j, err)
+				}
+				caCerts = append(caCerts, ca)
+
+				// store index in namedCertKeys with the signature as the key
+				sig, err := certFileSignature(certBundleFile, keyFile)
+				if err != nil {
+					t.Fatalf("failed get SNI cert %d signature: %v", j, err)
+				}
+				signatures[sig] = j
+			}
 
 			// launch server
 			config := setUp(t)
-
-			v := fakeVersion()
-			config.Version = &v
-
+			info := fakeVersionInfo()
+			config.EffectiveVersion = basecompatibility.NewEffectiveVersionFromString(fmt.Sprintf("%s.%s", info.Major, info.Minor), "", "")
 			config.EnableIndex = true
-			secureOptions := &SecureServingOptions{
-				BindAddress: net.ParseIP("127.0.0.1"),
+			secureOptions := (&SecureServingOptions{
+				BindAddress: netutils.ParseIPSloppy("127.0.0.1"),
 				BindPort:    6443,
 				ServerCert: GeneratableKeyCert{
 					CertKey: CertKey{
@@ -480,39 +289,39 @@ NextTest:
 						KeyFile:  serverKeyFile,
 					},
 				},
-				SNICertKeys: namedCertKeys,
-			}
+				DisableHTTP2Serving: true,
+				SNICertKeys:         namedCertKeys,
+			}).WithLoopback()
 			// use a random free port
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
-				t.Errorf("failed to listen on 127.0.0.1:0")
+				t.Fatalf("failed to listen on 127.0.0.1:0")
 			}
 
 			secureOptions.Listener = ln
 			// get port
 			secureOptions.BindPort = ln.Addr().(*net.TCPAddr).Port
 			config.LoopbackClientConfig = &restclient.Config{}
-			if err := secureOptions.ApplyTo(&config); err != nil {
-				t.Errorf("%q - failed applying the SecureServingOptions: %v", title, err)
-				return
+			if err := secureOptions.ApplyTo(&config.SecureServing, &config.LoopbackClientConfig); err != nil {
+				t.Fatalf("failed applying the SecureServingOptions: %v", err)
 			}
 
-			s, err := config.Complete(nil).New("test", server.EmptyDelegate)
+			s, err := config.Complete(nil).New("test", server.NewEmptyDelegate())
 			if err != nil {
-				t.Errorf("%q - failed creating the server: %v", title, err)
-				return
+				t.Fatalf("failed creating the server: %v", err)
 			}
 
 			// add poststart hook to know when the server is up.
 			startedCh := make(chan struct{})
-			s.AddPostStartHook("test-notifier", func(context PostStartHookContext) error {
+			s.AddPostStartHookOrDie("test-notifier", func(context server.PostStartHookContext) error {
 				close(startedCh)
 				return nil
 			})
 			preparedServer := s.PrepareRun()
+			preparedServerErrors := make(chan error)
 			go func() {
-				if err := preparedServer.Run(stopCh); err != nil {
-					t.Fatal(err)
+				if err := preparedServer.RunWithContext(ctx); err != nil {
+					preparedServerErrors <- err
 				}
 			}()
 
@@ -532,21 +341,19 @@ NextTest:
 				ServerName: test.ServerName, // used for SNI in the client HELLO packet
 			})
 			if err != nil {
-				t.Errorf("%q - failed to connect: %v", title, err)
-				return
+				t.Fatalf("failed to connect: %v", err)
 			}
+			defer conn.Close()
 
 			// check returned server certificate
 			sig := x509CertSignature(conn.ConnectionState().PeerCertificates[0])
 			gotCertIndex, found := signatures[sig]
 			if !found {
-				t.Errorf("%q - unknown signature returned from server: %s", title, sig)
+				t.Errorf("unknown signature returned from server: %s", sig)
 			}
 			if gotCertIndex != test.ExpectedCertIndex {
-				t.Errorf("%q - expected cert index %d, got cert index %d", title, test.ExpectedCertIndex, gotCertIndex)
+				t.Errorf("expected cert index %d, got cert index %d", test.ExpectedCertIndex, gotCertIndex)
 			}
-
-			conn.Close()
 
 			// check that the loopback client can connect
 			host := "127.0.0.1"
@@ -554,49 +361,34 @@ NextTest:
 				host = test.LoopbackClientBindAddressOverride
 			}
 			s.LoopbackClientConfig.Host = net.JoinHostPort(host, strconv.Itoa(secureOptions.BindPort))
-			if test.ExpectLoopbackClientError {
-				if err == nil {
-					t.Errorf("%q - expected error creating loopback client config", title)
-				}
-				return
-			}
-			if err != nil {
-				t.Errorf("%q - failed creating loopback client config: %v", title, err)
-				return
-			}
+
 			client, err := discovery.NewDiscoveryClientForConfig(s.LoopbackClientConfig)
 			if err != nil {
-				t.Errorf("%q - failed to create loopback client: %v", title, err)
-				return
+				t.Fatalf("failed to create loopback client: %v", err)
 			}
 			got, err := client.ServerVersion()
 			if err != nil {
-				t.Errorf("%q - failed to connect with loopback client: %v", title, err)
-				return
+				t.Fatalf("failed to connect with loopback client: %v", err)
 			}
-			if expected := &v; !reflect.DeepEqual(got, expected) {
-				t.Errorf("%q - loopback client didn't get correct version info: expected=%v got=%v", title, expected, got)
+			if expected := &info; !reflect.DeepEqual(got, expected) {
+				t.Errorf("loopback client didn't get correct version info: expected=%v got=%v", *expected, *got)
 			}
-		}()
+
+			select {
+			case err := <-preparedServerErrors:
+				t.Fatalf("preparedServer failed with error: %v", err)
+			default:
+			}
+		})
 	}
 }
 
 func parseIPList(ips []string) []net.IP {
 	var netIPs []net.IP
 	for _, ip := range ips {
-		netIPs = append(netIPs, net.ParseIP(ip))
+		netIPs = append(netIPs, netutils.ParseIPSloppy(ip))
 	}
 	return netIPs
-}
-
-func createTestTLSCerts(spec TestCertSpec) (tlsCert tls.Certificate, err error) {
-	certPem, keyPem, err := generateSelfSignedCertKey(spec.host, parseIPList(spec.ips), spec.names)
-	if err != nil {
-		return tlsCert, err
-	}
-
-	tlsCert, err = tls.X509KeyPair(certPem, keyPem)
-	return tlsCert, err
 }
 
 func getOrCreateTestCertFiles(certFileName, keyFileName string, spec TestCertSpec) (err error) {
@@ -612,13 +404,13 @@ func getOrCreateTestCertFiles(certFileName, keyFileName string, spec TestCertSpe
 	}
 
 	os.MkdirAll(filepath.Dir(certFileName), os.FileMode(0755))
-	err = ioutil.WriteFile(certFileName, certPem, os.FileMode(0755))
+	err = os.WriteFile(certFileName, certPem, os.FileMode(0755))
 	if err != nil {
 		return err
 	}
 
 	os.MkdirAll(filepath.Dir(keyFileName), os.FileMode(0755))
-	err = ioutil.WriteFile(keyFileName, keyPem, os.FileMode(0755))
+	err = os.WriteFile(keyFileName, keyPem, os.FileMode(0755))
 	if err != nil {
 		return err
 	}
@@ -627,7 +419,7 @@ func getOrCreateTestCertFiles(certFileName, keyFileName string, spec TestCertSpe
 }
 
 func caCertFromBundle(bundlePath string) (*x509.Certificate, error) {
-	pemData, err := ioutil.ReadFile(bundlePath)
+	pemData, err := os.ReadFile(bundlePath)
 	if err != nil {
 		return nil, err
 	}
@@ -668,14 +460,15 @@ func certSignature(cert tls.Certificate) (string, error) {
 	return x509CertSignature(x509Certs[0]), nil
 }
 
-func fakeVersion() version.Info {
-	return version.Info{
-		Major:        "42",
-		Minor:        "42",
-		GitVersion:   "42",
-		GitCommit:    "34973274ccef6ab4dfaaf86599792fa9c3fe4689",
-		GitTreeState: "Dirty",
-	}
+func fakeVersionInfo() version.Info {
+	baseVer := baseversion.Get()
+	baseVer.Major = "42"
+	baseVer.Minor = "42"
+	baseVer.EmulationMajor = "42"
+	baseVer.EmulationMinor = "42"
+	baseVer.MinCompatibilityMajor = "42"
+	baseVer.MinCompatibilityMinor = "41"
+	return baseVer
 }
 
 // generateSelfSignedCertKey creates a self-signed certificate and key for the given host.
@@ -698,10 +491,10 @@ func generateSelfSignedCertKey(host string, alternateIPs []net.IP, alternateDNS 
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA: true,
+		IsCA:                  true,
 	}
 
-	if ip := net.ParseIP(host); ip != nil {
+	if ip := netutils.ParseIPSloppy(host); ip != nil {
 		template.IPAddresses = append(template.IPAddresses, ip)
 	} else {
 		template.DNSNames = append(template.DNSNames, host)

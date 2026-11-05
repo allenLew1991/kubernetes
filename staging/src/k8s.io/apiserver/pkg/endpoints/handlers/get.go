@@ -17,6 +17,7 @@ limitations under the License.
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -24,108 +25,110 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
-
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	metainternalversionscheme "k8s.io/apimachinery/pkg/apis/meta/internalversion/scheme"
+	metainternalversionvalidation "k8s.io/apimachinery/pkg/apis/meta/internalversion/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/audit"
+	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/metrics"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/registry/rest"
-	utiltrace "k8s.io/apiserver/pkg/util/trace"
+	"k8s.io/apiserver/pkg/server/routine"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/tracing"
+	"k8s.io/klog/v2"
 )
 
 // getterFunc performs a get request with the given context and object name. The request
 // may be used to deserialize an options object to pass to the getter.
-type getterFunc func(ctx request.Context, name string, req *http.Request, trace *utiltrace.Trace) (runtime.Object, error)
+type getterFunc func(ctx context.Context, name string, req *http.Request) (runtime.Object, error)
 
 // getResourceHandler is an HTTP handler function for get requests. It delegates to the
 // passed-in getterFunc to perform the actual get.
-func getResourceHandler(scope RequestScope, getter getterFunc) http.HandlerFunc {
+func getResourceHandler(scope *RequestScope, getter getterFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		trace := utiltrace.New("Get " + req.URL.Path)
-		defer trace.LogIfLong(500 * time.Millisecond)
+		ctx := req.Context()
+		ctx, span := tracing.Start(ctx, "Get", traceFields(req)...)
+		req = req.WithContext(ctx)
+		defer span.End(500 * time.Millisecond)
 
 		namespace, name, err := scope.Namer.Name(req)
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
-		ctx := scope.ContextFunc(req)
 		ctx = request.WithNamespace(ctx, namespace)
 
-		result, err := getter(ctx, name, req, trace)
+		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
-		requestInfo, ok := request.RequestInfoFrom(ctx)
-		if !ok {
-			scope.err(fmt.Errorf("missing requestInfo"), w, req)
-			return
-		}
-		if err := setSelfLink(result, requestInfo, scope.Namer); err != nil {
+
+		result, err := getter(ctx, name, req)
+		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
 
-		trace.Step("About to write a response")
-		transformResponseObject(ctx, scope, req, w, http.StatusOK, result)
+		span.AddEvent("About to write a response")
+		defer span.AddEvent("Writing http response done")
+		transformResponseObject(ctx, scope, req, w, http.StatusOK, outputMediaType, result)
 	}
 }
 
 // GetResource returns a function that handles retrieving a single resource from a rest.Storage object.
-func GetResource(r rest.Getter, e rest.Exporter, scope RequestScope) http.HandlerFunc {
+func GetResource(r rest.Getter, scope *RequestScope) http.HandlerFunc {
 	return getResourceHandler(scope,
-		func(ctx request.Context, name string, req *http.Request, trace *utiltrace.Trace) (runtime.Object, error) {
+		func(ctx context.Context, name string, req *http.Request) (runtime.Object, error) {
 			// check for export
 			options := metav1.GetOptions{}
 			if values := req.URL.Query(); len(values) > 0 {
-				exports := metav1.ExportOptions{}
-				if err := metainternalversion.ParameterCodec.DecodeParameters(values, scope.MetaGroupVersion, &exports); err != nil {
-					err = errors.NewBadRequest(err.Error())
-					return nil, err
-				}
-				if exports.Export {
-					if e == nil {
-						return nil, errors.NewBadRequest(fmt.Sprintf("export of %q is not supported", scope.Resource.Resource))
+				if len(values["export"]) > 0 {
+					exportBool := true
+					exportStrings := values["export"]
+					err := runtime.Convert_Slice_string_To_bool(&exportStrings, &exportBool, nil)
+					if err != nil {
+						return nil, errors.NewBadRequest(fmt.Sprintf("the export parameter cannot be parsed: %v", err))
 					}
-					return e.Export(ctx, name, exports)
+					if exportBool {
+						return nil, errors.NewBadRequest("the export parameter, deprecated since v1.14, is no longer supported")
+					}
 				}
-				if err := metainternalversion.ParameterCodec.DecodeParameters(values, scope.MetaGroupVersion, &options); err != nil {
+				if err := metainternalversionscheme.ParameterCodec.DecodeParameters(values, scope.MetaGroupVersion, &options); err != nil {
 					err = errors.NewBadRequest(err.Error())
 					return nil, err
 				}
 			}
-			if trace != nil {
-				trace.Step("About to Get from storage")
-			}
+			tracing.SpanFromContext(ctx).AddEvent("About to Get from storage")
 			return r.Get(ctx, name, &options)
 		})
 }
 
 // GetResourceWithOptions returns a function that handles retrieving a single resource from a rest.Storage object.
-func GetResourceWithOptions(r rest.GetterWithOptions, scope RequestScope, isSubresource bool) http.HandlerFunc {
+func GetResourceWithOptions(r rest.GetterWithOptions, scope *RequestScope, isSubresource bool) http.HandlerFunc {
 	return getResourceHandler(scope,
-		func(ctx request.Context, name string, req *http.Request, trace *utiltrace.Trace) (runtime.Object, error) {
+		func(ctx context.Context, name string, req *http.Request) (runtime.Object, error) {
 			opts, subpath, subpathKey := r.NewGetOptions()
-			trace.Step("About to process Get options")
+			span := tracing.SpanFromContext(ctx)
+			span.AddEvent("About to process Get options")
 			if err := getRequestOptions(req, scope, opts, subpath, subpathKey, isSubresource); err != nil {
 				err = errors.NewBadRequest(err.Error())
 				return nil, err
 			}
-			if trace != nil {
-				trace.Step("About to Get from storage")
-			}
+			span.AddEvent("About to Get from storage")
 			return r.Get(ctx, name, opts)
 		})
 }
 
 // getRequestOptions parses out options and can include path information.  The path information shouldn't include the subresource.
-func getRequestOptions(req *http.Request, scope RequestScope, into runtime.Object, subpath bool, subpathKey string, isSubresource bool) error {
+func getRequestOptions(req *http.Request, scope *RequestScope, into runtime.Object, subpath bool, subpathKey string, isSubresource bool) error {
 	if into == nil {
 		return nil
 	}
@@ -137,7 +140,7 @@ func getRequestOptions(req *http.Request, scope RequestScope, into runtime.Objec
 			newQuery[k] = v
 		}
 
-		ctx := scope.ContextFunc(req)
+		ctx := req.Context()
 		requestInfo, _ := request.RequestInfoFrom(ctx)
 		startingIndex := 2
 		if isSubresource {
@@ -162,117 +165,167 @@ func getRequestOptions(req *http.Request, scope RequestScope, into runtime.Objec
 	return scope.ParameterCodec.DecodeParameters(query, scope.Kind.GroupVersion(), into)
 }
 
-func ListResource(r rest.Lister, rw rest.Watcher, scope RequestScope, forceWatch bool, minRequestTimeout time.Duration) http.HandlerFunc {
+func ListResource(r rest.Lister, rw rest.Watcher, scope *RequestScope, forceWatch bool, minRequestTimeout time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		// For performance tracking purposes.
-		trace := utiltrace.New("List " + req.URL.Path)
-
+		ctx := req.Context()
 		namespace, err := scope.Namer.Namespace(req)
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
-
-		// Watches for single objects are routed to this function.
-		// Treat a name parameter the same as a field selector entry.
-		hasName := true
-		_, name, err := scope.Namer.Name(req)
-		if err != nil {
-			hasName = false
-		}
-
-		ctx := scope.ContextFunc(req)
 		ctx = request.WithNamespace(ctx, namespace)
 
-		opts := metainternalversion.ListOptions{}
-		if err := metainternalversion.ParameterCodec.DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, &opts); err != nil {
-			err = errors.NewBadRequest(err.Error())
+		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+		opts, err := listOpts(req, scope)
+		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
 
-		// transform fields
-		// TODO: DecodeParametersInto should do this.
-		if opts.FieldSelector != nil {
-			fn := func(label, value string) (newLabel, newValue string, err error) {
-				return scope.Convertor.ConvertFieldLabel(scope.Kind.GroupVersion().String(), scope.Kind.Kind, label, value)
-			}
-			if opts.FieldSelector, err = opts.FieldSelector.Transform(fn); err != nil {
-				// TODO: allow bad request to set field causes based on query parameters
-				err = errors.NewBadRequest(err.Error())
-				scope.err(err, w, req)
-				return
-			}
+		switch {
+		case opts.Watch || forceWatch:
+			err = handleWatch(ctx, rw, scope, req, w, opts, outputMediaType, minRequestTimeout)
+		default:
+			err = handleList(ctx, r, scope, req, w, opts, outputMediaType)
 		}
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+	}
+}
 
-		if hasName {
-			// metadata.name is the canonical internal name.
-			// SelectionPredicate will notice that this is
-			// a request for a single object and optimize the
-			// storage query accordingly.
-			nameSelector := fields.OneTermEqualSelector("metadata.name", name)
-			if opts.FieldSelector != nil && !opts.FieldSelector.Empty() {
-				// It doesn't make sense to ask for both a name
-				// and a field selector, since just the name is
-				// sufficient to narrow down the request to a
-				// single object.
-				scope.err(errors.NewBadRequest("both a name and a field selector provided; please provide one or the other."), w, req)
-				return
+func listOpts(req *http.Request, scope *RequestScope) (metainternalversion.ListOptions, error) {
+	// Watches for single objects are routed to this function.
+	// Treat a name parameter the same as a field selector entry.
+	hasName := true
+	_, name, err := scope.Namer.Name(req)
+	if err != nil {
+		hasName = false
+	}
+
+	opts := metainternalversion.ListOptions{}
+	if err := metainternalversionscheme.ParameterCodec.DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, &opts); err != nil {
+		return opts, errors.NewBadRequest(err.Error())
+	}
+
+	metainternalversion.SetListOptionsDefaults(&opts, utilfeature.DefaultFeatureGate.Enabled(features.WatchList))
+	if errs := metainternalversionvalidation.ValidateListOptions(&opts, utilfeature.DefaultFeatureGate.Enabled(features.WatchList)); len(errs) > 0 {
+		err := errors.NewInvalid(schema.GroupKind{Group: metav1.GroupName, Kind: "ListOptions"}, "", errs)
+		return opts, err
+	}
+
+	// transform fields
+	// TODO: DecodeParametersInto should do this.
+	if opts.FieldSelector != nil {
+		fn := func(label, value string) (newLabel, newValue string, err error) {
+			return scope.Convertor.ConvertFieldLabel(scope.Kind, label, value)
+		}
+		if opts.FieldSelector, err = opts.FieldSelector.Transform(fn); err != nil {
+			// TODO: allow bad request to set field causes based on query parameters
+			return opts, errors.NewBadRequest(err.Error())
+		}
+	}
+
+	if hasName {
+		// metadata.name is the canonical internal name.
+		// SelectionPredicate will notice that this is a request for
+		// a single object and optimize the storage query accordingly.
+		nameSelector := fields.OneTermEqualSelector("metadata.name", name)
+
+		// Note that fieldSelector setting explicitly the "metadata.name"
+		// will result in reaching this branch (as the value of that field
+		// is propagated to requestInfo as the name parameter.
+		// That said, the allowed field selectors in this branch are:
+		// nil, fields.Everything and field selector matching metadata.name
+		// for our name.
+		if opts.FieldSelector != nil && !opts.FieldSelector.Empty() {
+			selectedName, ok := opts.FieldSelector.RequiresExactMatch("metadata.name")
+			if !ok || name != selectedName {
+				return opts, errors.NewBadRequest("fieldSelector metadata.name doesn't match requested name")
 			}
+		} else {
 			opts.FieldSelector = nameSelector
 		}
-
-		if opts.Watch || forceWatch {
-			if rw == nil {
-				scope.err(errors.NewMethodNotSupported(scope.Resource.GroupResource(), "watch"), w, req)
-				return
-			}
-			// TODO: Currently we explicitly ignore ?timeout= and use only ?timeoutSeconds=.
-			timeout := time.Duration(0)
-			if opts.TimeoutSeconds != nil {
-				timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
-			}
-			if timeout == 0 && minRequestTimeout > 0 {
-				timeout = time.Duration(float64(minRequestTimeout) * (rand.Float64() + 1.0))
-			}
-			glog.V(2).Infof("Starting watch for %s, rv=%s labels=%s fields=%s timeout=%s", req.URL.Path, opts.ResourceVersion, opts.LabelSelector, opts.FieldSelector, timeout)
-
-			watcher, err := rw.Watch(ctx, &opts)
-			if err != nil {
-				scope.err(err, w, req)
-				return
-			}
-			requestInfo, _ := request.RequestInfoFrom(ctx)
-			metrics.RecordLongRunning(req, requestInfo, func() {
-				serveWatch(watcher, scope, req, w, timeout)
-			})
-			return
-		}
-
-		// Log only long List requests (ignore Watch).
-		defer trace.LogIfLong(500 * time.Millisecond)
-		trace.Step("About to List from storage")
-		result, err := r.List(ctx, &opts)
-		if err != nil {
-			scope.err(err, w, req)
-			return
-		}
-		trace.Step("Listing from storage done")
-		numberOfItems, err := setListSelfLink(result, ctx, req, scope.Namer)
-		if err != nil {
-			scope.err(err, w, req)
-			return
-		}
-		trace.Step("Self-linking done")
-		// Ensure empty lists return a non-nil items slice
-		if numberOfItems == 0 && meta.IsListType(result) {
-			if err := meta.SetList(result, []runtime.Object{}); err != nil {
-				scope.err(err, w, req)
-				return
-			}
-		}
-
-		transformResponseObject(ctx, scope, req, w, http.StatusOK, result)
-		trace.Step(fmt.Sprintf("Writing http response done (%d items)", numberOfItems))
 	}
+	return opts, nil
+}
+
+func handleWatch(ctx context.Context, rw rest.Watcher, scope *RequestScope, req *http.Request, w http.ResponseWriter, opts metainternalversion.ListOptions, outputMediaType negotiation.MediaTypeOptions, minRequestTimeout time.Duration) error {
+	isWatchList := isListWatchRequest(opts)
+	var span *tracing.Span
+	var onWatchListComplete WatchListCompleteHook
+	if isWatchList {
+		ctx, span = tracing.Start(ctx, "WatchList", traceFields(req)...)
+		onWatchListComplete = func() { span.End(500 * time.Millisecond) }
+		req = req.WithContext(ctx)
+	}
+
+	if rw == nil {
+		return errors.NewMethodNotSupported(scope.Resource.GroupResource(), "watch")
+	}
+	// TODO: Currently we explicitly ignore ?timeout= and use only ?timeoutSeconds=.
+	timeout := time.Duration(0)
+	if opts.TimeoutSeconds != nil {
+		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
+	}
+	if timeout == 0 && minRequestTimeout > 0 {
+		timeout = time.Duration(float64(minRequestTimeout) * (rand.Float64() + 1.0))
+	}
+
+	klog.V(3).InfoS("Starting watch", "path", req.URL.Path, "resourceVersion", opts.ResourceVersion, "labels", opts.LabelSelector, "fields", opts.FieldSelector, "sendInitialEvents", opts.SendInitialEvents, "timeout", timeout, "audit-ID", audit.GetAuditIDTruncated(ctx))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer func() { cancel() }()
+	watcher, err := rw.Watch(ctx, &opts)
+	if err != nil {
+		return err
+	}
+	handler, err := serveWatchHandler(watcher, scope, outputMediaType, req, w, timeout, metrics.CleanListScope(ctx, &opts), isWatchList, onWatchListComplete)
+	if err != nil {
+		return err
+	}
+	// Invalidate cancel() to defer until serve() is complete.
+	deferredCancel := cancel
+	cancel = func() {}
+
+	serve := func() {
+		defer deferredCancel()
+		requestInfo, _ := request.RequestInfoFrom(ctx)
+		metrics.RecordLongRunning(req, requestInfo, metrics.APIServerComponent, func() {
+			defer watcher.Stop()
+			handler.ServeHTTP(w, req)
+		})
+	}
+
+	// Run watch serving in a separate goroutine to allow freeing current stack memory
+	t := routine.TaskFrom(req.Context())
+	if t != nil {
+		t.Func = serve
+	} else {
+		serve()
+	}
+	return nil
+}
+
+func handleList(ctx context.Context, r rest.Lister, scope *RequestScope, req *http.Request, w http.ResponseWriter, opts metainternalversion.ListOptions, outputMediaType negotiation.MediaTypeOptions) error {
+	// For performance tracking purposes.
+	ctx, span := tracing.Start(ctx, "List", traceFields(req)...)
+	defer span.End(500 * time.Millisecond)
+	req = req.WithContext(ctx)
+
+	result, err := r.List(ctx, &opts)
+	if err != nil {
+		return err
+	}
+	transformResponseObject(ctx, scope, req, w, http.StatusOK, outputMediaType, result)
+	return nil
+}
+
+// isListWatchRequest is mirrored in staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go
+func isListWatchRequest(opts metainternalversion.ListOptions) bool {
+	return opts.SendInitialEvents != nil && *opts.SendInitialEvents && opts.AllowWatchBookmarks
 }

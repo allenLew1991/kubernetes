@@ -17,28 +17,31 @@ limitations under the License.
 package autoregister
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"k8s.io/kube-aggregator/pkg/apis/apiregistration"
-	apiregistrationclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/internalclientset/typed/apiregistration/internalversion"
-	informers "k8s.io/kube-aggregator/pkg/client/informers/internalversion/apiregistration/internalversion"
-	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/internalversion"
+	v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	apiregistrationclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/typed/apiregistration/v1"
+	informers "k8s.io/kube-aggregator/pkg/client/informers/externalversions/apiregistration/v1"
+	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 	"k8s.io/kube-aggregator/pkg/controllers"
 )
 
 const (
+	// AutoRegisterManagedLabel is a label attached to the APIService that identifies how the APIService wants to be synced.
 	AutoRegisterManagedLabel = "kube-aggregator.kubernetes.io/automanaged"
 
 	// manageOnStart is a value for the AutoRegisterManagedLabel that indicates the APIService wants to be synced one time when the controller starts.
@@ -51,9 +54,9 @@ const (
 // adding and removing APIServices
 type AutoAPIServiceRegistration interface {
 	// AddAPIServiceToSyncOnStart adds an API service to sync on start.
-	AddAPIServiceToSyncOnStart(in *apiregistration.APIService)
+	AddAPIServiceToSyncOnStart(in *v1.APIService)
 	// AddAPIServiceToSync adds an API service to sync continuously.
-	AddAPIServiceToSync(in *apiregistration.APIService)
+	AddAPIServiceToSync(in *v1.APIService)
 	// RemoveAPIServiceToSync removes an API service to auto-register.
 	RemoveAPIServiceToSync(name string)
 }
@@ -66,7 +69,7 @@ type autoRegisterController struct {
 	apiServiceClient apiregistrationclient.APIServicesGetter
 
 	apiServicesToSyncLock sync.RWMutex
-	apiServicesToSync     map[string]*apiregistration.APIService
+	apiServicesToSync     map[string]*v1.APIService
 
 	syncHandler func(apiServiceName string) error
 
@@ -78,45 +81,49 @@ type autoRegisterController struct {
 	apiServicesAtStart map[string]bool
 
 	// queue is where incoming work is placed to de-dup and to allow "easy" rate limited requeues on errors
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
+// NewAutoRegisterController creates a new autoRegisterController.
 func NewAutoRegisterController(apiServiceInformer informers.APIServiceInformer, apiServiceClient apiregistrationclient.APIServicesGetter) *autoRegisterController {
 	c := &autoRegisterController{
 		apiServiceLister:  apiServiceInformer.Lister(),
 		apiServiceSynced:  apiServiceInformer.Informer().HasSynced,
 		apiServiceClient:  apiServiceClient,
-		apiServicesToSync: map[string]*apiregistration.APIService{},
+		apiServicesToSync: map[string]*v1.APIService{},
 
 		apiServicesAtStart: map[string]bool{},
 
 		syncedSuccessfullyLock: &sync.RWMutex{},
 		syncedSuccessfully:     map[string]bool{},
 
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "autoregister"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "autoregister"},
+		),
 	}
 	c.syncHandler = c.checkAPIService
 
 	apiServiceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			cast := obj.(*apiregistration.APIService)
+			cast := obj.(*v1.APIService)
 			c.queue.Add(cast.Name)
 		},
 		UpdateFunc: func(_, obj interface{}) {
-			cast := obj.(*apiregistration.APIService)
+			cast := obj.(*v1.APIService)
 			c.queue.Add(cast.Name)
 		},
 		DeleteFunc: func(obj interface{}) {
-			cast, ok := obj.(*apiregistration.APIService)
+			cast, ok := obj.(*v1.APIService)
 			if !ok {
 				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 				if !ok {
-					glog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
+					klog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
 					return
 				}
-				cast, ok = tombstone.Obj.(*apiregistration.APIService)
+				cast, ok = tombstone.Obj.(*v1.APIService)
 				if !ok {
-					glog.V(2).Infof("Tombstone contained unexpected object: %#v", obj)
+					klog.V(2).Infof("Tombstone contained unexpected object: %#v", obj)
 					return
 				}
 			}
@@ -127,14 +134,15 @@ func NewAutoRegisterController(apiServiceInformer informers.APIServiceInformer, 
 	return c
 }
 
-func (c *autoRegisterController) Run(threadiness int, stopCh <-chan struct{}) {
+// Run starts the autoregister controller in a loop which syncs API services until stopCh is closed.
+func (c *autoRegisterController) Run(workers int, stopCh <-chan struct{}) {
 	// don't let panics crash the process
 	defer utilruntime.HandleCrash()
 	// make sure the work queue is shutdown which will trigger workers to end
 	defer c.queue.ShutDown()
 
-	glog.Infof("Starting autoregister controller")
-	defer glog.Infof("Shutting down autoregister controller")
+	klog.Info("Starting autoregister controller")
+	defer klog.Info("Shutting down autoregister controller")
 
 	// wait for your secondary caches to fill before starting your work
 	if !controllers.WaitForCacheSync("autoregister", stopCh, c.apiServiceSynced) {
@@ -148,8 +156,8 @@ func (c *autoRegisterController) Run(threadiness int, stopCh <-chan struct{}) {
 		}
 	}
 
-	// start up your worker threads based on threadiness.  Some controllers have multiple kinds of workers
-	for i := 0; i < threadiness; i++ {
+	// start up your worker threads based on workers.  Some controllers have multiple kinds of workers
+	for i := 0; i < workers; i++ {
 		// runWorker will loop until "something bad" happens.  The .Until will then rekick the worker
 		// after one second
 		go wait.Until(c.runWorker, time.Second, stopCh)
@@ -177,7 +185,7 @@ func (c *autoRegisterController) processNextWorkItem() bool {
 	defer c.queue.Done(key)
 
 	// do your work on the key.  This method will contains your "do stuff" logic
-	err := c.syncHandler(key.(string))
+	err := c.syncHandler(key)
 	if err == nil {
 		// if you had no error, tell the queue to stop tracking history for your key.  This will
 		// reset things like failure counts for per-item rate limiting
@@ -199,14 +207,14 @@ func (c *autoRegisterController) processNextWorkItem() bool {
 
 // checkAPIService syncs the current APIService against a list of desired APIService objects
 //
-//                                                 | A. desired: not found | B. desired: sync on start | C. desired: sync always
-// ------------------------------------------------|-----------------------|---------------------------|------------------------
-// 1. current: lookup error                        | error                 | error                     | error
-// 2. current: not found                           | -                     | create once               | create
-// 3. current: no sync                             | -                     | -                         | -
-// 4. current: sync on start, not present at start | -                     | -                         | -
-// 5. current: sync on start, present at start     | delete once           | update once               | update once
-// 6. current: sync always                         | delete                | update once               | update
+//	                                                | A. desired: not found | B. desired: sync on start | C. desired: sync always
+//	------------------------------------------------|-----------------------|---------------------------|------------------------
+//	1. current: lookup error                        | error                 | error                     | error
+//	2. current: not found                           | -                     | create once               | create
+//	3. current: no sync                             | -                     | -                         | -
+//	4. current: sync on start, not present at start | -                     | -                         | -
+//	5. current: sync on start, present at start     | delete once           | update once               | update once
+//	6. current: sync always                         | delete                | update once               | update
 func (c *autoRegisterController) checkAPIService(name string) (err error) {
 	desired := c.GetAPIServiceToSync(name)
 	curr, err := c.apiServiceLister.Get(name)
@@ -236,7 +244,11 @@ func (c *autoRegisterController) checkAPIService(name string) (err error) {
 
 	// we don't have an entry and we do want one (2B,2C)
 	case apierrors.IsNotFound(err) && desired != nil:
-		_, err := c.apiServiceClient.APIServices().Create(desired)
+		_, err := c.apiServiceClient.APIServices().Create(context.TODO(), desired, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			// created in the meantime, we'll get called again
+			return nil
+		}
 		return err
 
 	// we aren't trying to manage this APIService (3A,3B,3C)
@@ -253,7 +265,13 @@ func (c *autoRegisterController) checkAPIService(name string) (err error) {
 
 	// we have a spurious APIService that we're managing, delete it (5A,6A)
 	case desired == nil:
-		return c.apiServiceClient.APIServices().Delete(curr.Name, nil)
+		opts := metav1.DeleteOptions{Preconditions: metav1.NewUIDPreconditions(string(curr.UID))}
+		err := c.apiServiceClient.APIServices().Delete(context.TODO(), curr.Name, opts)
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// deleted or changed in the meantime, we'll get called again
+			return nil
+		}
+		return err
 
 	// if the specs already match, nothing for us to do
 	case reflect.DeepEqual(curr.Spec, desired.Spec):
@@ -263,26 +281,33 @@ func (c *autoRegisterController) checkAPIService(name string) (err error) {
 	// we have an entry and we have a desired, now we deconflict.  Only a few fields matter. (5B,5C,6B,6C)
 	apiService := curr.DeepCopy()
 	apiService.Spec = desired.Spec
-	_, err = c.apiServiceClient.APIServices().Update(apiService)
+	_, err = c.apiServiceClient.APIServices().Update(context.TODO(), apiService, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// deleted or changed in the meantime, we'll get called again
+		return nil
+	}
 	return err
 }
 
-func (c *autoRegisterController) GetAPIServiceToSync(name string) *apiregistration.APIService {
+// GetAPIServiceToSync gets a single API service to sync.
+func (c *autoRegisterController) GetAPIServiceToSync(name string) *v1.APIService {
 	c.apiServicesToSyncLock.RLock()
 	defer c.apiServicesToSyncLock.RUnlock()
 
 	return c.apiServicesToSync[name]
 }
 
-func (c *autoRegisterController) AddAPIServiceToSyncOnStart(in *apiregistration.APIService) {
+// AddAPIServiceToSyncOnStart registers an API service to sync only when the controller starts.
+func (c *autoRegisterController) AddAPIServiceToSyncOnStart(in *v1.APIService) {
 	c.addAPIServiceToSync(in, manageOnStart)
 }
 
-func (c *autoRegisterController) AddAPIServiceToSync(in *apiregistration.APIService) {
+// AddAPIServiceToSync registers an API service to sync continuously.
+func (c *autoRegisterController) AddAPIServiceToSync(in *v1.APIService) {
 	c.addAPIServiceToSync(in, manageContinuously)
 }
 
-func (c *autoRegisterController) addAPIServiceToSync(in *apiregistration.APIService, syncType string) {
+func (c *autoRegisterController) addAPIServiceToSync(in *v1.APIService, syncType string) {
 	c.apiServicesToSyncLock.Lock()
 	defer c.apiServicesToSyncLock.Unlock()
 
@@ -296,6 +321,7 @@ func (c *autoRegisterController) addAPIServiceToSync(in *apiregistration.APIServ
 	c.queue.Add(apiService.Name)
 }
 
+// RemoveAPIServiceToSync deletes a registered APIService.
 func (c *autoRegisterController) RemoveAPIServiceToSync(name string) {
 	c.apiServicesToSyncLock.Lock()
 	defer c.apiServicesToSyncLock.Unlock()
@@ -316,18 +342,18 @@ func (c *autoRegisterController) setSyncedSuccessfully(name string) {
 	c.syncedSuccessfully[name] = true
 }
 
-func automanagedType(service *apiregistration.APIService) string {
+func automanagedType(service *v1.APIService) string {
 	if service == nil {
 		return ""
 	}
 	return service.Labels[AutoRegisterManagedLabel]
 }
 
-func isAutomanagedOnStart(service *apiregistration.APIService) bool {
+func isAutomanagedOnStart(service *v1.APIService) bool {
 	return automanagedType(service) == manageOnStart
 }
 
-func isAutomanaged(service *apiregistration.APIService) bool {
+func isAutomanaged(service *v1.APIService) bool {
 	managedType := automanagedType(service)
 	return managedType == manageOnStart || managedType == manageContinuously
 }

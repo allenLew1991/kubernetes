@@ -17,11 +17,14 @@ limitations under the License.
 package validation
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/api/validate"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,78 +33,87 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// TODO: delete this global variable when we enable the validation of common
-// fields by default.
-var RepairMalformedUpdates bool = true
-
+// FieldImmutableErrorMsg is a error message for field is immutable.
 const FieldImmutableErrorMsg string = `field is immutable`
 
-const totalAnnotationSizeLimitB int = 256 * (1 << 10) // 256 kB
+const TotalAnnotationSizeLimitB int = 256 * (1 << 10) // 256 kB
 
 // BannedOwners is a black list of object that are not allowed to be owners.
 var BannedOwners = map[schema.GroupVersionKind]struct{}{
 	{Group: "", Version: "v1", Kind: "Event"}: {},
 }
 
-// ValidateClusterName can be used to check whether the given cluster name is valid.
-var ValidateClusterName = NameIsDNS1035Label
-
 // ValidateAnnotations validates that a set of annotations are correctly defined.
 func ValidateAnnotations(annotations map[string]string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	var totalSize int64
-	for k, v := range annotations {
+	for k := range annotations {
+		// The rule is QualifiedName except that case doesn't matter, so convert to lowercase before checking.
 		for _, msg := range validation.IsQualifiedName(strings.ToLower(k)) {
-			allErrs = append(allErrs, field.Invalid(fldPath, k, msg))
+			allErrs = append(allErrs, field.Invalid(fldPath, k, msg).WithOrigin("format=k8s-label-key"))
 		}
-		totalSize += (int64)(len(k)) + (int64)(len(v))
 	}
-	if totalSize > (int64)(totalAnnotationSizeLimitB) {
-		allErrs = append(allErrs, field.TooLong(fldPath, "", totalAnnotationSizeLimitB))
+	if err := ValidateAnnotationsSize(annotations); err != nil {
+		allErrs = append(allErrs, field.TooLong(fldPath, "" /*unused*/, TotalAnnotationSizeLimitB))
 	}
 	return allErrs
 }
 
+func ValidateAnnotationsSize(annotations map[string]string) error {
+	var totalSize int64
+	for k, v := range annotations {
+		totalSize += (int64)(len(k)) + (int64)(len(v))
+	}
+	if totalSize > (int64)(TotalAnnotationSizeLimitB) {
+		return fmt.Errorf("annotations size %d is larger than limit %d", totalSize, TotalAnnotationSizeLimitB)
+	}
+	return nil
+}
+
 func validateOwnerReference(ownerReference metav1.OwnerReference, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	gvk := schema.FromAPIVersionAndKind(ownerReference.APIVersion, ownerReference.Kind)
+	gv, err := schema.ParseGroupVersion(ownerReference.APIVersion)
 	// gvk.Group is empty for the legacy group.
-	if len(gvk.Version) == 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("apiVersion"), ownerReference.APIVersion, "version must not be empty"))
+	if len(ownerReference.APIVersion) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("apiVersion"), "must not be empty").MarkCoveredByDeclarative())
+	} else if err != nil || len(gv.Version) == 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("apiVersion"), ownerReference.APIVersion, "must be <group>/<version> or <version>"))
 	}
-	if len(gvk.Kind) == 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("kind"), ownerReference.Kind, "kind must not be empty"))
+	if len(ownerReference.Kind) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("kind"), "must not be empty").MarkCoveredByDeclarative())
 	}
 	if len(ownerReference.Name) == 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("name"), ownerReference.Name, "name must not be empty"))
+		allErrs = append(allErrs, field.Required(fldPath.Child("name"), "must not be empty").MarkCoveredByDeclarative())
 	}
 	if len(ownerReference.UID) == 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("uid"), ownerReference.UID, "uid must not be empty"))
+		allErrs = append(allErrs, field.Required(fldPath.Child("uid"), "must not be empty").MarkCoveredByDeclarative())
 	}
+	gvk := gv.WithKind(ownerReference.Kind)
 	if _, ok := BannedOwners[gvk]; ok {
 		allErrs = append(allErrs, field.Invalid(fldPath, ownerReference, fmt.Sprintf("%s is disallowed from being an owner", gvk)))
 	}
 	return allErrs
 }
 
+// ValidateOwnerReferences validates that a set of owner references are correctly defined.
 func ValidateOwnerReferences(ownerReferences []metav1.OwnerReference, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	controllerName := ""
-	for _, ref := range ownerReferences {
-		allErrs = append(allErrs, validateOwnerReference(ref, fldPath)...)
+	firstControllerName := ""
+	for idx, ref := range ownerReferences {
+		allErrs = append(allErrs, validateOwnerReference(ref, fldPath.Index(idx))...)
 		if ref.Controller != nil && *ref.Controller {
-			if controllerName != "" {
+			curControllerName := ref.Kind + "/" + ref.Name
+			if firstControllerName != "" {
 				allErrs = append(allErrs, field.Invalid(fldPath, ownerReferences,
-					fmt.Sprintf("Only one reference can have Controller set to true. Found \"true\" in references for %v and %v", controllerName, ref.Name)))
+					fmt.Sprintf("Only one reference can have Controller set to true. Found \"true\" in references for %v and %v", firstControllerName, curControllerName)))
 			} else {
-				controllerName = ref.Name
+				firstControllerName = curControllerName
 			}
 		}
 	}
 	return allErrs
 }
 
-// Validate finalizer names
+// ValidateFinalizerName validates finalizer names.
 func ValidateFinalizerName(stringValue string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	for _, msg := range validation.IsQualifiedName(stringValue) {
@@ -111,6 +123,7 @@ func ValidateFinalizerName(stringValue string, fldPath *field.Path) field.ErrorL
 	return allErrs
 }
 
+// ValidateNoNewFinalizers validates the new finalizers has no new finalizers compare to old finalizers.
 func ValidateNoNewFinalizers(newFinalizers []string, oldFinalizers []string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	extra := sets.NewString(newFinalizers...).Difference(sets.NewString(oldFinalizers...))
@@ -120,6 +133,7 @@ func ValidateNoNewFinalizers(newFinalizers []string, oldFinalizers []string, fld
 	return allErrs
 }
 
+// ValidateImmutableField validates the new value and the old value are deeply equal.
 func ValidateImmutableField(newVal, oldVal interface{}, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if !apiequality.Semantic.DeepEqual(oldVal, newVal) {
@@ -128,24 +142,70 @@ func ValidateImmutableField(newVal, oldVal interface{}, fldPath *field.Path) fie
 	return allErrs
 }
 
+// ValidateObjectMetaDeclaratively validates an ObjectMeta instance declaratively and deduplicates handwritten errors.
+// betaEnabled controls whether declarative validation rules at the Beta stability level are enforced.
+// NOTE: This method should be used in the types for which declarative validation is not enabled yet or cannot be enabled. The types
+// for which declarative validation is enabled and valdiation code is generated must use ValidateObjectMeta and ValidateObjectMetaUpdate.
+func ValidateObjectMetaDeclaratively(ctx context.Context, op operation.Type, obj, oldObj *metav1.ObjectMeta, requiresNamespace bool, nameFn ValidateNameFunc, fldPath *field.Path, betaEnabled bool) field.ErrorList {
+	var errs field.ErrorList
+	switch op {
+	case operation.Create:
+		errs = ValidateObjectMeta(obj, requiresNamespace, nameFn, fldPath)
+	case operation.Update:
+		errs = ValidateObjectMetaUpdate(obj, oldObj, fldPath)
+	}
+	dvErrs := v1validation.Validate_ObjectMeta(ctx, operation.Operation{Type: op}, fldPath, obj, oldObj)
+	enforcedDVErrs := validate.FilterEnforcedDeclarativeErrors(ctx, dvErrs, betaEnabled)
+	errs = errs.MarkFromImperative()
+	errs = validate.FilterCoveredHandwrittenErrors(ctx, errs, enforcedDVErrs, betaEnabled)
+	return append(errs, enforcedDVErrs...)
+}
+
 // ValidateObjectMeta validates an object's metadata on creation. It expects that name generation has already
 // been performed.
-// It doesn't return an error for rootscoped resources with namespace, because namespace should already be cleared before.
 func ValidateObjectMeta(objMeta *metav1.ObjectMeta, requiresNamespace bool, nameFn ValidateNameFunc, fldPath *field.Path) field.ErrorList {
 	metadata, err := meta.Accessor(objMeta)
 	if err != nil {
-		allErrs := field.ErrorList{}
+		var allErrs field.ErrorList
 		allErrs = append(allErrs, field.Invalid(fldPath, objMeta, err.Error()))
 		return allErrs
 	}
 	return ValidateObjectMetaAccessor(metadata, requiresNamespace, nameFn, fldPath)
 }
 
-// ValidateObjectMeta validates an object's metadata on creation. It expects that name generation has already
+// objectMetaValidationOptions defines behavioral modifications for validating
+// an ObjectMeta.
+type objectMetaValidationOptions struct {
+	/* nothing here yet */
+}
+
+// ObjectMetaValidationOption specifies a behavioral modifier for
+// ValidateObjectMetaWithOpts and ValidateObjectMetaAccessorWithOpts.
+type ObjectMetaValidationOption func(opts *objectMetaValidationOptions)
+
+// ValidateObjectMetaWithOpts validates an object's metadata on creation. It
+// expects that name generation has already been performed, so name validation
+// is always executed.
+//
+// This is similar to ValidateObjectMeta, but uses options to buy future-safety
+// and uses different signature for the name validation function.  It also does
+// not directly validate the generateName field, because name generation
+// should have already been performed and it is the result of that generastion
+// that must conform to the nameFn.
+func ValidateObjectMetaWithOpts(objMeta *metav1.ObjectMeta, isNamespaced bool, nameFn ValidateNameFuncWithErrors, fldPath *field.Path, options ...ObjectMetaValidationOption) field.ErrorList {
+	metadata, err := meta.Accessor(objMeta)
+	if err != nil {
+		var allErrs field.ErrorList
+		allErrs = append(allErrs, field.InternalError(fldPath, err))
+		return allErrs
+	}
+	return ValidateObjectMetaAccessorWithOpts(metadata, isNamespaced, nameFn, fldPath, options...)
+}
+
+// ValidateObjectMetaAccessor validates an object's metadata on creation. It expects that name generation has already
 // been performed.
-// It doesn't return an error for rootscoped resources with namespace, because namespace should already be cleared before.
 func ValidateObjectMetaAccessor(meta metav1.Object, requiresNamespace bool, nameFn ValidateNameFunc, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
+	var allErrs field.ErrorList
 
 	if len(meta.GetGenerateName()) != 0 {
 		for _, msg := range nameFn(meta.GetGenerateName(), true) {
@@ -162,7 +222,57 @@ func ValidateObjectMetaAccessor(meta metav1.Object, requiresNamespace bool, name
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("name"), meta.GetName(), msg))
 		}
 	}
-	if requiresNamespace {
+
+	return append(allErrs, validateObjectMetaAccessorWithOptsCommon(meta, requiresNamespace, fldPath, nil)...)
+}
+
+// ValidateObjectMetaAccessorWithOpts validates an object's metadata on
+// creation. It expects that name generation has already been performed, so
+// name validation is always executed.
+//
+// This is similar to ValidateObjectMetaAccessor, but uses options to buy
+// future-safety and uses different signature for the name validation function.
+// It also does not directly validate the generateName field, because name
+// generation should have already been performed and it is the result of that
+// generastion that must conform to the nameFn.
+func ValidateObjectMetaAccessorWithOpts(meta metav1.Object, isNamespaced bool, nameFn ValidateNameFuncWithErrors, fldPath *field.Path, options ...ObjectMetaValidationOption) field.ErrorList {
+	opts := objectMetaValidationOptions{}
+	for _, opt := range options {
+		opt(&opts)
+	}
+
+	var allErrs field.ErrorList
+
+	// generateName is not directly validated here. Types can have
+	// different rules for name generation, and the nameFn is for validating
+	// the post-generation data, not the input. In the past we assumed that
+	// name generation was always "append 5 random characters", but that's not
+	// NECESSARILY true. Also, the nameFn should always be considering the max
+	// length of the name, and it doesn't know enough about the name generation
+	// to do that. Also, given a bad generateName, the user will get errors
+	// for both the generateName and name fields. We will focus validation on
+	// the name field, which should give a better UX overall.
+	// TODO(thockin): should we do a max-length check here? e.g. 1K or 4K?
+
+	if len(meta.GetGenerateName()) != 0 && len(meta.GetName()) == 0 {
+		allErrs = append(allErrs,
+			field.InternalError(fldPath.Child("name"), fmt.Errorf("generateName was specified (%q), but no name was generated", meta.GetGenerateName())))
+	}
+	if len(meta.GetName()) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("name"), "name or generateName is required"))
+	} else {
+		allErrs = append(allErrs, nameFn(fldPath.Child("name"), meta.GetName())...)
+	}
+
+	return append(allErrs, validateObjectMetaAccessorWithOptsCommon(meta, isNamespaced, fldPath, &opts)...)
+}
+
+// validateObjectMetaAccessorWithOptsCommon is a shared function for validating
+// the parts of an ObjectMeta with are handled the same in both paths..
+func validateObjectMetaAccessorWithOptsCommon(meta metav1.Object, isNamespaced bool, fldPath *field.Path, _ *objectMetaValidationOptions) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if isNamespaced {
 		if len(meta.GetNamespace()) == 0 {
 			allErrs = append(allErrs, field.Required(fldPath.Child("namespace"), ""))
 		} else {
@@ -172,45 +282,17 @@ func ValidateObjectMetaAccessor(meta metav1.Object, requiresNamespace bool, name
 		}
 	} else {
 		if len(meta.GetNamespace()) != 0 {
+			// TODO(thockin): change to "may not be specified on this type" or something
 			allErrs = append(allErrs, field.Forbidden(fldPath.Child("namespace"), "not allowed on this type"))
 		}
 	}
-	if len(meta.GetClusterName()) != 0 {
-		for _, msg := range ValidateClusterName(meta.GetClusterName(), false) {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("clusterName"), meta.GetClusterName(), msg))
-		}
-	}
-	allErrs = append(allErrs, ValidateNonnegativeField(meta.GetGeneration(), fldPath.Child("generation"))...)
+
+	allErrs = append(allErrs, ValidateNonnegativeField(meta.GetGeneration(), fldPath.Child("generation")).MarkCoveredByDeclarative()...)
 	allErrs = append(allErrs, v1validation.ValidateLabels(meta.GetLabels(), fldPath.Child("labels"))...)
 	allErrs = append(allErrs, ValidateAnnotations(meta.GetAnnotations(), fldPath.Child("annotations"))...)
 	allErrs = append(allErrs, ValidateOwnerReferences(meta.GetOwnerReferences(), fldPath.Child("ownerReferences"))...)
-	allErrs = append(allErrs, ValidateInitializers(meta.GetInitializers(), fldPath.Child("initializers"))...)
 	allErrs = append(allErrs, ValidateFinalizers(meta.GetFinalizers(), fldPath.Child("finalizers"))...)
-	return allErrs
-}
-
-func ValidateInitializers(initializers *metav1.Initializers, fldPath *field.Path) field.ErrorList {
-	var allErrs field.ErrorList
-	if initializers == nil {
-		return allErrs
-	}
-	for i, initializer := range initializers.Pending {
-		allErrs = append(allErrs, validation.IsFullyQualifiedName(fldPath.Child("pending").Index(i).Child("name"), initializer.Name)...)
-	}
-	allErrs = append(allErrs, validateInitializersResult(initializers.Result, fldPath.Child("result"))...)
-	return allErrs
-}
-
-func validateInitializersResult(result *metav1.Status, fldPath *field.Path) field.ErrorList {
-	var allErrs field.ErrorList
-	if result == nil {
-		return allErrs
-	}
-	switch result.Status {
-	case metav1.StatusFailure:
-	default:
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("status"), result.Status, "must be 'Failure'"))
-	}
+	allErrs = append(allErrs, v1validation.ValidateManagedFields(meta.GetManagedFields(), fldPath.Child("managedFields"), v1validation.CoveredByDeclarative)...)
 	return allErrs
 }
 
@@ -234,7 +316,7 @@ func ValidateFinalizers(finalizers []string, fldPath *field.Path) field.ErrorLis
 	return allErrs
 }
 
-// ValidateObjectMetaUpdate validates an object's metadata when updated
+// ValidateObjectMetaUpdate validates an object's metadata when updated.
 func ValidateObjectMetaUpdate(newMeta, oldMeta *metav1.ObjectMeta, fldPath *field.Path) field.ErrorList {
 	newMetadata, err := meta.Accessor(newMeta)
 	if err != nil {
@@ -251,41 +333,9 @@ func ValidateObjectMetaUpdate(newMeta, oldMeta *metav1.ObjectMeta, fldPath *fiel
 	return ValidateObjectMetaAccessorUpdate(newMetadata, oldMetadata, fldPath)
 }
 
+// ValidateObjectMetaAccessorUpdate validates an object's metadata when updated.
 func ValidateObjectMetaAccessorUpdate(newMeta, oldMeta metav1.Object, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
-
-	if !RepairMalformedUpdates && newMeta.GetUID() != oldMeta.GetUID() {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("uid"), newMeta.GetUID(), "field is immutable"))
-	}
-	// in the event it is left empty, set it, to allow clients more flexibility
-	// TODO: remove the following code that repairs the update request when we retire the clients that modify the immutable fields.
-	// Please do not copy this pattern elsewhere; validation functions should not be modifying the objects they are passed!
-	if RepairMalformedUpdates {
-		if len(newMeta.GetUID()) == 0 {
-			newMeta.SetUID(oldMeta.GetUID())
-		}
-		// ignore changes to timestamp
-		if oldCreationTime := oldMeta.GetCreationTimestamp(); oldCreationTime.IsZero() {
-			oldMeta.SetCreationTimestamp(newMeta.GetCreationTimestamp())
-		} else {
-			newMeta.SetCreationTimestamp(oldMeta.GetCreationTimestamp())
-		}
-		// an object can never remove a deletion timestamp or clear/change grace period seconds
-		if !oldMeta.GetDeletionTimestamp().IsZero() {
-			newMeta.SetDeletionTimestamp(oldMeta.GetDeletionTimestamp())
-		}
-		if oldMeta.GetDeletionGracePeriodSeconds() != nil && newMeta.GetDeletionGracePeriodSeconds() == nil {
-			newMeta.SetDeletionGracePeriodSeconds(oldMeta.GetDeletionGracePeriodSeconds())
-		}
-	}
-
-	// TODO: needs to check if newMeta==nil && oldMeta !=nil after the repair logic is removed.
-	if newMeta.GetDeletionGracePeriodSeconds() != nil && (oldMeta.GetDeletionGracePeriodSeconds() == nil || *newMeta.GetDeletionGracePeriodSeconds() != *oldMeta.GetDeletionGracePeriodSeconds()) {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("deletionGracePeriodSeconds"), newMeta.GetDeletionGracePeriodSeconds(), "field is immutable; may only be changed via deletion"))
-	}
-	if newMeta.GetDeletionTimestamp() != nil && (oldMeta.GetDeletionTimestamp() == nil || !newMeta.GetDeletionTimestamp().Equal(oldMeta.GetDeletionTimestamp())) {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("deletionTimestamp"), newMeta.GetDeletionTimestamp(), "field is immutable; may only be changed via deletion"))
-	}
 
 	// Finalizers cannot be added if the object is already being deleted.
 	if oldMeta.GetDeletionTimestamp() != nil {
@@ -298,46 +348,24 @@ func ValidateObjectMetaAccessorUpdate(newMeta, oldMeta metav1.Object, fldPath *f
 	}
 
 	// Generation shouldn't be decremented
-	if newMeta.GetGeneration() < oldMeta.GetGeneration() {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newMeta.GetGeneration(), "must not be decremented"))
+	allErrs = append(allErrs, ValidateNonnegativeField(newMeta.GetGeneration(), fldPath.Child("generation")).MarkCoveredByDeclarative()...)
+	if oldMeta.GetGeneration() != 0 && newMeta.GetGeneration() == 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newMeta.GetGeneration(), "field cannot be cleared once set").WithOrigin("update").MarkCoveredByDeclarative())
+	} else if newMeta.GetGeneration() < oldMeta.GetGeneration() {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newMeta.GetGeneration(), "must not be decremented").WithOrigin("monotonic").MarkCoveredByDeclarative())
 	}
 
-	allErrs = append(allErrs, ValidateInitializersUpdate(newMeta.GetInitializers(), oldMeta.GetInitializers(), fldPath.Child("initializers"))...)
-
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetName(), oldMeta.GetName(), fldPath.Child("name"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetNamespace(), oldMeta.GetNamespace(), fldPath.Child("namespace"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetUID(), oldMeta.GetUID(), fldPath.Child("uid"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetCreationTimestamp(), oldMeta.GetCreationTimestamp(), fldPath.Child("creationTimestamp"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetClusterName(), oldMeta.GetClusterName(), fldPath.Child("clusterName"))...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetNamespace(), oldMeta.GetNamespace(), fldPath.Child("namespace")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetUID(), oldMeta.GetUID(), fldPath.Child("uid")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetCreationTimestamp(), oldMeta.GetCreationTimestamp(), fldPath.Child("creationTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionTimestamp(), oldMeta.GetDeletionTimestamp(), fldPath.Child("deletionTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionGracePeriodSeconds(), oldMeta.GetDeletionGracePeriodSeconds(), fldPath.Child("deletionGracePeriodSeconds")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
 
 	allErrs = append(allErrs, v1validation.ValidateLabels(newMeta.GetLabels(), fldPath.Child("labels"))...)
 	allErrs = append(allErrs, ValidateAnnotations(newMeta.GetAnnotations(), fldPath.Child("annotations"))...)
 	allErrs = append(allErrs, ValidateOwnerReferences(newMeta.GetOwnerReferences(), fldPath.Child("ownerReferences"))...)
+	allErrs = append(allErrs, v1validation.ValidateManagedFields(newMeta.GetManagedFields(), fldPath.Child("managedFields"), v1validation.CoveredByDeclarative)...)
 
-	return allErrs
-}
-
-// ValidateInitializersUpdate checks the update of the metadata initializers field
-func ValidateInitializersUpdate(newInit, oldInit *metav1.Initializers, fldPath *field.Path) field.ErrorList {
-	var allErrs field.ErrorList
-	switch {
-	case oldInit == nil && newInit != nil:
-		// Initializers may not be set on new objects
-		allErrs = append(allErrs, field.Invalid(fldPath, nil, "field is immutable once initialization has completed"))
-	case oldInit != nil && newInit == nil:
-		// this is a valid transition and means initialization was successful
-	case oldInit != nil && newInit != nil:
-		// validate changes to initializers
-		switch {
-		case oldInit.Result == nil && newInit.Result != nil:
-			// setting a result is allowed
-			allErrs = append(allErrs, validateInitializersResult(newInit.Result, fldPath.Child("result"))...)
-		case oldInit.Result != nil:
-			// setting Result implies permanent failure, and all future updates will be prevented
-			allErrs = append(allErrs, ValidateImmutableField(newInit.Result, oldInit.Result, fldPath.Child("result"))...)
-		default:
-			// leaving the result nil is allowed
-		}
-	}
 	return allErrs
 }

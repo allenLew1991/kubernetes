@@ -17,13 +17,19 @@ limitations under the License.
 package v1
 
 import (
-	"k8s.io/api/core/v1"
+	"time"
+
+	"k8s.io/utils/ptr"
+
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	resourcehelper "k8s.io/component-helpers/resource"
+	"k8s.io/kubernetes/pkg/api/v1/service"
+	corev1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/util/parsers"
-	utilpointer "k8s.io/kubernetes/pkg/util/pointer"
 )
 
 func addDefaultingFuncs(scheme *runtime.Scheme) error {
@@ -55,21 +61,22 @@ func SetDefaults_ReplicationController(obj *v1.ReplicationController) {
 			obj.Labels = labels
 		}
 	}
-	if obj.Spec.Replicas == nil {
-		obj.Spec.Replicas = new(int32)
-		*obj.Spec.Replicas = 1
-	}
+	// obj.Spec.Replicas is defaulted declaratively
 }
 func SetDefaults_Volume(obj *v1.Volume) {
-	if utilpointer.AllPtrFieldsNil(&obj.VolumeSource) {
+	if ptr.AllPtrFieldsNil(&obj.VolumeSource) {
 		obj.VolumeSource = v1.VolumeSource{
 			EmptyDir: &v1.EmptyDirVolumeSource{},
 		}
 	}
-}
-func SetDefaults_ContainerPort(obj *v1.ContainerPort) {
-	if obj.Protocol == "" {
-		obj.Protocol = v1.ProtocolTCP
+	if utilfeature.DefaultFeatureGate.Enabled(features.ImageVolume) && obj.Image != nil && obj.Image.PullPolicy == "" {
+		// PullPolicy defaults to Always if :latest tag is specified, or IfNotPresent otherwise.
+		_, tag, _, _ := parsers.ParseImageName(obj.Image.Reference)
+		if tag == "latest" {
+			obj.Image.PullPolicy = v1.PullAlways
+		} else {
+			obj.Image.PullPolicy = v1.PullIfNotPresent
+		}
 	}
 }
 func SetDefaults_Container(obj *v1.Container) {
@@ -91,6 +98,11 @@ func SetDefaults_Container(obj *v1.Container) {
 		obj.TerminationMessagePolicy = v1.TerminationMessageReadFile
 	}
 }
+
+func SetDefaults_EphemeralContainer(obj *v1.EphemeralContainer) {
+	SetDefaults_Container((*v1.Container)(&obj.EphemeralContainerCommon))
+}
+
 func SetDefaults_Service(obj *v1.Service) {
 	if obj.Spec.SessionAffinity == "" {
 		obj.Spec.SessionAffinity = v1.ServiceAffinityNone
@@ -116,19 +128,45 @@ func SetDefaults_Service(obj *v1.Service) {
 		if sp.Protocol == "" {
 			sp.Protocol = v1.ProtocolTCP
 		}
-		if sp.TargetPort == intstr.FromInt(0) || sp.TargetPort == intstr.FromString("") {
-			sp.TargetPort = intstr.FromInt(int(sp.Port))
+		if sp.TargetPort == intstr.FromInt32(0) || sp.TargetPort == intstr.FromString("") {
+			sp.TargetPort = intstr.FromInt32(sp.Port)
 		}
 	}
-	// Defaults ExternalTrafficPolicy field for NodePort / LoadBalancer service
+	// Defaults ExternalTrafficPolicy field for externally-accessible service
 	// to Global for consistency.
-	if (obj.Spec.Type == v1.ServiceTypeNodePort ||
-		obj.Spec.Type == v1.ServiceTypeLoadBalancer) &&
-		obj.Spec.ExternalTrafficPolicy == "" {
-		obj.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeCluster
+	if service.ExternallyAccessible(obj) && obj.Spec.ExternalTrafficPolicy == "" {
+		obj.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyCluster
 	}
+
+	if obj.Spec.InternalTrafficPolicy == nil {
+		if obj.Spec.Type == v1.ServiceTypeNodePort || obj.Spec.Type == v1.ServiceTypeLoadBalancer || obj.Spec.Type == v1.ServiceTypeClusterIP {
+			serviceInternalTrafficPolicyCluster := v1.ServiceInternalTrafficPolicyCluster
+			obj.Spec.InternalTrafficPolicy = &serviceInternalTrafficPolicyCluster
+		}
+	}
+
+	if obj.Spec.Type == v1.ServiceTypeLoadBalancer {
+		if obj.Spec.AllocateLoadBalancerNodePorts == nil {
+			obj.Spec.AllocateLoadBalancerNodePorts = ptr.To(true)
+		}
+	}
+
+	if obj.Spec.Type == v1.ServiceTypeLoadBalancer {
+		ipMode := v1.LoadBalancerIPModeVIP
+		for i, ing := range obj.Status.LoadBalancer.Ingress {
+			if ing.IP != "" && ing.IPMode == nil {
+				obj.Status.LoadBalancer.Ingress[i].IPMode = &ipMode
+			}
+		}
+	}
+
 }
 func SetDefaults_Pod(obj *v1.Pod) {
+	// Enforced on Pod but not on PodSpec. For historical reasons, PodTemplate is not defaulted this way.
+	if obj.Spec.TerminationGracePeriodSeconds != nil && *obj.Spec.TerminationGracePeriodSeconds < 0 {
+		obj.Spec.TerminationGracePeriodSeconds = ptr.To[int64](1)
+	}
+
 	// If limits are specified, but requests are not, default requests to limits
 	// This is done here rather than a more specific defaulting pass on v1.ResourceRequirements
 	// because we only want this defaulting semantic to take place on a v1.Pod and not a v1.PodTemplate
@@ -140,7 +178,7 @@ func SetDefaults_Pod(obj *v1.Pod) {
 			}
 			for key, value := range obj.Spec.Containers[i].Resources.Limits {
 				if _, exists := obj.Spec.Containers[i].Resources.Requests[key]; !exists {
-					obj.Spec.Containers[i].Resources.Requests[key] = *(value.Copy())
+					obj.Spec.Containers[i].Resources.Requests[key] = value.DeepCopy()
 				}
 			}
 		}
@@ -152,23 +190,77 @@ func SetDefaults_Pod(obj *v1.Pod) {
 			}
 			for key, value := range obj.Spec.InitContainers[i].Resources.Limits {
 				if _, exists := obj.Spec.InitContainers[i].Resources.Requests[key]; !exists {
-					obj.Spec.InitContainers[i].Resources.Requests[key] = *(value.Copy())
+					obj.Spec.InitContainers[i].Resources.Requests[key] = value.DeepCopy()
 				}
 			}
 		}
 	}
+
+	// Pod Requests default values must be applied after container-level default values
+	// have been populated. When PodLevelResourcesFixDefaulting is enabled, this
+	// defaulting is deferred to PrepareForCreate so it runs after admission webhooks
+	// have injected all containers, giving a complete view of the pod.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) &&
+		!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixDefaulting) {
+		defaultHugePagePodLimits(obj)
+		defaultPodRequests(obj)
+	}
+
+	if obj.Spec.EnableServiceLinks == nil {
+		enableServiceLinks := v1.DefaultEnableServiceLinks
+		obj.Spec.EnableServiceLinks = &enableServiceLinks
+	}
+
+	if obj.Spec.HostNetwork {
+		defaultHostNetworkPorts(&obj.Spec.Containers)
+		defaultHostNetworkPorts(&obj.Spec.InitContainers)
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.H2CContainerProbe) {
+		defaultHTTPProbeProtocol(obj.Spec.Containers)
+		defaultHTTPProbeProtocol(obj.Spec.InitContainers)
+		defaultHTTPProbeProtocolEphemeral(obj.Spec.EphemeralContainers)
+	}
 }
+func SetDefaults_PodStatus(obj *v1.PodStatus) {
+	// Keep the singular PodIP and the PodIPs list in sync.
+	hasIP := len(obj.PodIP) > 0
+	hasIPs := len(obj.PodIPs) > 0
+	switch {
+	case hasIP && !hasIPs:
+		// default the list from the singular field
+		obj.PodIPs = []v1.PodIP{{IP: obj.PodIP}}
+	case !hasIP && hasIPs:
+		// default the singular field from the list
+		obj.PodIP = obj.PodIPs[0].IP
+	case hasIP && hasIPs && obj.PodIPs[0].IP != obj.PodIP:
+		// when both are specified and mismatch, PodIP is authoritative for
+		// compatibility with older kubelets
+		obj.PodIPs = []v1.PodIP{{IP: obj.PodIP}}
+	}
+}
+
 func SetDefaults_PodSpec(obj *v1.PodSpec) {
+	// New fields added here will break upgrade tests:
+	// https://github.com/kubernetes/kubernetes/issues/69445
+	// In most cases the new defaulted field can added to SetDefaults_Pod instead of here, so
+	// that it only materializes in the Pod object and not all objects with a PodSpec field.
+
+	// DeprecatedServiceAccount is an alias for ServiceAccountName; keep the two
+	// in sync, with ServiceAccountName winning when both are set. This was
+	// historically applied during conversion and produces identical
+	// serializations, so it is exempt from the new-field caution above.
+	if len(obj.ServiceAccountName) == 0 {
+		obj.ServiceAccountName = obj.DeprecatedServiceAccount
+	}
+	obj.DeprecatedServiceAccount = obj.ServiceAccountName
 	if obj.DNSPolicy == "" {
 		obj.DNSPolicy = v1.DNSClusterFirst
 	}
 	if obj.RestartPolicy == "" {
 		obj.RestartPolicy = v1.RestartPolicyAlways
 	}
-	if obj.HostNetwork {
-		defaultHostNetworkPorts(&obj.Containers)
-		defaultHostNetworkPorts(&obj.InitContainers)
-	}
+	// Always default an empty securityContext to preserve historical behavior.
 	if obj.SecurityContext == nil {
 		obj.SecurityContext = &v1.PodSecurityContext{}
 	}
@@ -223,6 +315,12 @@ func SetDefaults_ProjectedVolumeSource(obj *v1.ProjectedVolumeSource) {
 		obj.DefaultMode = &perm
 	}
 }
+func SetDefaults_ServiceAccountTokenProjection(obj *v1.ServiceAccountTokenProjection) {
+	hour := int64(time.Hour.Seconds())
+	if obj.ExpirationSeconds == nil {
+		obj.ExpirationSeconds = &hour
+	}
+}
 func SetDefaults_PersistentVolume(obj *v1.PersistentVolume) {
 	if obj.Status.Phase == "" {
 		obj.Status.Phase = v1.VolumePending
@@ -230,7 +328,7 @@ func SetDefaults_PersistentVolume(obj *v1.PersistentVolume) {
 	if obj.Spec.PersistentVolumeReclaimPolicy == "" {
 		obj.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimRetain
 	}
-	if obj.Spec.VolumeMode == nil && utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
+	if obj.Spec.VolumeMode == nil {
 		obj.Spec.VolumeMode = new(v1.PersistentVolumeMode)
 		*obj.Spec.VolumeMode = v1.PersistentVolumeFilesystem
 	}
@@ -239,37 +337,11 @@ func SetDefaults_PersistentVolumeClaim(obj *v1.PersistentVolumeClaim) {
 	if obj.Status.Phase == "" {
 		obj.Status.Phase = v1.ClaimPending
 	}
-	if obj.Spec.VolumeMode == nil && utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
-		obj.Spec.VolumeMode = new(v1.PersistentVolumeMode)
-		*obj.Spec.VolumeMode = v1.PersistentVolumeFilesystem
-	}
 }
-func SetDefaults_ISCSIVolumeSource(obj *v1.ISCSIVolumeSource) {
-	if obj.ISCSIInterface == "" {
-		obj.ISCSIInterface = "default"
-	}
-}
-func SetDefaults_ISCSIPersistentVolumeSource(obj *v1.ISCSIPersistentVolumeSource) {
-	if obj.ISCSIInterface == "" {
-		obj.ISCSIInterface = "default"
-	}
-}
-func SetDefaults_AzureDiskVolumeSource(obj *v1.AzureDiskVolumeSource) {
-	if obj.CachingMode == nil {
-		obj.CachingMode = new(v1.AzureDataDiskCachingMode)
-		*obj.CachingMode = v1.AzureDataDiskCachingReadWrite
-	}
-	if obj.Kind == nil {
-		obj.Kind = new(v1.AzureDataDiskKind)
-		*obj.Kind = v1.AzureSharedBlobDisk
-	}
-	if obj.FSType == nil {
-		obj.FSType = new(string)
-		*obj.FSType = "ext4"
-	}
-	if obj.ReadOnly == nil {
-		obj.ReadOnly = new(bool)
-		*obj.ReadOnly = false
+func SetDefaults_PersistentVolumeClaimSpec(obj *v1.PersistentVolumeClaimSpec) {
+	if obj.VolumeMode == nil {
+		obj.VolumeMode = new(v1.PersistentVolumeMode)
+		*obj.VolumeMode = v1.PersistentVolumeFilesystem
 	}
 }
 func SetDefaults_Endpoints(obj *v1.Endpoints) {
@@ -291,21 +363,33 @@ func SetDefaults_HTTPGetAction(obj *v1.HTTPGetAction) {
 		obj.Scheme = v1.URISchemeHTTP
 	}
 }
+
+// SetDefaults_Namespace adds a default label for all namespaces
+func SetDefaults_Namespace(obj *v1.Namespace) {
+	// we can't SetDefaults for nameless namespaces (generateName).
+	// This code needs to be kept in sync with the implementation that exists
+	// in Namespace Canonicalize strategy (pkg/registry/core/namespace)
+
+	// note that this can result in many calls to feature enablement in some cases, but
+	// we assume that there's no real cost there.
+	if len(obj.Name) > 0 {
+		if obj.Labels == nil {
+			obj.Labels = map[string]string{}
+		}
+		obj.Labels[v1.LabelMetadataName] = obj.Name
+	}
+}
+
 func SetDefaults_NamespaceStatus(obj *v1.NamespaceStatus) {
 	if obj.Phase == "" {
 		obj.Phase = v1.NamespaceActive
-	}
-}
-func SetDefaults_Node(obj *v1.Node) {
-	if obj.Spec.ExternalID == "" {
-		obj.Spec.ExternalID = obj.Name
 	}
 }
 func SetDefaults_NodeStatus(obj *v1.NodeStatus) {
 	if obj.Allocatable == nil && obj.Capacity != nil {
 		obj.Allocatable = make(v1.ResourceList, len(obj.Capacity))
 		for key, value := range obj.Capacity {
-			obj.Allocatable[key] = *(value.Copy())
+			obj.Allocatable[key] = value.DeepCopy()
 		}
 		obj.Allocatable = obj.Capacity
 	}
@@ -329,19 +413,19 @@ func SetDefaults_LimitRangeItem(obj *v1.LimitRangeItem) {
 		// If a default limit is unspecified, but the max is specified, default the limit to the max
 		for key, value := range obj.Max {
 			if _, exists := obj.Default[key]; !exists {
-				obj.Default[key] = *(value.Copy())
+				obj.Default[key] = value.DeepCopy()
 			}
 		}
 		// If a default limit is specified, but the default request is not, default request to limit
 		for key, value := range obj.Default {
 			if _, exists := obj.DefaultRequest[key]; !exists {
-				obj.DefaultRequest[key] = *(value.Copy())
+				obj.DefaultRequest[key] = value.DeepCopy()
 			}
 		}
 		// If a default request is not specified, but the min is provided, default request to the min
 		for key, value := range obj.Min {
 			if _, exists := obj.DefaultRequest[key]; !exists {
-				obj.DefaultRequest[key] = *(value.Copy())
+				obj.DefaultRequest[key] = value.DeepCopy()
 			}
 		}
 	}
@@ -363,45 +447,54 @@ func defaultHostNetworkPorts(containers *[]v1.Container) {
 	}
 }
 
-func SetDefaults_RBDVolumeSource(obj *v1.RBDVolumeSource) {
-	if obj.RBDPool == "" {
-		obj.RBDPool = "rbd"
-	}
-	if obj.RadosUser == "" {
-		obj.RadosUser = "admin"
-	}
-	if obj.Keyring == "" {
-		obj.Keyring = "/etc/ceph/keyring"
+func defaultHTTPGetProtocol(action *v1.HTTPGetAction) {
+	if action != nil && action.Protocol == nil {
+		defaultProtocol := v1.HTTPProtocolHTTP1
+		action.Protocol = &defaultProtocol
 	}
 }
 
-func SetDefaults_RBDPersistentVolumeSource(obj *v1.RBDPersistentVolumeSource) {
-	if obj.RBDPool == "" {
-		obj.RBDPool = "rbd"
-	}
-	if obj.RadosUser == "" {
-		obj.RadosUser = "admin"
-	}
-	if obj.Keyring == "" {
-		obj.Keyring = "/etc/ceph/keyring"
+func defaultHTTPProbeProtocol(containers []v1.Container) {
+	for i := range containers {
+		if containers[i].LivenessProbe != nil {
+			defaultHTTPGetProtocol(containers[i].LivenessProbe.HTTPGet)
+		}
+		if containers[i].ReadinessProbe != nil {
+			defaultHTTPGetProtocol(containers[i].ReadinessProbe.HTTPGet)
+		}
+		if containers[i].StartupProbe != nil {
+			defaultHTTPGetProtocol(containers[i].StartupProbe.HTTPGet)
+		}
+		if containers[i].Lifecycle != nil {
+			if containers[i].Lifecycle.PostStart != nil {
+				defaultHTTPGetProtocol(containers[i].Lifecycle.PostStart.HTTPGet)
+			}
+			if containers[i].Lifecycle.PreStop != nil {
+				defaultHTTPGetProtocol(containers[i].Lifecycle.PreStop.HTTPGet)
+			}
+		}
 	}
 }
 
-func SetDefaults_ScaleIOVolumeSource(obj *v1.ScaleIOVolumeSource) {
-	if obj.StorageMode == "" {
-		obj.StorageMode = "ThinProvisioned"
-	}
-	if obj.FSType == "" {
-		obj.FSType = "xfs"
-	}
-}
-
-func SetDefaults_ScaleIOPersistentVolumeSource(obj *v1.ScaleIOPersistentVolumeSource) {
-	if obj.StorageMode == "" {
-		obj.StorageMode = "ThinProvisioned"
-	}
-	if obj.FSType == "" {
-		obj.FSType = "xfs"
+func defaultHTTPProbeProtocolEphemeral(containers []v1.EphemeralContainer) {
+	for i := range containers {
+		if containers[i].LivenessProbe != nil {
+			defaultHTTPGetProtocol(containers[i].LivenessProbe.HTTPGet)
+		}
+		if containers[i].ReadinessProbe != nil {
+			defaultHTTPGetProtocol(containers[i].ReadinessProbe.HTTPGet)
+		}
+		if containers[i].StartupProbe != nil {
+			defaultHTTPGetProtocol(containers[i].StartupProbe.HTTPGet)
+		}
+		if containers[i].Lifecycle != nil {
+			if containers[i].Lifecycle.PostStart != nil {
+				defaultHTTPGetProtocol(containers[i].Lifecycle.PostStart.HTTPGet)
+			}
+			if containers[i].Lifecycle.PreStop != nil {
+				defaultHTTPGetProtocol(containers[i].Lifecycle.PreStop.HTTPGet)
+			}
+		}
 	}
 }
 
@@ -409,5 +502,121 @@ func SetDefaults_HostPathVolumeSource(obj *v1.HostPathVolumeSource) {
 	typeVol := v1.HostPathUnset
 	if obj.Type == nil {
 		obj.Type = &typeVol
+	}
+}
+
+func SetDefaults_PodLogOptions(obj *v1.PodLogOptions) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams) {
+		if obj.Stream == nil {
+			obj.Stream = ptr.To(v1.LogStreamAll)
+		}
+	}
+}
+
+// defaultPodRequests applies default values for pod-level requests, only when
+// pod-level limits are set, in following scenarios:
+// 1. When at least one container (regular, init or sidecar) has requests set:
+// The pod-level requests become equal to the effective requests of all containers
+// in the pod.
+// 2. When no containers have requests set: The pod-level requests become equal to
+// pod-level limits.
+// This defaulting behavior ensures consistent resource accounting at the pod-level
+// while maintaining compatibility with the container-level specifications, as detailed
+// in KEP-2837: https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/2837-pod-level-resource-spec/README.md#proposed-validation--defaulting-rules
+// TODO(ndixita): Remove defaultPodRequests once PodLevelResourcesFixDefaulting feature gate is GA.
+func defaultPodRequests(obj *v1.Pod) {
+	// We only populate defaults when the pod-level resources are partly specified already.
+	if obj.Spec.Resources == nil {
+		return
+	}
+
+	if len(obj.Spec.Resources.Limits) == 0 {
+		return
+	}
+
+	var podReqs v1.ResourceList
+	podReqs = obj.Spec.Resources.Requests
+	if podReqs == nil {
+		podReqs = make(v1.ResourceList)
+	}
+
+	aggrCtrReqs := resourcehelper.AggregateContainerRequests(obj, resourcehelper.PodResourcesOptions{})
+
+	// When containers specify requests for a resource (supported by
+	// PodLevelResources feature) and pod-level requests are not set, the pod-level requests
+	// default to the effective requests of all the containers for that resource.
+	for key, aggrCtrLim := range aggrCtrReqs {
+		// Default pod level requests for overcommittable resources from aggregated container requests.
+		if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) && corev1helper.IsOvercommitAllowed(key) {
+			podReqs[key] = aggrCtrLim.DeepCopy()
+		}
+	}
+
+	// When no containers specify requests for a resource, the pod-level requests
+	// will default to match the pod-level limits, if pod-level
+	// limits exist for that resource.
+	// Defaulting for pod level hugepages requests is dependent on defaultHugePagePodLimits,
+	// if defaultHugePagePodLimits defined the limit, the request will be set here.
+	for key, podLim := range obj.Spec.Resources.Limits {
+		if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) {
+			podReqs[key] = podLim.DeepCopy()
+		}
+	}
+
+	// Only set pod-level resource requests in the PodSpec if the requirements map
+	// contains entries after collecting container-level requests and pod-level limits.
+	if len(podReqs) > 0 {
+		obj.Spec.Resources.Requests = podReqs
+	}
+}
+
+// defaultHugePagePodLimits applies default values for pod-level limits, only when
+// container hugepage limits are set, but not at pod level, in following
+// scenario:
+// 1. When at least one container (regular, init or sidecar) has hugepage
+// limits set:
+// The pod-level limit becomes equal to the aggregated hugepages limit of all
+// the containers in the pod.
+// TODO(ndixita): Remove defaultHugePagePodLimits once PodLevelResourcesFixDefaulting feature gate is GA.
+func defaultHugePagePodLimits(pod *v1.Pod) {
+	// We only populate hugepage limit defaults when the pod-level resources are partly specified.
+	if pod.Spec.Resources == nil {
+		return
+	}
+
+	if len(pod.Spec.Resources.Limits) == 0 && len(pod.Spec.Resources.Requests) == 0 {
+		return
+	}
+
+	var podLims v1.ResourceList
+	podLims = pod.Spec.Resources.Limits
+	if podLims == nil {
+		podLims = make(v1.ResourceList)
+	}
+
+	aggrCtrLims := resourcehelper.AggregateContainerLimits(pod, resourcehelper.PodResourcesOptions{})
+
+	// When containers specify limits for hugepages and pod-level limits are not
+	// set for that resource, the pod-level limit will default to the aggregated
+	// hugepages limit of all the containers.
+	for key, aggrCtrLim := range aggrCtrLims {
+		if !resourcehelper.IsSupportedPodLevelResource(key) || !corev1helper.IsHugePageResourceName(key) {
+			continue
+		}
+
+		// We do not default pod-level hugepage limits if there is a hugepage request.
+		if _, exists := pod.Spec.Resources.Requests[key]; exists {
+			continue
+		}
+
+		if _, exists := podLims[key]; !exists {
+			podLims[key] = aggrCtrLim.DeepCopy()
+		}
+	}
+
+	// Only set pod-level resource limits in the PodSpec if the requirements map
+	// contains entries after collecting container-level limits and pod-level limits for hugepages.
+	if len(podLims) > 0 {
+		pod.Spec.Resources.Limits = podLims
 	}
 }

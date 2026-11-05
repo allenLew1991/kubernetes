@@ -19,15 +19,15 @@ package storageclasses
 // This file contains tests for the storage classes API resource.
 
 import (
+	"context"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
@@ -35,13 +35,13 @@ const provisionerPluginName = "kubernetes.io/mock-provisioner"
 
 // TestStorageClasses tests apiserver-side behavior of creation of storage class objects and their use by pvcs.
 func TestStorageClasses(t *testing.T) {
-	_, s, closeFn := framework.RunAMaster(nil)
-	defer closeFn()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=StorageObjectInUseProtection"}, framework.SharedEtcd())
+	defer server.TearDownFn()
 
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Groups[v1.GroupName].GroupVersion()}})
+	client := clientset.NewForConfigOrDie(server.ClientConfig)
 
-	ns := framework.CreateTestingNamespace("storageclass", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(client, "storageclass", t)
+	defer framework.DeleteNamespaceOrDie(client, ns, t)
 
 	DoTestStorageClasses(t, client, ns)
 }
@@ -59,7 +59,7 @@ func DoTestStorageClasses(t *testing.T, client clientset.Interface, ns *v1.Names
 		Provisioner: provisionerPluginName,
 	}
 
-	if _, err := client.StorageV1().StorageClasses().Create(&s); err != nil {
+	if _, err := client.StorageV1().StorageClasses().Create(context.TODO(), &s, metav1.CreateOptions{}); err != nil {
 		t.Errorf("unable to create test storage class: %v", err)
 	}
 	defer deleteStorageClassOrErrorf(t, client, s.Namespace, s.Name)
@@ -72,27 +72,27 @@ func DoTestStorageClasses(t *testing.T, client clientset.Interface, ns *v1.Names
 			Namespace: ns.Name,
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
-			Resources:        v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")}},
+			Resources:        v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceName(v1.ResourceStorage): resource.MustParse("1G")}},
 			AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
 			StorageClassName: &classGold,
 		},
 	}
 
 	pvc.ObjectMeta.Name = "uses-storageclass"
-	if _, err := client.CoreV1().PersistentVolumeClaims(ns.Name).Create(pvc); err != nil {
+	if _, err := client.CoreV1().PersistentVolumeClaims(ns.Name).Create(context.TODO(), pvc, metav1.CreateOptions{}); err != nil {
 		t.Errorf("Failed to create pvc: %v", err)
 	}
 	defer deletePersistentVolumeClaimOrErrorf(t, client, ns.Name, pvc.Name)
 }
 
 func deleteStorageClassOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
-	if err := c.StorageV1().StorageClasses().Delete(name, nil); err != nil {
+	if err := c.StorageV1().StorageClasses().Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete storage class %v: %v", name, err)
 	}
 }
 
 func deletePersistentVolumeClaimOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
-	if err := c.CoreV1().PersistentVolumeClaims(ns).Delete(name, nil); err != nil {
+	if err := c.CoreV1().PersistentVolumeClaims(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete persistent volume claim %v: %v", name, err)
 	}
 }

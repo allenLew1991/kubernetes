@@ -26,13 +26,14 @@ limitations under the License.
 package replication
 
 import (
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
+	consistencyutil "k8s.io/client-go/util/consistency"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/replicaset"
 )
@@ -49,12 +50,10 @@ type ReplicationManager struct {
 }
 
 // NewReplicationManager configures a replication manager with the specified event recorder
-func NewReplicationManager(podInformer coreinformers.PodInformer, rcInformer coreinformers.ReplicationControllerInformer, kubeClient clientset.Interface, burstReplicas int) *ReplicationManager {
-	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.CoreV1().RESTClient()).Events("")})
+func NewReplicationManager(ctx context.Context, podInformer coreinformers.PodInformer, rcInformer coreinformers.ReplicationControllerInformer, kubeClient clientset.Interface, burstReplicas int) *ReplicationManager {
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	return &ReplicationManager{
-		*replicaset.NewBaseController(informerAdapter{rcInformer}, podInformer, clientsetAdapter{kubeClient}, burstReplicas,
+		*replicaset.NewBaseController(ctx, informerAdapter{rcInformer}, podInformer, clientsetAdapter{kubeClient}, burstReplicas,
 			v1.SchemeGroupVersion.WithKind("ReplicationController"),
 			"replication_controller",
 			"replicationmanager",
@@ -62,6 +61,16 @@ func NewReplicationManager(podInformer coreinformers.PodInformer, rcInformer cor
 				KubeClient: kubeClient,
 				Recorder:   eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "replication-controller"}),
 			}},
+			eventBroadcaster,
+			replicaset.ReplicaSetControllerFeatures{
+				// ReplicationController API does not support the .status.terminatingReplicas field. However,
+				// ReplicaSets do support this field, which is then propagated to Deployments for higher-level features.
+				EnableStatusTerminatingReplicas: false,
+			},
+			// TODO: Replication controller does not currently support stale controller consistency.
+			// In order to support stale controller consistency, we would need to parameterize the metrics
+			// and resource types passed to the consistency store.
+			consistencyutil.NewNoopConsistencyStore(),
 		),
 	}
 }

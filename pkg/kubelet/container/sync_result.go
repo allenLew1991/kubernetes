@@ -19,14 +19,93 @@ package container
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
+// BackoffError should be used whenever an error needs to specify a particular backoff duration
+// to the Kubelet.
+type BackoffError struct {
+	error       error
+	backoffTime time.Time
+}
+
+func NewBackoffError(err error, backoffTime time.Time) *BackoffError {
+	return &BackoffError{
+		error:       err,
+		backoffTime: backoffTime,
+	}
+}
+
+func (b *BackoffError) Error() string {
+	return b.error.Error()
+}
+func (b *BackoffError) Unwrap() error {
+	return b.error
+}
+
+// BackoffTime returns the expected expiration time of the backoff.
+func (e *BackoffError) BackoffTime() time.Time {
+	return e.backoffTime
+}
+
+// MinBackoffExpiration recursively searches through err for BackoffErrors and returns
+// the minimum of all found backoff times.
+func MinBackoffExpiration(err error) (time.Time, bool) {
+	var ae utilerrors.Aggregate
+	var be *BackoffError
+	switch {
+	case errors.As(err, &be):
+		return be.BackoffTime(), true
+	case errors.As(err, &ae):
+		var min time.Time
+		found := false
+		for _, e := range ae.Errors() {
+			if backoff, ok := MinBackoffExpiration(e); ok {
+				if !found || backoff.Before(min) {
+					min = backoff
+					found = true
+				}
+			}
+		}
+		return min, found
+	default:
+		if e := errors.Unwrap(err); e != nil {
+			return MinBackoffExpiration(e)
+		}
+		return time.Time{}, false
+	}
+}
+
+// IsBackoffError returns true if err is non-nil and consists only of backoff errors.
+// Aggregates are backoff errors only if every contained error is a backoff error.
+func IsBackoffError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ae, ok := errors.AsType[utilerrors.Aggregate](err); ok {
+		for _, e := range ae.Errors() {
+			if !IsBackoffError(e) {
+				return false
+			}
+		}
+		return len(ae.Errors()) > 0
+	}
+	_, isBackoffErr := errors.AsType[*BackoffError](err)
+	return isBackoffErr ||
+		errors.Is(err, ErrCrashLoopBackOff) ||
+		errors.Is(err, ErrImagePullBackOff)
+}
+
 // TODO(random-liu): We need to better organize runtime errors for introspection.
 
-// Container Terminated and Kubelet is backing off the restart
-var ErrCrashLoopBackOff = errors.New("CrashLoopBackOff")
+var (
+	// ErrCrashLoopBackOff returned when a container Terminated and Kubelet is backing off the restart.
+	ErrCrashLoopBackOff = errors.New("CrashLoopBackOff")
+	// ErrImagePullBackOff returned when a container image pull failed and Kubelet is backing off the pull.
+	ErrImagePullBackOff = errors.New("ImagePullBackOff")
+)
 
 var (
 	// ErrContainerNotFound returned when a container in the given pod with the
@@ -35,18 +114,20 @@ var (
 )
 
 var (
-	ErrRunContainer     = errors.New("RunContainerError")
-	ErrKillContainer    = errors.New("KillContainerError")
-	ErrVerifyNonRoot    = errors.New("VerifyNonRootError")
-	ErrRunInitContainer = errors.New("RunInitContainerError")
+	// ErrRunContainer returned when runtime failed to start any of pod's container.
+	ErrRunContainer = errors.New("RunContainerError")
+	// ErrKillContainer returned when runtime failed to kill any of pod's containers.
+	ErrKillContainer = errors.New("KillContainerError")
+	// ErrCreatePodSandbox returned when runtime failed to create a sandbox for pod.
 	ErrCreatePodSandbox = errors.New("CreatePodSandboxError")
+	// ErrConfigPodSandbox returned when runetime failed to get pod sandbox config from pod.
 	ErrConfigPodSandbox = errors.New("ConfigPodSandboxError")
-	ErrKillPodSandbox   = errors.New("KillPodSandboxError")
-)
-
-var (
-	ErrSetupNetwork    = errors.New("SetupNetworkError")
-	ErrTeardownNetwork = errors.New("TeardownNetworkError")
+	// ErrKillPodSandbox returned when runtime failed to stop pod's sandbox.
+	ErrKillPodSandbox = errors.New("KillPodSandboxError")
+	// ErrResizePodInPlace returned when runtime failed to resize a pod.
+	ErrResizePodInPlace = errors.New("ResizePodInPlaceError")
+	// ErrRemoveContainer returned when runtime failed to remove a container.
+	ErrRemoveContainer = errors.New("RemoveContainerError")
 )
 
 // SyncAction indicates different kind of actions in SyncPod() and KillPod(). Now there are only actions
@@ -54,14 +135,22 @@ var (
 type SyncAction string
 
 const (
-	StartContainer   SyncAction = "StartContainer"
-	KillContainer    SyncAction = "KillContainer"
-	SetupNetwork     SyncAction = "SetupNetwork"
-	TeardownNetwork  SyncAction = "TeardownNetwork"
-	InitContainer    SyncAction = "InitContainer"
+	// StartContainer action
+	StartContainer SyncAction = "StartContainer"
+	// KillContainer action
+	KillContainer SyncAction = "KillContainer"
+	// InitContainer action
+	InitContainer SyncAction = "InitContainer"
+	// CreatePodSandbox action
 	CreatePodSandbox SyncAction = "CreatePodSandbox"
+	// ConfigPodSandbox action
 	ConfigPodSandbox SyncAction = "ConfigPodSandbox"
-	KillPodSandbox   SyncAction = "KillPodSandbox"
+	// KillPodSandbox action
+	KillPodSandbox SyncAction = "KillPodSandbox"
+	// ResizePodInPlace action is included whenever any containers in the pod are resized without restart
+	ResizePodInPlace SyncAction = "ResizePodInPlace"
+	// RemoveContainer action
+	RemoveContainer SyncAction = "RemoveContainer"
 )
 
 // SyncResult is the result of sync action.
@@ -116,11 +205,11 @@ func (p *PodSyncResult) Fail(err error) {
 func (p *PodSyncResult) Error() error {
 	errlist := []error{}
 	if p.SyncError != nil {
-		errlist = append(errlist, fmt.Errorf("failed to SyncPod: %v\n", p.SyncError))
+		errlist = append(errlist, fmt.Errorf("failed to SyncPod: %w", p.SyncError))
 	}
 	for _, result := range p.SyncResults {
 		if result.Error != nil {
-			errlist = append(errlist, fmt.Errorf("failed to %q for %q with %v: %q\n", result.Action, result.Target,
+			errlist = append(errlist, fmt.Errorf("failed to %q for %q with %w: %q", result.Action, result.Target,
 				result.Error, result.Message))
 		}
 	}

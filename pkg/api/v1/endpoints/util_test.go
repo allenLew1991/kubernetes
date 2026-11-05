@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/dump"
 )
 
 func podRef(uid string) *v1.ObjectReference {
@@ -51,11 +51,11 @@ func TestPackSubsets(t *testing.T) {
 		}, {
 			name:   "empty ports",
 			given:  []v1.EndpointSubset{{Addresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: []v1.EndpointPort{}}},
-			expect: []v1.EndpointSubset{},
+			expect: []v1.EndpointSubset{{Addresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: nil}},
 		}, {
 			name:   "empty ports",
 			given:  []v1.EndpointSubset{{NotReadyAddresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: []v1.EndpointPort{}}},
-			expect: []v1.EndpointSubset{},
+			expect: []v1.EndpointSubset{{NotReadyAddresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: nil}},
 		}, {
 			name: "one set, one ip, one port",
 			given: []v1.EndpointSubset{{
@@ -458,7 +458,7 @@ func TestPackSubsets(t *testing.T) {
 	for _, tc := range testCases {
 		result := RepackSubsets(tc.given)
 		if !reflect.DeepEqual(result, SortSubsets(tc.expect)) {
-			t.Errorf("case %q: expected %s, got %s", tc.name, spew.Sprintf("%#v", SortSubsets(tc.expect)), spew.Sprintf("%#v", result))
+			t.Errorf("case %q: expected %s, got %s", tc.name, dump.Pretty(SortSubsets(tc.expect)), dump.Pretty(result))
 		}
 	}
 }

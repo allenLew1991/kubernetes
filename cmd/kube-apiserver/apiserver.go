@@ -14,43 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// apiserver is the main api server and master for the cluster.
-// it is responsible for serving the cluster management API.
+// APIServer is the main API server and master for the cluster.
+// It is responsible for serving the cluster management API.
 package main
 
 import (
-	"fmt"
-	"math/rand"
 	"os"
-	"time"
+	_ "time/tzdata" // for timeZone support in CronJob
 
-	"github.com/spf13/pflag"
-
-	"k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/util/flag"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/logs/json/register"          // for JSON log format registration
+	_ "k8s.io/component-base/metrics/prometheus/clientgo" // load all the prometheus client-go plugins
+	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
-	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
-	"k8s.io/kubernetes/pkg/version/verflag"
 )
 
 func main() {
-	rand.Seed(time.Now().UTC().UnixNano())
-
-	s := options.NewServerRunOptions()
-	s.AddFlags(pflag.CommandLine)
-
-	flag.InitFlags()
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	verflag.PrintAndExitIfRequested()
-
-	stopCh := server.SetupSignalHandler()
-	if err := app.Run(s, stopCh); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
+	command := app.NewAPIServerCommand()
+	code := cli.Run(command)
+	os.Exit(code)
 }

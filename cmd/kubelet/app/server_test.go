@@ -17,7 +17,27 @@ limitations under the License.
 package app
 
 import (
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/mldsa"
+	"crypto/rsa"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	yaml "go.yaml.in/yaml/v2"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/kubernetes/cmd/kubelet/app/options"
+	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/config"
 )
 
 func TestValueOfAllocatableResources(t *testing.T) {
@@ -59,5 +79,621 @@ func TestValueOfAllocatableResources(t *testing.T) {
 				t.Errorf("%s: unexpected error: %v, %v", test.name, err1, err2)
 			}
 		}
+	}
+}
+
+func TestParseResourceList(t *testing.T) {
+	testCases := []struct {
+		input    map[string]string
+		expected string
+		name     string
+	}{
+		{
+			input:    map[string]string{"cpu": "200m"},
+			expected: "200m",
+			name:     "whole millicores",
+		},
+		{
+			input:    map[string]string{"cpu": "200.5m"},
+			expected: "201m",
+			name:     "decimal millicores rounded up",
+		},
+		{
+			input:    map[string]string{"cpu": "200.4m"},
+			expected: "200m",
+			name:     "decimal millicores rounded down",
+		},
+	}
+
+	for _, test := range testCases {
+		rl, err := parseResourceList(test.input)
+		require.NoError(t, err, test.name)
+		q := rl[v1.ResourceCPU]
+		require.Equal(t, test.expected, q.String(), test.name)
+	}
+}
+
+func TestParseResourceListCPUOverflowsMicro(t *testing.T) {
+	// The old rounding read the quantity through a wrapping micro projection, so
+	// a reservation past that range was stored as a negative number of cores.
+	for _, v := range []string{"1e30", "10000000000000", "9223372036854775808u"} {
+		rl, err := parseResourceList(map[string]string{"cpu": v})
+		require.NoError(t, err, v)
+		q := rl[v1.ResourceCPU]
+		require.Equal(t, 1, q.Sign(), v)
+		require.Zero(t, q.Cmp(resource.MustParse(v)), "%s: kept unrounded, got %s", v, q.String())
+	}
+
+	// The largest micro value that fits, where adding 500 before dividing does not.
+	rl, err := parseResourceList(map[string]string{"cpu": "9223372036854775807u"})
+	require.NoError(t, err)
+	q := rl[v1.ResourceCPU]
+	require.Equal(t, int64(9223372036854776), q.MilliValue())
+
+	// Rounding stops at the cutoff rather than continuing past it, so the largest
+	// rounded value sits above the smallest kept one.
+	require.Equal(t, 1, q.Cmp(resource.MustParse("9223372036854775808u")))
+}
+
+func TestMergeKubeletConfigurations(t *testing.T) {
+	testCases := []struct {
+		kubeletConfig           *kubeletconfiginternal.KubeletConfiguration
+		dropin1                 string
+		dropin2                 string
+		customDropins           map[string]string
+		overwrittenConfigFields map[string]interface{}
+		cliArgs                 []string
+		name                    string
+		expectMergeError        string
+		expectedSkippedFiles    []string
+	}{
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:         int32(9090),
+				ReadOnlyPort: int32(10257),
+			},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 9090
+`,
+			dropin2: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 8080
+readOnlyPort: 10255
+`,
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(8080),
+				"ReadOnlyPort": int32(10255),
+			},
+			name: "kubelet.conf.d overrides kubelet.conf",
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				ReadOnlyPort:  int32(10256),
+				KubeReserved:  map[string]string{"memory": "100Mi"},
+				SyncFrequency: metav1.Duration{Duration: 5 * time.Minute},
+			},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+readOnlyPort: 10255
+kubeReserved:
+  memory: 150Mi
+  cpu: 200m
+`,
+			dropin2: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+readOnlyPort: 10257
+kubeReserved:
+  memory: 100Mi
+`,
+			overwrittenConfigFields: map[string]interface{}{
+				"ReadOnlyPort": int32(10257),
+				"KubeReserved": map[string]string{
+					"cpu":    "200m",
+					"memory": "100Mi",
+				},
+				"SyncFrequency": metav1.Duration{Duration: 5 * time.Minute},
+			},
+			name: "kubelet.conf.d overrides kubelet.conf with subfield override",
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:       int32(9090),
+				ClusterDNS: []string{"192.168.1.3", "192.168.1.4"},
+			},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 9090
+systemReserved:
+  memory: 1Gi
+`,
+			dropin2: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 8080
+readOnlyPort: 10255
+systemReserved:
+  memory: 2Gi
+clusterDNS:
+  - 192.168.1.1
+  - 192.168.1.5
+  - 192.168.1.8
+`,
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(8080),
+				"ReadOnlyPort": int32(10255),
+				"SystemReserved": map[string]string{
+					"memory": "2Gi",
+				},
+				"ClusterDNS": []string{"192.168.1.1", "192.168.1.5", "192.168.1.8"},
+			},
+			name: "kubelet.conf.d overrides kubelet.conf with slices/lists",
+		},
+		{
+			kubeletConfig: nil,
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 9090
+`,
+			dropin2: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 8080
+readOnlyPort: 10255
+`,
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(8081),
+				"ReadOnlyPort": int32(10256),
+			},
+			cliArgs: []string{
+				"--port=8081",
+				"--read-only-port=10256",
+			},
+			name: "cli args override kubelet.conf.d",
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:       int32(9090),
+				ClusterDNS: []string{"192.168.1.3"},
+			},
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":       int32(9090),
+				"ClusterDNS": []string{"192.168.1.2"},
+			},
+			cliArgs: []string{
+				"--port=9090",
+				"--cluster-dns=192.168.1.2",
+			},
+			name: "cli args override kubelet.conf",
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				ResolverConfig: "original",
+				Port:           123,
+				ReadOnlyPort:   234,
+			},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+resolvConf: dropin1
+`,
+			dropin2: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 0
+`,
+			overwrittenConfigFields: map[string]interface{}{
+				"ResolverConfig": "dropin1",    // overridden by dropin1
+				"Port":           int32(10250), // reset to 0 by dropin2, then re-defaulted
+				"ReadOnlyPort":   int32(234),   // preserved from original config
+			},
+			name: "json conversion is correct",
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta2
+kind: KubeletConfiguration
+`,
+			name:             "invalid drop-in apiVersion",
+			expectMergeError: `unknown apiVersion/kind: kubelet.config.k8s.io/v1beta2, Kind=KubeletConfiguration`,
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration2
+`,
+			name:             "invalid drop-in kind",
+			expectMergeError: `unknown apiVersion/kind: kubelet.config.k8s.io/v1beta1, Kind=KubeletConfiguration2`,
+		},
+		{
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{},
+			dropin1: `
+port: 123
+`,
+			name:             "empty drop-in apiVersion/kind",
+			expectMergeError: `'Kind' is missing`,
+		},
+		{
+			name: "identical kubelet config and drop-in file",
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:         int32(9090),
+				ReadOnlyPort: int32(10255),
+			},
+			dropin1: `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 9090
+readOnlyPort: 10255
+`,
+			expectMergeError: "",
+		},
+		{
+			name: "yaml files are ignored, only .conf files are loaded",
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port: int32(9090),
+			},
+			customDropins: map[string]string{
+				"10-should-be-ignored.yaml": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 7777
+`,
+				"20-should-be-ignored.txt": "readme text",
+				"30-valid.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+readOnlyPort: 10255
+`,
+			},
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(9090),  // Port should remain unchanged as .yaml file should be ignored
+				"ReadOnlyPort": int32(10255), // ReadOnlyPort should be set from .conf file
+			},
+			expectedSkippedFiles: []string{"10-should-be-ignored.yaml", "20-should-be-ignored.txt"},
+		},
+		{
+			name: "invalid YAML syntax in drop-in file causes merge to fail",
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port: int32(9090),
+			},
+			customDropins: map[string]string{
+				"10-malformed.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: [this is not valid
+  indentation is wrong
+    more indentation
+`,
+			},
+			expectMergeError: "10-malformed.conf",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			// Prepare a temporary directory for testing
+			tempDir := t.TempDir()
+
+			kubeletConfig := &kubeletconfiginternal.KubeletConfiguration{}
+			kubeletFlags := &options.KubeletFlags{}
+
+			if test.kubeletConfig != nil {
+				// Create the Kubeletconfig
+				kubeletConfFile := filepath.Join(tempDir, "kubelet.conf")
+				yamlData, err := yaml.Marshal(test.kubeletConfig) // Convert struct to YAML
+				require.NoError(t, err, "failed to convert kubelet config to YAML")
+				err = os.WriteFile(kubeletConfFile, yamlData, 0644)
+				require.NoError(t, err, "failed to create config from YAML data")
+				kubeletFlags.KubeletConfigFile = kubeletConfFile
+				kubeletConfig = test.kubeletConfig
+			}
+			if len(test.dropin1) > 0 || len(test.dropin2) > 0 || len(test.customDropins) > 0 {
+				// Create kubelet.conf.d directory and drop-in configuration files
+				kubeletConfDir := filepath.Join(tempDir, "kubelet.conf.d")
+				err := os.Mkdir(kubeletConfDir, 0755)
+				require.NoError(t, err, "Failed to create kubelet.conf.d directory")
+
+				if len(test.dropin1) > 0 {
+					err = os.WriteFile(filepath.Join(kubeletConfDir, "10-kubelet.conf"), []byte(test.dropin1), 0644)
+					require.NoError(t, err, "failed to create config from a yaml file")
+				}
+
+				if len(test.dropin2) > 0 {
+					err = os.WriteFile(filepath.Join(kubeletConfDir, "20-kubelet.conf"), []byte(test.dropin2), 0644)
+					require.NoError(t, err, "failed to create config from a yaml file")
+				}
+
+				for filename, content := range test.customDropins {
+					err = os.WriteFile(filepath.Join(kubeletConfDir, filename), []byte(content), 0644)
+					require.NoError(t, err, "failed to create custom dropin file")
+				}
+
+				// Merge the kubelet configurations
+				skippedFiles, err := mergeKubeletConfigurations(kubeletConfig, kubeletConfDir)
+				if test.expectMergeError == "" {
+					require.NoError(t, err, "failed to merge kubelet drop-in configs")
+				} else {
+					require.Error(t, err)
+					require.ErrorContains(t, err, test.expectMergeError)
+				}
+
+				// Verify skipped files if expected
+				if len(test.expectedSkippedFiles) > 0 {
+					// Extract just the filenames from the full paths
+					var skippedFilenames []string
+					for _, path := range skippedFiles {
+						skippedFilenames = append(skippedFilenames, filepath.Base(path))
+					}
+					require.ElementsMatch(t, test.expectedSkippedFiles, skippedFilenames,
+						"skipped files do not match expected")
+				}
+			}
+
+			// Use kubelet config flag precedence
+			err := kubeletConfigFlagPrecedence(kubeletConfig, test.cliArgs)
+			require.NoError(t, err, "failed to set the kubelet config flag precedence")
+
+			// Verify the merged configuration fields
+			for fieldName, expectedValue := range test.overwrittenConfigFields {
+				value := reflect.ValueOf(kubeletConfig).Elem()
+				field := value.FieldByName(fieldName)
+				require.Equal(t, expectedValue, field.Interface(), "Field mismatch: "+fieldName)
+			}
+		})
+	}
+}
+
+func TestMergeKubeletConfigsWithSubdirs(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		kubeletConfig           *kubeletconfiginternal.KubeletConfiguration
+		dropins                 map[string]string // map[relativePath]content
+		overwrittenConfigFields map[string]interface{}
+	}{
+		{
+			name: "subdirectories are processed in lexical order",
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:         int32(9090),
+				ReadOnlyPort: int32(10257),
+			},
+			dropins: map[string]string{
+				"10-kubelet.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 8080
+`,
+				"subdir/20-kubelet.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 7777
+readOnlyPort: 9999
+`,
+			},
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(7777),
+				"ReadOnlyPort": int32(9999),
+			},
+		},
+		{
+			name: "same filename in multiple directories - lexical order applies",
+			kubeletConfig: &kubeletconfiginternal.KubeletConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "KubeletConfiguration",
+					APIVersion: "kubelet.config.k8s.io/v1beta1",
+				},
+				Port:         int32(9090),
+				ReadOnlyPort: int32(10255),
+			},
+			dropins: map[string]string{
+				"10-kubelet.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 8080
+`,
+				"sub-dir1/10-kubelet.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 7070
+readOnlyPort: 8888
+`,
+				"sub-dir2/10-kubelet.conf": `
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 6060
+readOnlyPort: 9999
+`,
+			},
+			overwrittenConfigFields: map[string]interface{}{
+				"Port":         int32(6060),
+				"ReadOnlyPort": int32(9999),
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			kubeletConfDir := filepath.Join(tempDir, "kubelet.conf.d")
+			err := os.Mkdir(kubeletConfDir, 0755)
+			require.NoError(t, err, "Failed to create kubelet.conf.d directory")
+
+			// Create drop-in files including those in subdirectories
+			for relPath, content := range test.dropins {
+				fullPath := filepath.Join(kubeletConfDir, relPath)
+				// Create subdirectory if needed
+				dir := filepath.Dir(fullPath)
+				if dir != kubeletConfDir {
+					err = os.MkdirAll(dir, 0755)
+					require.NoError(t, err, "Failed to create subdirectory: "+dir)
+				}
+				err = os.WriteFile(fullPath, []byte(content), 0644)
+				require.NoError(t, err, "Failed to create drop-in file: "+relPath)
+			}
+
+			// Merge the kubelet configurations
+			_, err = mergeKubeletConfigurations(test.kubeletConfig, kubeletConfDir)
+			require.NoError(t, err, "failed to merge kubelet drop-in configs")
+
+			// Verify the merged configuration fields
+			for fieldName, expectedValue := range test.overwrittenConfigFields {
+				value := reflect.ValueOf(test.kubeletConfig).Elem()
+				field := value.FieldByName(fieldName)
+				require.Equal(t, expectedValue, field.Interface(), "Field mismatch: "+fieldName)
+			}
+		})
+	}
+}
+
+func TestMarshalKubeletConfigForLog(t *testing.T) {
+	kc := &kubeletconfiginternal.KubeletConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "KubeletConfiguration",
+			APIVersion: "kubelet.config.k8s.io/v1beta1",
+		},
+		// Non-default values that must round-trip into the marshaled output.
+		FailSwapOn:   false,
+		EvictionHard: map[string]string{"memory.available": "200Mi"},
+		// Sensitive field that must be masked.
+		StaticPodURLHeader: map[string][]string{
+			"Authorization": {"Bearer super-secret-token"},
+		},
+	}
+
+	out, err := marshalKubeletConfigForLog(kc)
+	require.NoError(t, err)
+
+	// (2) The output carries the external GroupVersionKind, mirroring /configz.
+	require.Contains(t, out, "apiVersion: kubelet.config.k8s.io/v1beta1")
+	require.Contains(t, out, "kind: KubeletConfiguration")
+
+	// (1) Non-default effective values are present.
+	require.Contains(t, out, "failSwapOn: false")
+	require.Contains(t, out, "memory.available: 200Mi")
+
+	// (3) Sensitive StaticPodURLHeader values are masked, never leaked.
+	require.Contains(t, out, "<masked>")
+	require.NotContains(t, out, "super-secret-token")
+
+	// The helper must not mutate the caller's config when masking.
+	require.Equal(t, []string{"Bearer super-secret-token"}, kc.StaticPodURLHeader["Authorization"])
+}
+
+// describePublicKey names the exact key a certificate carries, so that P-256
+// and P-384 (both x509.ECDSA) and the three ML-DSA variants stay distinct.
+func describePublicKey(t *testing.T, pub crypto.PublicKey) string {
+	t.Helper()
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		return "ECDSA " + k.Curve.Params().Name
+	case *rsa.PublicKey:
+		return fmt.Sprintf("RSA %d", k.N.BitLen())
+	case *mldsa.PublicKey:
+		switch k.Parameters() {
+		case mldsa.MLDSA44():
+			return "ML-DSA-44"
+		case mldsa.MLDSA65():
+			return "ML-DSA-65"
+		case mldsa.MLDSA87():
+			return "ML-DSA-87"
+		default:
+			t.Fatalf("certificate carries an ML-DSA key with unrecognized parameters")
+		}
+	default:
+		t.Fatalf("certificate carries an unrecognized key type %T", pub)
+	}
+	return ""
+}
+
+// verifySelfSignedKey runs InitializeTLS against an empty cert directory and
+// names the key of the certificate it generates.
+func verifySelfSignedKey(t *testing.T, algorithm *kubeletconfiginternal.CertificateKeyAlgorithmType, wantKey string) {
+	t.Helper()
+	kf := &options.KubeletFlags{
+		CertDirectory:    t.TempDir(),
+		HostnameOverride: "test-node",
+	}
+	kc := &kubeletconfiginternal.KubeletConfiguration{
+		TLSMinVersion:                 "VersionTLS13",
+		ServerCertificateKeyAlgorithm: algorithm,
+	}
+
+	if _, err := InitializeTLS(context.Background(), kf, kc); err != nil {
+		t.Fatalf("InitializeTLS() failed: %v", err)
+	}
+
+	certs, err := certutil.CertsFromFile(kc.TLSCertFile)
+	if err != nil {
+		t.Fatalf("reading the generated cert: %v", err)
+	}
+	if got := describePublicKey(t, certs[0].PublicKey); got != wantKey {
+		t.Errorf("generated cert key = %s, want %s", got, wantKey)
+	}
+}
+
+func TestInitializeTLSSelfSignedKeyAlgorithm(t *testing.T) {
+	wantKeys := map[kubeletconfiginternal.CertificateKeyAlgorithmType]string{
+		kubeletconfiginternal.CertificateKeyAlgorithmECDSAP256: "ECDSA P-256",
+		kubeletconfiginternal.CertificateKeyAlgorithmECDSAP384: "ECDSA P-384",
+		kubeletconfiginternal.CertificateKeyAlgorithmRSA2048:   "RSA 2048",
+		kubeletconfiginternal.CertificateKeyAlgorithmRSA3072:   "RSA 3072",
+		kubeletconfiginternal.CertificateKeyAlgorithmRSA4096:   "RSA 4096",
+		kubeletconfiginternal.CertificateKeyAlgorithmMLDSA44:   "ML-DSA-44",
+		kubeletconfiginternal.CertificateKeyAlgorithmMLDSA65:   "ML-DSA-65",
+		kubeletconfiginternal.CertificateKeyAlgorithmMLDSA87:   "ML-DSA-87",
+	}
+
+	t.Run("unset uses the documented ECDSA-P256 default", func(t *testing.T) {
+		verifySelfSignedKey(t, nil, "ECDSA P-256")
+	})
+
+	for _, algorithm := range kubeletconfiginternal.ValidCertificateKeyAlgorithms {
+		wantKey, ok := wantKeys[algorithm]
+		if !ok {
+			t.Errorf("no expected key recorded for supported algorithm %q", algorithm)
+			continue
+		}
+		t.Run(string(algorithm), func(t *testing.T) {
+			verifySelfSignedKey(t, &algorithm, wantKey)
+		})
 	}
 }

@@ -17,22 +17,26 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"time"
 
-	"github.com/golang/glog"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	bootstrapsecretutil "k8s.io/cluster-bootstrap/util/secrets"
+	"k8s.io/klog/v2"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	bootstrapapi "k8s.io/kubernetes/pkg/bootstrap/api"
-	"k8s.io/kubernetes/pkg/util/metrics"
+	"k8s.io/kubernetes/pkg/controller"
 )
 
 // TokenCleanerOptions contains options for the TokenCleaner
@@ -59,72 +63,164 @@ type TokenCleaner struct {
 
 	client clientset.Interface
 
-	secrets           cache.Store
-	secretsController cache.Controller
+	// secretLister is able to list/get secrets and is populated by the shared informer passed to NewTokenCleaner.
+	secretLister corelisters.SecretLister
+
+	// secretSynced returns true if the secret shared informer has been synced at least once.
+	secretSynced cache.InformerSynced
+
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewTokenCleaner returns a new *NewTokenCleaner.
-//
-// TODO: Switch to shared informers
-func NewTokenCleaner(cl clientset.Interface, options TokenCleanerOptions) (*TokenCleaner, error) {
+func NewTokenCleaner(ctx context.Context, cl clientset.Interface, secrets coreinformers.SecretInformer, options TokenCleanerOptions) (*TokenCleaner, error) {
+	logger := klog.FromContext(ctx)
 	e := &TokenCleaner{
 		client:               cl,
+		secretLister:         secrets.Lister(),
+		secretSynced:         secrets.Informer().HasSynced,
 		tokenSecretNamespace: options.TokenSecretNamespace,
-	}
-	if cl.CoreV1().RESTClient().GetRateLimiter() != nil {
-		if err := metrics.RegisterMetricAndTrackRateLimiterUsage("token_cleaner", cl.CoreV1().RESTClient().GetRateLimiter()); err != nil {
-			return nil, err
-		}
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "token_cleaner",
+			},
+		),
 	}
 
-	secretSelector := fields.SelectorFromSet(map[string]string{api.SecretTypeField: string(bootstrapapi.SecretTypeBootstrapToken)})
-	e.secrets, e.secretsController = cache.NewInformer(
-		&cache.ListWatch{
-			ListFunc: func(lo metav1.ListOptions) (runtime.Object, error) {
-				lo.FieldSelector = secretSelector.String()
-				return e.client.CoreV1().Secrets(e.tokenSecretNamespace).List(lo)
+	_, _ = secrets.Informer().AddEventHandlerWithOptions(
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				switch t := obj.(type) {
+				case *v1.Secret:
+					return t.Type == bootstrapapi.SecretTypeBootstrapToken && t.Namespace == e.tokenSecretNamespace
+				default:
+					utilruntime.HandleError(fmt.Errorf("object passed to %T that is not expected: %T", e, obj))
+					return false
+				}
 			},
-			WatchFunc: func(lo metav1.ListOptions) (watch.Interface, error) {
-				lo.FieldSelector = secretSelector.String()
-				return e.client.CoreV1().Secrets(e.tokenSecretNamespace).Watch(lo)
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    e.enqueueSecrets,
+				UpdateFunc: func(oldSecret, newSecret interface{}) { e.enqueueSecrets(newSecret) },
 			},
 		},
-		&v1.Secret{},
-		options.SecretResync,
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    e.evalSecret,
-			UpdateFunc: func(oldSecret, newSecret interface{}) { e.evalSecret(newSecret) },
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.SecretResync,
 		},
 	)
+
 	return e, nil
 }
 
 // Run runs controller loops and returns when they are done
-func (tc *TokenCleaner) Run(stopCh <-chan struct{}) {
-	go tc.secretsController.Run(stopCh)
-	go wait.Until(tc.evalSecrets, 10*time.Second, stopCh)
-	<-stopCh
+func (tc *TokenCleaner) Run(ctx context.Context) {
+	defer utilruntime.HandleCrashWithContext(ctx)
+
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting token cleaner controller")
+
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down token cleaner controller")
+		tc.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, tc.secretSynced) {
+		return
+	}
+
+	wg.Go(func() {
+		wait.UntilWithContext(ctx, tc.worker, 10*time.Second)
+	})
+	<-ctx.Done()
 }
 
-func (tc *TokenCleaner) evalSecrets() {
-	for _, obj := range tc.secrets.List() {
-		tc.evalSecret(obj)
+func (tc *TokenCleaner) enqueueSecrets(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	tc.queue.Add(key)
+}
+
+// worker runs a thread that dequeues secrets, handles them, and marks them done.
+func (tc *TokenCleaner) worker(ctx context.Context) {
+	for tc.processNextWorkItem(ctx) {
 	}
 }
 
-func (tc *TokenCleaner) evalSecret(o interface{}) {
+// processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (tc *TokenCleaner) processNextWorkItem(ctx context.Context) bool {
+	key, quit := tc.queue.Get()
+	if quit {
+		return false
+	}
+	defer tc.queue.Done(key)
+
+	if err := tc.syncFunc(ctx, key); err != nil {
+		tc.queue.AddRateLimited(key)
+		utilruntime.HandleError(fmt.Errorf("Sync %v failed with : %v", key, err))
+		return true
+	}
+
+	tc.queue.Forget(key)
+	return true
+}
+
+func (tc *TokenCleaner) syncFunc(ctx context.Context, key string) error {
+	logger := klog.FromContext(ctx)
+	startTime := time.Now()
+	defer func() {
+		logger.V(4).Info("Finished syncing secret", "secret", key, "elapsedTime", time.Since(startTime))
+	}()
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+
+	ret, err := tc.secretLister.Secrets(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		logger.V(3).Info("Secret has been deleted", "secret", key)
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if ret.Type == bootstrapapi.SecretTypeBootstrapToken {
+		tc.evalSecret(ctx, ret)
+	}
+	return nil
+}
+
+func (tc *TokenCleaner) evalSecret(ctx context.Context, o interface{}) {
+	logger := klog.FromContext(ctx)
 	secret := o.(*v1.Secret)
-	if isSecretExpired(secret) {
-		glog.V(3).Infof("Deleting expired secret %s/%s", secret.Namespace, secret.Name)
-		var options *metav1.DeleteOptions
+	ttl, alreadyExpired := bootstrapsecretutil.GetExpiration(secret, time.Now())
+	if alreadyExpired {
+		logger.V(3).Info("Deleting expired secret", "secret", klog.KObj(secret))
+		var options metav1.DeleteOptions
 		if len(secret.UID) > 0 {
-			options = &metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &secret.UID}}
+			options.Preconditions = &metav1.Preconditions{UID: &secret.UID}
 		}
-		err := tc.client.CoreV1().Secrets(secret.Namespace).Delete(secret.Name, options)
+		err := tc.client.CoreV1().Secrets(secret.Namespace).Delete(ctx, secret.Name, options)
 		// NotFound isn't a real error (it's already been deleted)
 		// Conflict isn't a real error (the UID precondition failed)
 		if err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
-			glog.V(3).Infof("Error deleting Secret: %v", err)
+			logger.V(3).Info("Error deleting secret", "err", err)
 		}
+	} else if ttl > 0 {
+		key, err := controller.KeyFunc(o)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+		tc.queue.AddAfter(key, ttl)
 	}
 }

@@ -25,12 +25,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 )
 
-func newStorage(t *testing.T) (*REST, *etcdtesting.EtcdTestServer) {
+func newStorage(t *testing.T) (*REST, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	restOptions := generic.RESTOptions{
 		StorageConfig:           etcdStorage,
@@ -38,7 +39,11 @@ func newStorage(t *testing.T) (*REST, *etcdtesting.EtcdTestServer) {
 		DeleteCollectionWorkers: 1,
 		ResourcePrefix:          "podtemplates",
 	}
-	return NewREST(restOptions), server
+	rest, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
+	return rest, server
 }
 
 func validNewPodTemplate(name string) *api.PodTemplate {
@@ -51,20 +56,7 @@ func validNewPodTemplate(name string) *api.PodTemplate {
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{"test": "foo"},
 			},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyAlways,
-				DNSPolicy:     api.DNSClusterFirst,
-				Containers: []api.Container{
-					{
-						Name:            "foo",
-						Image:           "test",
-						ImagePullPolicy: api.PullAlways,
-
-						TerminationMessagePath:   api.TerminationMessagePathDefault,
-						TerminationMessagePolicy: api.TerminationMessageReadFile,
-					},
-				},
-			},
+			Spec: podtest.MakePodSpec(),
 		},
 	}
 }

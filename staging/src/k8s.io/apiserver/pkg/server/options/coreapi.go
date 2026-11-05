@@ -26,6 +26,7 @@ import (
 	clientgoclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	tracing "k8s.io/component-base/tracing"
 )
 
 // CoreAPIOptions contains options to configure the connection to a core API Kubernetes apiserver.
@@ -69,6 +70,7 @@ func (o *CoreAPIOptions) ApplyTo(config *server.RecommendedConfig) error {
 			return err
 		}
 	}
+	kubeconfig.Wrap(tracing.WrapperFor(config.TracerProvider))
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes clientset: %v", err)

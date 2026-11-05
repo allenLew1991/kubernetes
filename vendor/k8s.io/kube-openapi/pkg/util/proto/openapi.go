@@ -58,6 +58,14 @@ type SchemaVisitor interface {
 	VisitReference(Reference)
 }
 
+// SchemaVisitorArbitrary is an additional visitor interface which handles
+// arbitrary types. For backwards compatibility, it's a separate interface
+// which is checked for at runtime.
+type SchemaVisitorArbitrary interface {
+	SchemaVisitor
+	VisitArbitrary(*Arbitrary)
+}
+
 // Schema is the base definition of an openapi type.
 type Schema interface {
 	// Giving a visitor here will let you visit the actual type.
@@ -69,6 +77,8 @@ type Schema interface {
 	GetPath() *Path
 	// Describes the field.
 	GetDescription() string
+	// Default for that schema.
+	GetDefault() interface{}
 	// Returns type extensions.
 	GetExtensions() map[string]interface{}
 }
@@ -121,6 +131,7 @@ func (p *Path) FieldPath(field string) Path {
 type BaseSchema struct {
 	Description string
 	Extensions  map[string]interface{}
+	Default     interface{}
 
 	Path Path
 }
@@ -131,6 +142,10 @@ func (b *BaseSchema) GetDescription() string {
 
 func (b *BaseSchema) GetExtensions() map[string]interface{} {
 	return b.Extensions
+}
+
+func (b *BaseSchema) GetDefault() interface{} {
+	return b.Default
 }
 
 func (b *BaseSchema) GetPath() *Path {
@@ -165,6 +180,8 @@ type Kind struct {
 	RequiredFields []string
 	// Maps field names to types.
 	Fields map[string]Schema
+	// FieldOrder reports the canonical order for the fields.
+	FieldOrder []string
 }
 
 var _ Schema = &Kind{}
@@ -240,6 +257,23 @@ func (p *Primitive) GetName() string {
 		return p.Type
 	}
 	return fmt.Sprintf("%s (%s)", p.Type, p.Format)
+}
+
+// Arbitrary is a value of any type (primitive, object or array)
+type Arbitrary struct {
+	BaseSchema
+}
+
+var _ Schema = &Arbitrary{}
+
+func (a *Arbitrary) Accept(v SchemaVisitor) {
+	if visitor, ok := v.(SchemaVisitorArbitrary); ok {
+		visitor.VisitArbitrary(a)
+	}
+}
+
+func (a *Arbitrary) GetName() string {
+	return "Arbitrary value (primitive, object or array)"
 }
 
 // Reference implementation depends on the type of document.

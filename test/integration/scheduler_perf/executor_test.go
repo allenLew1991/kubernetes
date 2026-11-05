@@ -1,0 +1,1887 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package benchmark
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	v1 "k8s.io/api/core/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/ktesting"
+	"k8s.io/client-go/kubernetes/fake"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"k8s.io/utils/ptr"
+)
+
+type verifyFunc func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error
+
+func TestRunOp(t *testing.T) {
+	tests := []struct {
+		name            string
+		op              realOp
+		workload        *Workload
+		expectedFailure bool
+		verifyFuncs     []verifyFunc
+	}{
+		{
+			name: "Create Single Node",
+			op: &createNodesOp{
+				Opcode: createNodesOpcode,
+				Count:  1,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyObj(
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "node-0-",
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+							Allocatable: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Create Multiple Nodes",
+			op: &createNodesOp{
+				Opcode: createNodesOpcode,
+				Count:  5,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(5),
+				verifyObj(
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "node-0-",
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+							Allocatable: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Create Nodes with Label Strategy",
+			op: &createNodesOp{
+				Opcode:                   createNodesOpcode,
+				Count:                    3,
+				LabelNodePrepareStrategy: NewLabelNodePrepareStrategy("test-label", "value1", "value2", "value3"),
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyLabelValuesAllowed("test-label", sets.New("value1", "value2", "value3")),
+			},
+		},
+		{
+			name: "Create Nodes with Unique Label Strategy",
+			op: &createNodesOp{
+				Opcode:                  createNodesOpcode,
+				Count:                   2,
+				UniqueNodeLabelStrategy: NewUniqueNodeLabelStrategy("unique-test-label"),
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyUniqueLabelValues("unique-test-label"),
+			},
+		},
+		{
+			name: "Create Nodes with Node Allocatable Strategy",
+			op: &createNodesOp{
+				Opcode: createNodesOpcode,
+				Count:  2,
+				NodeAllocatableStrategy: NewNodeAllocatableStrategy(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "2",
+						v1.ResourceMemory: "4Gi",
+					},
+					nil, // no CSI node allocatable
+					nil, // no migrated plugins
+				),
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyObj(
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "node-0-",
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+							Allocatable: v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("2"),
+								v1.ResourceMemory: resource.MustParse("4Gi"),
+								v1.ResourcePods:   resource.MustParse("110"),
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Create Nodes with Custom Template",
+			op: &createNodesOp{
+				Opcode: createNodesOpcode,
+				Count:  2,
+				NodeTemplatePath: createObjTemplateFile(t,
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "custom-node-",
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourcePods:   resource.MustParse("100"),
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("8Gi"),
+							},
+						},
+					},
+				),
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyObj(
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "custom-node-",
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourcePods:   resource.MustParse("100"),
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("8Gi"),
+							},
+						},
+					},
+				),
+			},
+		},
+		{
+			name: "Invalid Node Template Path",
+			op: &createNodesOp{
+				Opcode:           createNodesOpcode,
+				Count:            1,
+				NodeTemplatePath: ptr.To("non-existent-file.json"),
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create Nodes with Template Params",
+			op: &createNodesOp{
+				Opcode: createNodesOpcode,
+				Count:  1,
+				NodeTemplatePath: createObjTemplateFile(t,
+					&v1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "param-node-",
+							Labels: map[string]string{
+								"test-param": "{{.ParamValue}}",
+							},
+						},
+						Status: v1.NodeStatus{
+							Capacity: v1.ResourceList{
+								v1.ResourcePods:   resource.MustParse("100"),
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("8Gi"),
+							},
+						},
+					},
+				),
+				TemplateParams: map[string]any{
+					"ParamValue": "substituted-value",
+				},
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyLabelValuesAllowed("test-param", sets.New("substituted-value")),
+			},
+		},
+		{
+			name: "Create Two Pods",
+			op: &createPodsOp{
+				Opcode:               createPodsOpcode,
+				Count:                2,
+				SkipWaitToCompletion: true,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj(
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "namespace-0",
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Name:  "pause",
+									Image: "registry.k8s.io/pause:latest",
+								},
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Create Pods with Custom Namespace",
+			op: &createPodsOp{
+				Opcode:               createPodsOpcode,
+				Count:                1,
+				Namespace:            ptr.To("test-namespace"),
+				PodTemplatePath:      newPodTemplateFile(t, "test-namespace"),
+				SkipWaitToCompletion: true,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyNamespaceCreated("test-namespace"),
+				verifyCount(1),
+				verifyObj(
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "test-namespace",
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Name:  "pause",
+									Image: "registry.k8s.io/pause:latest",
+								},
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Invalid Pod Template Path",
+			op: &createPodsOp{
+				Opcode:          createPodsOpcode,
+				Count:           1,
+				PodTemplatePath: ptr.To("non-existent-pod-template.json"),
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create Pods with PersistentVolume",
+			op: &createPodsOp{
+				Opcode:                            createPodsOpcode,
+				Count:                             1,
+				Namespace:                         ptr.To("default"),
+				PodTemplatePath:                   newPodTemplateFile(t, "default"),
+				PersistentVolumeTemplatePath:      newPersistentVolumeTemplateFile(t),
+				PersistentVolumeClaimTemplatePath: newPersistentVolumeClaimTemplateFile(t, "default"),
+				SkipWaitToCompletion:              true,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyNamespaceCreated("default"),
+				verifyObj(
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+						Spec: v1.PodSpec{
+							Volumes: []v1.Volume{
+								{
+									Name: "vol",
+									VolumeSource: v1.VolumeSource{
+										PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+											ClaimName: "pvc-0",
+										},
+									},
+								},
+							},
+							Containers: []v1.Container{
+								{
+									Name:  "pause",
+									Image: "registry.k8s.io/pause:latest",
+								},
+							},
+						},
+					}),
+			},
+		},
+		{
+			name: "Create Pods with CountParam",
+			op: &createPodsOp{
+				Opcode:               createPodsOpcode,
+				CountParam:           "$POD_COUNT",
+				Namespace:            ptr.To("default"),
+				PodTemplatePath:      newPodTemplateFile(t, "default"),
+				SkipWaitToCompletion: true,
+			},
+			workload: &Workload{
+				Name: "test-workload",
+				Params: params{
+					params: map[string]any{
+						"POD_COUNT": float64(2),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyNamespaceCreated("default"),
+			},
+		},
+		{
+			name: "Create multiple Pods with detailed verification",
+			op: &createPodsOp{
+				Opcode:               createPodsOpcode,
+				Count:                3,
+				Namespace:            ptr.To("test-namespace"),
+				PodTemplatePath:      newPodTemplateFile(t, "test-namespace"),
+				SkipWaitToCompletion: true,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyNamespaceCreated("test-namespace"),
+				verifyObj(
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "test-namespace",
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Name:  "pause",
+									Image: "registry.k8s.io/pause:latest",
+								},
+							},
+						},
+					}),
+			},
+		},
+		{
+
+			name: "Create Pods with Signature Labels from File",
+			op: &createPodsOp{
+				Opcode: createPodsOpcode,
+				Count:  3,
+				PodTemplatePath: createObjTemplateFile(t,
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "custom-pod-{{.Index}}",
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Name:  "container",
+									Image: "pause",
+								},
+							},
+						},
+					}),
+				SkipWaitToCompletion: true,
+				SignatureBatchSize:   2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyPodSignature(2),
+			},
+		},
+		{
+			name: "Create Pods with Signature Labels from File (unset SignatureBatchSize)",
+			op: &createPodsOp{
+				Opcode: createPodsOpcode,
+				Count:  3,
+				PodTemplatePath: createObjTemplateFile(t,
+					&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "custom-pod-{{.Index}}",
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Name:  "container",
+									Image: "pause",
+								},
+							},
+						},
+					}),
+				SkipWaitToCompletion: true,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyPodSignature(1),
+			},
+		},
+		{
+			name: "Create Pods with Invalid SignatureBatchSize",
+			op: &createPodsOp{
+				Opcode:             createPodsOpcode,
+				Count:              1,
+				SignatureBatchSize: -1,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create PodGroups",
+			op: &createPodGroups{
+				Opcode:       createPodGroupsOpcode,
+				Namespace:    "namespace-0",
+				TemplatePath: *newPodGroupTemplateFile(t, "namespace-0"),
+				Count:        2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj(st.MakePodGroup().Namespace("namespace-0").MinCount(3).Obj()),
+			},
+		},
+		{
+			name: "Create PodGroups with Invalid Template Path",
+			op: &createPodGroups{
+				Opcode:       createPodGroupsOpcode,
+				Namespace:    "namespace-0",
+				TemplatePath: "non-existent-file.yaml",
+				Count:        1,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create PodGroups with empty namespace",
+			op: &createPodGroups{
+				Opcode:       createPodGroupsOpcode,
+				Namespace:    "",
+				TemplatePath: *newPodGroupTemplateFile(t, ""),
+				Count:        1,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create PodGroups with zero count",
+			op: &createPodGroups{
+				Opcode:       createPodGroupsOpcode,
+				Namespace:    "namespace-0",
+				TemplatePath: *newPodGroupTemplateFile(t, "namespace-0"),
+				Count:        0,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create PodGroups with Parent CompositePodGroups",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"podGroupsCount":          float64(4),
+						"parentLevel":             float64(2),
+						"childrenPodGroupsPerCPG": float64(2),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			op: &createPodGroups{
+				Opcode:    createPodGroupsOpcode,
+				Namespace: "namespace-0",
+				TemplatePath: *createObjTemplateFile(t,
+					st.MakePodGroup().
+						Name("pg-{{.Index}}").
+						Namespace("namespace-0").
+						MinCount(3).
+						ParentCompositePodGroup("cpg-l{{.parentLevel}}-{{DivideInt .Index .childrenPodGroupsPerCPG}}").
+						Obj(),
+				),
+				CountParam: "$podGroupsCount",
+				TemplateParams: map[string]any{
+					"parentLevel":             "$parentLevel",
+					"childrenPodGroupsPerCPG": "$childrenPodGroupsPerCPG",
+				},
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(4),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj([]*schedulingv1beta1.PodGroup{
+					st.MakePodGroup().Name("pg-0").Namespace("namespace-0").MinCount(3).ParentCompositePodGroup("cpg-l2-0").Obj(),
+					st.MakePodGroup().Name("pg-1").Namespace("namespace-0").MinCount(3).ParentCompositePodGroup("cpg-l2-0").Obj(),
+					st.MakePodGroup().Name("pg-2").Namespace("namespace-0").MinCount(3).ParentCompositePodGroup("cpg-l2-1").Obj(),
+					st.MakePodGroup().Name("pg-3").Namespace("namespace-0").MinCount(3).ParentCompositePodGroup("cpg-l2-1").Obj(),
+				}),
+			},
+		},
+		{
+			name: "Create PodGroups with missing parentLevel parameter",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"podGroupsCount":          float64(2),
+						"childrenPodGroupsPerCPG": float64(2),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			op: &createPodGroups{
+				Opcode:    createPodGroupsOpcode,
+				Namespace: "namespace-0",
+				TemplatePath: *createObjTemplateFile(t,
+					st.MakePodGroup().
+						Name("pg-{{.Index}}").
+						Namespace("namespace-0").
+						MinCount(3).
+						ParentCompositePodGroup("cpg-l{{.parentLevel}}-{{DivideInt .Index .childrenPodGroupsPerCPG}}").
+						Obj(),
+				),
+				CountParam: "$podGroupsCount",
+				TemplateParams: map[string]any{
+					"parentLevel":             "$parentLevel",
+					"childrenPodGroupsPerCPG": "$childrenPodGroupsPerCPG",
+				},
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj(st.MakeCompositePodGroup().Namespace("namespace-0").MinGroupCount(2).Obj()),
+			},
+		},
+		{
+			name: "Create 3-Level CompositePodGroups",
+			op: &createCompositePodGroups{
+				Opcode:                           createCompositePodGroupsOpcode,
+				Namespace:                        "namespace-0",
+				TemplatePath:                     *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:                        1,
+				Depth:                            3,
+				ChildrenCompositePodGroupsPerCPG: 2,
+				ChildrenPodGroupsPerCPG:          2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj([]*schedulingv1beta1.CompositePodGroup{
+					st.MakeCompositePodGroup().Name("cpg-l1-0").Namespace("namespace-0").MinGroupCount(2).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l2-0").Namespace("namespace-0").ParentCompositePodGroup("cpg-l1-0").MinGroupCount(2).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l2-1").Namespace("namespace-0").ParentCompositePodGroup("cpg-l1-0").MinGroupCount(2).Obj(),
+				}),
+			},
+		},
+		{
+			name: "Create 4-Level CompositePodGroups with Parameters",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"initRoots":    float64(1),
+						"childrenCPGs": float64(2),
+						"childrenPGs":  float64(3),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			op: &createCompositePodGroups{
+				Opcode:                                createCompositePodGroupsOpcode,
+				Namespace:                             "namespace-0",
+				TemplatePath:                          *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCountParam:                        "$initRoots",
+				Depth:                                 4,
+				ChildrenCompositePodGroupsPerCPGParam: "$childrenCPGs",
+				ChildrenPodGroupsPerCPGParam:          "$childrenPGs",
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(7),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj([]*schedulingv1beta1.CompositePodGroup{
+					st.MakeCompositePodGroup().Name("cpg-l1-0").Namespace("namespace-0").MinGroupCount(2).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l2-0").Namespace("namespace-0").ParentCompositePodGroup("cpg-l1-0").MinGroupCount(2).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l2-1").Namespace("namespace-0").ParentCompositePodGroup("cpg-l1-0").MinGroupCount(2).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l3-0").Namespace("namespace-0").ParentCompositePodGroup("cpg-l2-0").MinGroupCount(3).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l3-1").Namespace("namespace-0").ParentCompositePodGroup("cpg-l2-0").MinGroupCount(3).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l3-2").Namespace("namespace-0").ParentCompositePodGroup("cpg-l2-1").MinGroupCount(3).Obj(),
+					st.MakeCompositePodGroup().Name("cpg-l3-3").Namespace("namespace-0").ParentCompositePodGroup("cpg-l2-1").MinGroupCount(3).Obj(),
+				}),
+			},
+		},
+		{
+			name: "Create CompositePodGroups with Invalid Template Path",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            "non-existent-file.yaml",
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with empty namespace",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, ""),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with zero root count",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               0,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with zero childrenPodGroupsPerCPG",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 0,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with depth < 2",
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   1,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with depth > 4",
+			op: &createCompositePodGroups{
+				Opcode:                           createCompositePodGroupsOpcode,
+				Namespace:                        "namespace-0",
+				TemplatePath:                     *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:                        1,
+				Depth:                            5,
+				ChildrenCompositePodGroupsPerCPG: 2,
+				ChildrenPodGroupsPerCPG:          2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with depth 2 and childrenCompositePodGroupsPerCPG set",
+			op: &createCompositePodGroups{
+				Opcode:                           createCompositePodGroupsOpcode,
+				Namespace:                        "namespace-0",
+				TemplatePath:                     *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:                        1,
+				Depth:                            2,
+				ChildrenCompositePodGroupsPerCPG: 2,
+				ChildrenPodGroupsPerCPG:          2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with already defined podGroupsCount parameter",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"podGroupsCount": float64(4),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with already defined parentLevel parameter",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"parentLevel": float64(1),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create CompositePodGroups with already used podGroupsCount and parentLevel parameters",
+			workload: &Workload{
+				Params: params{
+					params: map[string]any{
+						"podGroupsCount": float64(4),
+						"parentLevel":    float64(1),
+					},
+					isUsed: map[string]bool{
+						"podGroupsCount": true,
+						"parentLevel":    true,
+					},
+				},
+			},
+			op: &createCompositePodGroups{
+				Opcode:                  createCompositePodGroupsOpcode,
+				Namespace:               "namespace-0",
+				TemplatePath:            *newCompositePodGroupTemplateFile(t, "namespace-0"),
+				RootCount:               1,
+				Depth:                   2,
+				ChildrenPodGroupsPerCPG: 2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyNamespaceCreated("namespace-0"),
+				verifyObj(st.MakeCompositePodGroup().Namespace("namespace-0").MinGroupCount(2).Obj()),
+			},
+		},
+		{
+			name: "Create Namespaces",
+			op: &createNamespacesOp{
+				Opcode: createNamespacesOpcode,
+				Prefix: "test-namespace",
+				Count:  2,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyNamespaceCreated("test-namespace-0"),
+				verifyNamespaceCreated("test-namespace-1"),
+			},
+		},
+		{
+			name: "Create Namespaces with Zero Count",
+			op: &createNamespacesOp{
+				Opcode: createNamespacesOpcode,
+				Prefix: "zero-namespace",
+				Count:  0,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(0),
+			},
+		},
+		{
+			name: "Create Namespaces with Empty Prefix",
+			op: &createNamespacesOp{
+				Opcode: createNamespacesOpcode,
+				Count:  1,
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(1),
+				verifyNamespaceCreated("-0"),
+			},
+		},
+		{
+			name: "Create Namespaces with Invalid Count",
+			op: &createNamespacesOp{
+				Opcode: createNamespacesOpcode,
+				Prefix: "invalid-count-namespace",
+				Count:  -1,
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create Namespaces with Invalid CountParam",
+			op: &createNamespacesOp{
+				Opcode:     createNamespacesOpcode,
+				Prefix:     "invalid-count-param-namespace",
+				CountParam: "$NAMESPACE_COUNT",
+			},
+			workload: &Workload{
+				Name: "test-workload",
+				Params: params{
+					params: map[string]any{
+						"NAMESPACE_COUNT": "invalid",
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			expectedFailure: true,
+		},
+		{
+			name: "Create Namespaces with CountParam",
+			op: &createNamespacesOp{
+				Opcode:     createNamespacesOpcode,
+				Prefix:     "param-namespace",
+				CountParam: "$NAMESPACE_COUNT",
+			},
+			workload: &Workload{
+				Name: "test-workload",
+				Params: params{
+					params: map[string]any{
+						"NAMESPACE_COUNT": float64(3),
+					},
+					isUsed: map[string]bool{},
+				},
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(3),
+				verifyNamespaceCreated("param-namespace-0"),
+				verifyNamespaceCreated("param-namespace-1"),
+				verifyNamespaceCreated("param-namespace-2"),
+			},
+		},
+		{
+			name: "Create Namespaces with Custom Template",
+			op: &createNamespacesOp{
+				Opcode: createNamespacesOpcode,
+				Prefix: "template-namespace",
+				Count:  2,
+				NamespaceTemplatePath: createObjTemplateFile(t,
+					&v1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "namespace-name-gets-overwritten",
+							Labels: map[string]string{
+								"test-label": "test-value",
+							},
+							Annotations: map[string]string{
+								"test-annotation": "test-value",
+							},
+						},
+					},
+				),
+			},
+			verifyFuncs: []verifyFunc{
+				verifyCount(2),
+				verifyObj(
+					&v1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"test-label": "test-value",
+							},
+							Annotations: map[string]string{
+								"test-annotation": "test-value",
+							},
+						},
+					},
+				),
+			},
+		},
+		{
+			name: "Invalid Namespace Template Path",
+			op: &createNamespacesOp{
+				Opcode:                createNamespacesOpcode,
+				Prefix:                "invalid-template-namespace",
+				Count:                 1,
+				NamespaceTemplatePath: new("non-existent-namespace-template.json"),
+			},
+			expectedFailure: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			client := fake.NewSimpleClientset()
+			tCtx = tCtx.WithClients(nil, nil, client, nil)
+
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			podInformer := informerFactory.Core().V1().Pods()
+			podGroupInformer := informerFactory.Scheduling().V1beta1().PodGroups()
+			podGroupInformer.Informer()
+			compositePodGroupInformer := informerFactory.Scheduling().V1beta1().CompositePodGroups()
+			compositePodGroupInformer.Informer()
+			informerFactory.Start(tCtx.Done())
+			informerFactory.WaitForCacheSync(tCtx.Done())
+
+			exec := &WorkloadExecutor{
+				numPodsScheduledPerNamespace: make(map[string]int),
+				nextNodeIndex:                0,
+				testCase: &testCase{
+					DefaultPodTemplatePath: newPodTemplateFile(t, "namespace-0"),
+				},
+				podInformer:               podInformer,
+				podGroupInformer:          podGroupInformer,
+				compositePodGroupInformer: compositePodGroupInformer,
+				workload:                  tt.workload,
+			}
+
+			opToRun := tt.op
+			opIndex := 0
+			w := tt.workload
+			if w == nil {
+				w = &Workload{}
+			}
+
+			var err error
+			if patchable, ok := tt.op.(interface {
+				patchParams(w *Workload) (realOp, error)
+			}); ok {
+				opToRun, err = patchable.patchParams(w)
+			}
+
+			if err == nil {
+				err = exec.runOp(tCtx, opToRun, opIndex)
+			}
+
+			if tt.expectedFailure {
+				if err == nil {
+					t.Fatalf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Failed to run operation: %v", err)
+			}
+
+			if tt.verifyFuncs != nil {
+				for i, vf := range tt.verifyFuncs {
+					if err := vf(t, tCtx, opToRun, opIndex); err != nil {
+						t.Fatalf("Verification function %d failed for test %q: %v", i, tt.name, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// verifyCount returns a verification function that checks if the number of existing objects
+// matches the expected count based on the operation type.
+func verifyCount(expectedCount int) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		switch concreteOp := op.(type) {
+		case *createNodesOp:
+			nodes, err := tCtx.Client().CoreV1().Nodes().List(tCtx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list nodes: %w", err)
+			}
+			if got := len(nodes.Items); got != expectedCount {
+				return fmt.Errorf("unexpected node count: got %d, want %d", got, expectedCount)
+			}
+		case *createPodsOp:
+			namespace := fmt.Sprintf("namespace-%d", opIndex)
+			if concreteOp.Namespace != nil {
+				namespace = *concreteOp.Namespace
+			}
+			pods, err := tCtx.Client().CoreV1().Pods(namespace).List(tCtx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list pods: %w", err)
+			}
+			if got := len(pods.Items); got != expectedCount {
+				return fmt.Errorf("unexpected pod count: got %d, want %d", got, expectedCount)
+			}
+		case *createPodGroups:
+			pgs, err := tCtx.Client().SchedulingV1beta1().PodGroups(concreteOp.Namespace).List(tCtx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list pod groups: %w", err)
+			}
+			if got := len(pgs.Items); got != expectedCount {
+				return fmt.Errorf("unexpected pod group count: got %d, want %d", got, expectedCount)
+			}
+		case *createCompositePodGroups:
+			cpgs, err := tCtx.Client().SchedulingV1beta1().CompositePodGroups(concreteOp.Namespace).List(tCtx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list composite pod groups: %w", err)
+			}
+			if got := len(cpgs.Items); got != expectedCount {
+				return fmt.Errorf("unexpected composite pod group count: got %d, want %d", got, expectedCount)
+			}
+		case *createNamespacesOp:
+			namespaces, err := tCtx.Client().CoreV1().Namespaces().List(tCtx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list namespaces: %w", err)
+			}
+			if got := len(namespaces.Items); got != expectedCount {
+				return fmt.Errorf("unexpected namespace count: got %d, want %d", got, expectedCount)
+			}
+		default:
+			return fmt.Errorf("verifyCount doesn't support this operation type: %T", op)
+		}
+		return nil
+	}
+}
+
+func verifyPodSignature(batchSize int) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		pods, err := tCtx.Client().CoreV1().Pods(metav1.NamespaceAll).List(tCtx, metav1.ListOptions{})
+		if err != nil {
+			return err
+		}
+		if len(pods.Items) == 0 {
+			return fmt.Errorf("no pods found")
+		}
+		for i, pod := range pods.Items {
+			val, ok := pod.Labels["signature"]
+			if !ok {
+				return fmt.Errorf("pod %s missing signature label", pod.Name)
+			}
+			expected := fmt.Sprintf("signature-label-%d", i/batchSize)
+			if val != expected {
+				return fmt.Errorf("pod %d: unexpected signature: got %q, want %q", i, val, expected)
+			}
+		}
+		return nil
+	}
+}
+
+// verifyLabelValuesAllowed returns a verification function that checks if the label values for a given key.
+func verifyLabelValuesAllowed(key string, allowValues sets.Set[string]) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		labelValues, _, err := objLabelValues(t, tCtx, op, key)
+		if err != nil {
+			return fmt.Errorf("failed to get label values: %w", err)
+		}
+
+		for labelValue := range labelValues {
+			if !allowValues.Has(labelValue) {
+				return fmt.Errorf("Node has unexpected label value %s for key %s", labelValue, key)
+			}
+		}
+
+		return nil
+	}
+}
+
+// verifyUniqueLabelValues returns a verification function that checks if the label values for a given key are unique.
+func verifyUniqueLabelValues(key string) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		_, duplicatedValues, err := objLabelValues(t, tCtx, op, key)
+		if err != nil {
+			return fmt.Errorf("failed to get label values: %w", err)
+		}
+
+		if duplicatedValues.Len() > 0 {
+			return fmt.Errorf("Node has duplicate label values %v for key %s", duplicatedValues.UnsortedList(), key)
+		}
+
+		return nil
+	}
+}
+
+// objLabelValues is a helper function to extract label values from the listed objects.
+// The listed objects are dependent on the operation type.
+// It returns two sets: one with deduplicated labelValues and second with duplicated labels.
+func objLabelValues(t *testing.T, tCtx ktesting.TContext, op realOp, key string) (sets.Set[string], sets.Set[string], error) {
+	t.Helper()
+
+	labelValues := sets.New[string]()
+	duplicatedValues := sets.New[string]()
+
+	switch op.(type) {
+	case *createNodesOp:
+		nodes, err := tCtx.Client().CoreV1().Nodes().List(tCtx, metav1.ListOptions{})
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list nodes for label verification: %w", err)
+		}
+
+		for _, node := range nodes.Items {
+			if labelValue, exists := node.Labels[key]; exists {
+				if labelValues.Has(labelValue) {
+					duplicatedValues.Insert(labelValue)
+				}
+				labelValues.Insert(labelValue)
+			} else {
+				return nil, nil, fmt.Errorf("Node %s is missing expected label %s", node.Name, key)
+			}
+		}
+	default:
+		return nil, nil, fmt.Errorf("verifyLabel doesn't support this operation type: %T", op)
+	}
+
+	return labelValues, duplicatedValues, nil
+}
+
+// verifyObj checks if listed objects match the expected template object using cmp.Diff.
+func verifyObj(expectedObj any) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		var got, want any
+		var cmpOpts []cmp.Option
+
+		switch opDetails := op.(type) {
+		case *createNodesOp:
+			nodesList, listErr := tCtx.Client().CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+			if listErr != nil {
+				return fmt.Errorf("failed to list nodes: %w", listErr)
+			}
+			gotNodes := nodesList.Items
+
+			expectedNodeTemplate, ok := expectedObj.(*v1.Node)
+			if !ok {
+				return fmt.Errorf("expectedObj must be *v1.Node when op is *createNodesOp, got %T", expectedObj)
+			}
+
+			wantNodes := make([]v1.Node, len(gotNodes))
+			// we don't need to verify len(), we just need to check if all of them are the same as the expected one.
+			for i := range gotNodes {
+				wantNodes[i] = *expectedNodeTemplate
+			}
+
+			cmpOpts = []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpOptsIgnoreObjectMeta,
+				cmpopts.IgnoreFields(v1.NodeStatus{}, // This test isn't interested in these fields.
+					"Conditions",
+					"Phase",
+				),
+			}
+			got = gotNodes
+			want = wantNodes
+		case *createPodsOp:
+			expectedPodTemplate, ok := expectedObj.(*v1.Pod)
+			if !ok {
+				return fmt.Errorf("expectedObj must be *v1.Pod when op is *createPodsOp, got %T", expectedObj)
+			}
+
+			namespace := expectedPodTemplate.Namespace
+			if namespace == "" {
+				return fmt.Errorf("expectedPodTemplate.Namespace must be set")
+			}
+
+			podsList, listErr := tCtx.Client().CoreV1().Pods(namespace).List(tCtx, metav1.ListOptions{})
+			if listErr != nil {
+				return fmt.Errorf("failed to list pods: %w", listErr)
+			}
+			gotPods := podsList.Items
+
+			wantPods := make([]v1.Pod, len(gotPods))
+			for i := range gotPods {
+				wantPods[i] = *expectedPodTemplate
+			}
+
+			cmpOpts = []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpOptsIgnoreObjectMeta,
+				cmpopts.IgnoreFields(v1.PodStatus{}, // This test isn't interested in these fields.
+					"Phase", "Conditions", "Message", "Reason", "NominatedNodeName",
+					"HostIP", "HostIPs", "PodIP", "PodIPs", "StartTime", "QOSClass", "ContainerStatuses",
+				),
+			}
+			got = gotPods
+			want = wantPods
+		case *createPodGroups:
+			switch expected := expectedObj.(type) {
+			case *schedulingv1beta1.PodGroup:
+				namespace := expected.Namespace
+				if namespace == "" {
+					return fmt.Errorf("expectedPodGroupTemplate.Namespace must be set")
+				}
+
+				podGroupsList, listErr := tCtx.Client().SchedulingV1beta1().PodGroups(namespace).List(tCtx, metav1.ListOptions{})
+				if listErr != nil {
+					return fmt.Errorf("failed to list pod groups: %w", listErr)
+				}
+				gotPodGroups := podGroupsList.Items
+
+				wantPodGroups := make([]schedulingv1beta1.PodGroup, len(gotPodGroups))
+				for i := range gotPodGroups {
+					wantPodGroups[i] = *expected
+				}
+
+				cmpOpts = []cmp.Option{
+					cmpopts.EquateEmpty(),
+					cmpOptsIgnoreObjectMeta,
+				}
+				got = gotPodGroups
+				want = wantPodGroups
+			case []*schedulingv1beta1.PodGroup:
+				if len(expected) == 0 {
+					return fmt.Errorf("expectedPodGroups slice must not be empty")
+				}
+				namespace := expected[0].Namespace
+				if namespace == "" {
+					return fmt.Errorf("expectedPodGroups[0].Namespace must be set")
+				}
+
+				podGroupsList, listErr := tCtx.Client().SchedulingV1beta1().PodGroups(namespace).List(tCtx, metav1.ListOptions{})
+				if listErr != nil {
+					return fmt.Errorf("failed to list pod groups: %w", listErr)
+				}
+				gotPodGroups := podGroupsList.Items
+
+				wantPodGroups := make([]schedulingv1beta1.PodGroup, len(expected))
+				for i, pg := range expected {
+					wantPodGroups[i] = *pg
+				}
+
+				cmpOpts = []cmp.Option{
+					cmpopts.EquateEmpty(),
+				}
+				got = gotPodGroups
+				want = wantPodGroups
+			default:
+				return fmt.Errorf("expectedObj must be *schedulingv1beta1.PodGroup or []*schedulingv1beta1.PodGroup when op is *createPodGroups, got %T", expectedObj)
+			}
+		case *createCompositePodGroups:
+			switch expected := expectedObj.(type) {
+			case *schedulingv1beta1.CompositePodGroup:
+				namespace := expected.Namespace
+				if namespace == "" {
+					return fmt.Errorf("expectedCompositePodGroupTemplate.Namespace must be set")
+				}
+
+				compositePodGroupsList, listErr := tCtx.Client().SchedulingV1beta1().CompositePodGroups(namespace).List(tCtx, metav1.ListOptions{})
+				if listErr != nil {
+					return fmt.Errorf("failed to list composite pod groups: %w", listErr)
+				}
+				gotCompositePodGroups := compositePodGroupsList.Items
+
+				wantCompositePodGroups := make([]schedulingv1beta1.CompositePodGroup, len(gotCompositePodGroups))
+				for i := range gotCompositePodGroups {
+					wantCompositePodGroups[i] = *expected
+				}
+
+				cmpOpts = []cmp.Option{
+					cmpopts.EquateEmpty(),
+					cmpOptsIgnoreObjectMeta,
+				}
+				got = gotCompositePodGroups
+				want = wantCompositePodGroups
+			case []*schedulingv1beta1.CompositePodGroup:
+				if len(expected) == 0 {
+					return fmt.Errorf("expectedCompositePodGroups slice must not be empty")
+				}
+				namespace := expected[0].Namespace
+				if namespace == "" {
+					return fmt.Errorf("expectedCompositePodGroups[0].Namespace must be set")
+				}
+
+				compositePodGroupsList, listErr := tCtx.Client().SchedulingV1beta1().CompositePodGroups(namespace).List(tCtx, metav1.ListOptions{})
+				if listErr != nil {
+					return fmt.Errorf("failed to list composite pod groups: %w", listErr)
+				}
+				gotCompositePodGroups := compositePodGroupsList.Items
+
+				wantCompositePodGroups := make([]schedulingv1beta1.CompositePodGroup, len(expected))
+				for i, cpg := range expected {
+					wantCompositePodGroups[i] = *cpg
+				}
+
+				cmpOpts = []cmp.Option{
+					cmpopts.EquateEmpty(),
+				}
+				got = gotCompositePodGroups
+				want = wantCompositePodGroups
+			default:
+				return fmt.Errorf("expectedObj must be *schedulingv1beta1.CompositePodGroup or []*schedulingv1beta1.CompositePodGroup when op is *createCompositePodGroups, got %T", expectedObj)
+			}
+		case *createNamespacesOp:
+			expectedNamespaceTemplate, ok := expectedObj.(*v1.Namespace)
+			if !ok {
+				return fmt.Errorf("expectedObj must be *v1.Namespace when op is *createNamespacesOp, got %T", expectedObj)
+			}
+
+			namespacesList, listErr := tCtx.Client().CoreV1().Namespaces().List(tCtx, metav1.ListOptions{})
+			if listErr != nil {
+				return fmt.Errorf("failed to list namespaces: %w", listErr)
+			}
+			gotNamespaces := namespacesList.Items
+
+			if opDetails.Count < 0 {
+				return fmt.Errorf("opDetails.Count must be non-negative, got %d", opDetails.Count)
+			}
+			wantNamespaces := make([]v1.Namespace, opDetails.Count)
+			for i := range opDetails.Count {
+				wantNamespace := expectedNamespaceTemplate.DeepCopy()
+				wantNamespace.Name = fmt.Sprintf("%s-%d", opDetails.Prefix, i)
+				wantNamespaces[i] = *wantNamespace
+			}
+
+			cmpOpts = []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpopts.IgnoreFields(metav1.ObjectMeta{},
+					"UID", "ResourceVersion", "Generation", "CreationTimestamp", "ManagedFields", "SelfLink",
+				),
+				cmpopts.IgnoreFields(v1.NamespaceStatus{}, "Phase", "Conditions"),
+			}
+			got = gotNamespaces
+			want = wantNamespaces
+		default:
+			return fmt.Errorf("verifyObj doesn't support this operation type for cmp.Diff: %T", opDetails)
+		}
+
+		if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
+			return fmt.Errorf("unexpected difference (-want +got):\\n%s", diff)
+		}
+		return nil
+	}
+}
+
+// createObjTemplateFile creates a temporary file with the given object serialized as JSON.
+func createObjTemplateFile(t *testing.T, obj any) *string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", "scheduler-perf-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir for the template: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("Failed to remove temp dir: %v", err)
+		}
+	})
+
+	templateFile := filepath.Join(dir, "template.json")
+	f, err := os.Create(templateFile)
+	if err != nil {
+		t.Fatalf("Failed to create the template file %s: %v", templateFile, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("Failed to close file: %v", err)
+		}
+	}()
+
+	switch obj := obj.(type) {
+	case *v1.Namespace, *v1.Node, *v1.Pod, *v1.PersistentVolume, *v1.PersistentVolumeClaim, *schedulingv1beta1.PodGroup, *schedulingv1beta1.CompositePodGroup:
+		if err := json.NewEncoder(f).Encode(obj); err != nil {
+			t.Fatalf("Failed to encode the template to %s: %v", templateFile, err)
+		}
+	default:
+		t.Fatalf("Unsupported object type for template file: %T", obj)
+	}
+	return &templateFile
+}
+
+// mockDataCollector always returns the same data items, to be used for mocking data collector in unit tests.
+type mockDataCollector struct {
+	dataItems []DataItem
+}
+
+// init does nothing.
+func (mc *mockDataCollector) init() error {
+	return nil
+}
+
+// run does nothing.
+func (mc *mockDataCollector) run(_ ktesting.TContext) {}
+
+// collect always returns DataItems defined in the collector.
+func (mc *mockDataCollector) collect() []DataItem {
+	return mc.dataItems
+}
+
+func TestMetricThreshold(t *testing.T) {
+	testCases := []struct {
+		name                                  string
+		thresholdValue                        float64
+		dataItems                             []DataItem
+		thresholdMetricSelector               *thresholdMetricSelector
+		expectCollectionFailure               bool
+		expectedDataItemsWithThresholdIndices []int
+		expectedThresholdName                 string
+	}{
+		{
+			name:           "value is above threshold, no error",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 150,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Average",
+			},
+			expectedDataItemsWithThresholdIndices: []int{0},
+			expectedThresholdName:                 "AverageThreshold",
+		},
+		{
+			name:           "value is below threshold, expect error",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 70,
+						"Max":     90,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Max",
+			},
+			expectCollectionFailure:               true,
+			expectedDataItemsWithThresholdIndices: []int{0},
+			expectedThresholdName:                 "MaxThreshold",
+		},
+		{
+			name:           "no error if the labels do not match",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 70,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Average",
+				Labels: map[string]string{
+					"label": "value2",
+				},
+			},
+			expectedDataItemsWithThresholdIndices: []int{},
+			expectedThresholdName:                 "AverageThreshold",
+		},
+		{
+			name:           "out of multiple data items only matching are selected",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 70,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value",
+					},
+				},
+				{
+					Data: map[string]float64{
+						"Average": 150,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value2",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Average",
+				Labels: map[string]string{
+					"label": "value2",
+				},
+			},
+			expectedDataItemsWithThresholdIndices: []int{1},
+			expectedThresholdName:                 "AverageThreshold",
+		},
+		{
+			name:           "threshold value is added for all matching entries",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 130,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value",
+					},
+				},
+				{
+					Data: map[string]float64{
+						"Average": 150,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value2",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Average",
+			},
+			expectedDataItemsWithThresholdIndices: []int{0, 1},
+			expectedThresholdName:                 "AverageThreshold",
+		},
+		{
+			name:           "threshold value is added for all matching entries even with error",
+			thresholdValue: 100,
+			dataItems: []DataItem{
+				{
+					Data: map[string]float64{
+						"Average": 70,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value",
+					},
+				},
+				{
+					Data: map[string]float64{
+						"Average": 80,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value2",
+					},
+				},
+				{
+					Data: map[string]float64{
+						"Average": 130,
+					},
+					Labels: map[string]string{
+						"Metric": "throughput",
+						"label":  "value3",
+					},
+				},
+			},
+			thresholdMetricSelector: &thresholdMetricSelector{
+				Name:       "throughput",
+				DataBucket: "Average",
+			},
+			expectCollectionFailure:               true,
+			expectedDataItemsWithThresholdIndices: []int{0, 1, 2},
+			expectedThresholdName:                 "AverageThreshold",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			var capturedErr error
+			capturingCtx, finalize := tCtx.WithError(&capturedErr)
+			defer finalize()
+
+			originalGetTestDataCollectors := getTestDataCollectors
+			defer func() { getTestDataCollectors = originalGetTestDataCollectors }()
+			getTestDataCollectors = func(_ coreinformers.PodInformer, _ string, _ []string, _ map[string]string, _ *metricsCollectorConfig, _ float64) []testDataCollector {
+				return []testDataCollector{&mockDataCollector{dataItems: tc.dataItems}}
+			}
+
+			workload := &Workload{
+				Name: "some/workload",
+				Threshold: thresholds{
+					valuesByTopic: map[string]float64{"example": tc.thresholdValue},
+				},
+				ThresholdMetricSelector: tc.thresholdMetricSelector,
+			}
+			exec := &WorkloadExecutor{
+				topicName:                    "example",
+				testCase:                     &testCase{},
+				numPodsScheduledPerNamespace: make(map[string]int),
+				workload:                     workload,
+			}
+
+			start := &startCollectingMetricsOp{
+				Opcode:     startCollectingMetricsOpcode,
+				Name:       "test-collection",
+				Namespaces: []string{"test-namespaces"},
+			}
+			err := exec.runOp(capturingCtx, start, 0)
+			if err != nil {
+				t.Fatalf("Failed to start metric collection")
+			}
+			stop := &stopCollectingMetricsOp{Opcode: stopCollectingMetricsOpcode}
+			err = exec.runOp(capturingCtx, stop, 0)
+			if err != nil {
+				t.Fatalf("Failed to stop metric collection")
+			}
+
+			if tc.expectCollectionFailure != capturingCtx.Failed() {
+				t.Fatalf("expectCollectionFailure=%v but got %v", tc.expectCollectionFailure, capturingCtx.Failed())
+			}
+			for _, idx := range tc.expectedDataItemsWithThresholdIndices {
+				if idx >= len(exec.dataItems) {
+					t.Fatalf("expectedDataItemsWithThresholdIndex out of data items range")
+				}
+				if _, ok := exec.dataItems[idx].Data[tc.expectedThresholdName]; !ok {
+					t.Fatalf("expected data item at index=%d to have %s field", idx, tc.expectedThresholdName)
+				}
+			}
+		})
+	}
+}
+
+// cmpOptsIgnoreObjectMeta ignores metadata fields that are not relevant for object equality in these tests.
+var cmpOptsIgnoreObjectMeta = cmpopts.IgnoreFields(metav1.ObjectMeta{},
+	"UID", "ResourceVersion", "Generation", "CreationTimestamp", "ManagedFields", "SelfLink", "Name",
+	"Labels", // verifyObj doesn't care about labels.
+)
+
+func newPodTemplateFile(t *testing.T, namespace string) *string {
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-{{.Index}}",
+			Namespace: namespace,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:  "pause",
+					Image: "registry.k8s.io/pause:latest",
+				},
+			},
+		},
+	}
+	return createObjTemplateFile(t, pod)
+}
+
+func newPodGroupTemplateFile(t *testing.T, namespace string) *string {
+	pg := st.MakePodGroup().Name("gang-{{.Index}}").Namespace(namespace).MinCount(3).Obj()
+	return createObjTemplateFile(t, pg)
+}
+
+func newCompositePodGroupTemplateFile(t *testing.T, namespace string) *string {
+	t.Helper()
+	dir := t.TempDir()
+	templateFile := filepath.Join(dir, "composite-podgroup.yaml")
+	content := fmt.Sprintf(`metadata:
+  name: cpg-l{{.Level}}-{{.Index}}
+  namespace: %s
+spec:
+  {{- if gt .Level 1 }}
+  parentCompositePodGroupName: cpg-l{{.ParentLevel}}-{{.ParentIndex}}
+  {{- end }}
+  schedulingPolicy:
+    gang:
+      minGroupCount: {{.ChildrenCount}}
+`, namespace)
+	if err := os.WriteFile(templateFile, []byte(content), 0600); err != nil {
+		t.Fatalf("Failed to write composite podgroup template: %v", err)
+	}
+	return &templateFile
+}
+
+func newPersistentVolumeTemplateFile(t *testing.T) *string {
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv",
+		},
+		Spec: v1.PersistentVolumeSpec{
+			Capacity: v1.ResourceList{
+				v1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: "/tmp"},
+			},
+		},
+	}
+	return createObjTemplateFile(t, pv)
+}
+
+func newPersistentVolumeClaimTemplateFile(t *testing.T, namespace string) *string {
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc",
+			Namespace: namespace,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			Resources: v1.VolumeResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+	return createObjTemplateFile(t, pvc)
+}
+
+// verifyNamespaceCreated returns a verification function that checks if a namespace was created.
+func verifyNamespaceCreated(expectedNamespace string) verifyFunc {
+	return func(t *testing.T, tCtx ktesting.TContext, op realOp, opIndex int) error {
+		_, err := tCtx.Client().CoreV1().Namespaces().Get(tCtx, expectedNamespace, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("namespace %s was not created: %w", expectedNamespace, err)
+		}
+		return nil
+	}
+}
+
+func TestProfileCollection(t *testing.T) {
+	t.Run("successful collection", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		tempDir := t.TempDir()
+		profilePath := filepath.Join(tempDir, "cpu-profile.out")
+
+		exec := &WorkloadExecutor{}
+		startOp := &startCollectingProfileOp{
+			Opcode:   startCollectingProfileOpcode,
+			Type:     "CPU",
+			FilePath: profilePath,
+		}
+
+		if err := exec.runOp(tCtx, startOp, 0); err != nil {
+			t.Fatalf("Failed to start CPU profile collection: %v", err)
+		}
+		if exec.cpuProfileFile == nil {
+			t.Fatalf("Expected cpuProfileFile to be set, got nil")
+		}
+
+		stopOp := &stopCollectingProfileOp{
+			Opcode: stopCollectingProfileOpcode,
+			Type:   "CPU",
+		}
+		if err := exec.runOp(tCtx, stopOp, 0); err != nil {
+			t.Fatalf("Failed to stop CPU profile collection: %v", err)
+		}
+		if exec.cpuProfileFile != nil {
+			t.Fatalf("Expected cpuProfileFile to be nil after stop, got %v", exec.cpuProfileFile)
+		}
+		if _, err := os.Stat(profilePath); err != nil {
+			t.Fatalf("Expected profile file %q to exist, got error: %v", profilePath, err)
+		}
+	})
+
+	t.Run("start while already ongoing", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		tempDir := t.TempDir()
+		profilePath := filepath.Join(tempDir, "cpu-profile.out")
+
+		exec := &WorkloadExecutor{}
+		startOp := &startCollectingProfileOp{
+			Opcode:   startCollectingProfileOpcode,
+			Type:     "CPU",
+			FilePath: profilePath,
+		}
+
+		if err := exec.runOp(tCtx, startOp, 0); err != nil {
+			t.Fatalf("Failed to start CPU profile collection: %v", err)
+		}
+		if err := exec.runOp(tCtx, startOp, 0); err == nil {
+			t.Fatalf("Expected error starting profile collection while already ongoing, got nil")
+		}
+
+		if err := exec.runOp(tCtx, &stopCollectingProfileOp{
+			Opcode: stopCollectingProfileOpcode,
+			Type:   "CPU",
+		}, 0); err != nil {
+			t.Fatalf("Failed to stop CPU profile collection: %v", err)
+		}
+	})
+
+	t.Run("stop without starting", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		exec := &WorkloadExecutor{}
+		stopOp := &stopCollectingProfileOp{
+			Opcode: stopCollectingProfileOpcode,
+			Type:   "CPU",
+		}
+
+		if err := exec.runOp(tCtx, stopOp, 0); err == nil {
+			t.Fatalf("Expected error stopping profile collection without starting, got nil")
+		}
+	})
+
+	t.Run("invalid profile for start", func(t *testing.T) {
+		startOp := &startCollectingProfileOp{
+			Opcode:   startCollectingProfileOpcode,
+			Type:     "MEMORY",
+			FilePath: "some-path.out",
+		}
+		if err := startOp.isValid(true); err == nil {
+			t.Fatalf("Expected error for invalid profile type, got nil")
+		}
+	})
+
+	t.Run("invalid profile for stop", func(t *testing.T) {
+		stopOp := &stopCollectingProfileOp{
+			Opcode: stopCollectingProfileOpcode,
+			Type:   "MEMORY",
+		}
+		if err := stopOp.isValid(true); err == nil {
+			t.Fatalf("Expected error for invalid profile type, got nil")
+		}
+	})
+
+	t.Run("successful collection with dataItemsDir", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		tempDir := t.TempDir()
+		oldDataItemsDir := dataItemsDir
+		dataItemsDir = ptr.To(tempDir)
+		defer func() { dataItemsDir = oldDataItemsDir }()
+
+		profileName := "cpu-profile.out"
+		expectedPath := filepath.Join(tempDir, profileName)
+
+		exec := &WorkloadExecutor{}
+		startOp := &startCollectingProfileOp{
+			Opcode:   startCollectingProfileOpcode,
+			Type:     "CPU",
+			FilePath: profileName,
+		}
+
+		if err := exec.runOp(tCtx, startOp, 0); err != nil {
+			t.Fatalf("Failed to start CPU profile collection: %v", err)
+		}
+		if exec.cpuProfileFile == nil {
+			t.Fatalf("Expected cpuProfileFile to be set, got nil")
+		}
+
+		stopOp := &stopCollectingProfileOp{
+			Opcode: stopCollectingProfileOpcode,
+			Type:   "CPU",
+		}
+		if err := exec.runOp(tCtx, stopOp, 0); err != nil {
+			t.Fatalf("Failed to stop CPU profile collection: %v", err)
+		}
+		if exec.cpuProfileFile != nil {
+			t.Fatalf("Expected cpuProfileFile to be nil after stop, got %v", exec.cpuProfileFile)
+		}
+		if _, err := os.Stat(expectedPath); err != nil {
+			t.Fatalf("Expected profile file %q to exist, got error: %v", expectedPath, err)
+		}
+	})
+}

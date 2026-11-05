@@ -18,29 +18,34 @@ package git_repo
 
 import (
 	"fmt"
-	"io/ioutil"
+
 	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
-	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	"k8s.io/kubernetes/pkg/volume/emptydir"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
 )
 
 func newTestHost(t *testing.T) (string, volume.VolumeHost) {
-	tempDir, err := ioutil.TempDir("/tmp", "git_repo_test.")
+	tempDir, err := os.MkdirTemp("", "git_repo_test.")
 	if err != nil {
 		t.Fatalf("can't make a temp rootdir: %v", err)
 	}
-	return tempDir, volumetest.NewFakeVolumeHost(tempDir, nil, empty_dir.ProbeVolumePlugins())
+	return tempDir, volumetest.NewFakeVolumeHost(t, tempDir, nil, emptydir.ProbeVolumePlugins())
 }
 
 func TestCanSupport(t *testing.T) {
@@ -51,7 +56,7 @@ func TestCanSupport(t *testing.T) {
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/git-repo")
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plug.GetPluginName() != "kubernetes.io/git-repo" {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())
@@ -69,23 +74,26 @@ type expectedCommand struct {
 	dir string
 }
 
+type scenario struct {
+	name                  string
+	vol                   *v1.Volume
+	expecteds             []expectedCommand
+	isExpectedFailure     bool
+	gitRepoPluginDisabled bool
+}
+
 func TestPlugin(t *testing.T) {
-	gitUrl := "https://github.com/kubernetes/kubernetes.git"
+	gitURL := "https://github.com/kubernetes/kubernetes.git"
 	revision := "2a30ce65c5ab586b98916d83385c5983edd353a1"
 
-	scenarios := []struct {
-		name              string
-		vol               *v1.Volume
-		expecteds         []expectedCommand
-		isExpectedFailure bool
-	}{
+	scenarios := []scenario{
 		{
 			name: "target-dir",
 			vol: &v1.Volume{
 				Name: "vol1",
 				VolumeSource: v1.VolumeSource{
 					GitRepo: &v1.GitRepoVolumeSource{
-						Repository: gitUrl,
+						Repository: gitURL,
 						Revision:   revision,
 						Directory:  "target_dir",
 					},
@@ -93,7 +101,7 @@ func TestPlugin(t *testing.T) {
 			},
 			expecteds: []expectedCommand{
 				{
-					cmd: []string{"git", "clone", gitUrl, "target_dir"},
+					cmd: []string{"git", "clone", "--", gitURL, "target_dir"},
 					dir: "",
 				},
 				{
@@ -105,7 +113,21 @@ func TestPlugin(t *testing.T) {
 					dir: "/target_dir",
 				},
 			},
-			isExpectedFailure: false,
+		},
+		{
+			name:                  "target-dir",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   revision,
+						Directory:  "target_dir",
+					},
+				},
+			},
+			isExpectedFailure: true,
 		},
 		{
 			name: "target-dir-no-revision",
@@ -113,18 +135,31 @@ func TestPlugin(t *testing.T) {
 				Name: "vol1",
 				VolumeSource: v1.VolumeSource{
 					GitRepo: &v1.GitRepoVolumeSource{
-						Repository: gitUrl,
+						Repository: gitURL,
 						Directory:  "target_dir",
 					},
 				},
 			},
 			expecteds: []expectedCommand{
 				{
-					cmd: []string{"git", "clone", gitUrl, "target_dir"},
+					cmd: []string{"git", "clone", "--", gitURL, "target_dir"},
 					dir: "",
 				},
 			},
-			isExpectedFailure: false,
+		},
+		{
+			name:                  "target-dir-no-revision",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Directory:  "target_dir",
+					},
+				},
+			},
+			isExpectedFailure: true,
 		},
 		{
 			name: "only-git-clone",
@@ -132,17 +167,29 @@ func TestPlugin(t *testing.T) {
 				Name: "vol1",
 				VolumeSource: v1.VolumeSource{
 					GitRepo: &v1.GitRepoVolumeSource{
-						Repository: gitUrl,
+						Repository: gitURL,
 					},
 				},
 			},
 			expecteds: []expectedCommand{
 				{
-					cmd: []string{"git", "clone", gitUrl},
+					cmd: []string{"git", "clone", "--", gitURL},
 					dir: "",
 				},
 			},
-			isExpectedFailure: false,
+		},
+		{
+			name:                  "only-git-clone",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+					},
+				},
+			},
+			isExpectedFailure: true,
 		},
 		{
 			name: "no-target-dir",
@@ -150,7 +197,7 @@ func TestPlugin(t *testing.T) {
 				Name: "vol1",
 				VolumeSource: v1.VolumeSource{
 					GitRepo: &v1.GitRepoVolumeSource{
-						Repository: gitUrl,
+						Repository: gitURL,
 						Revision:   revision,
 						Directory:  "",
 					},
@@ -158,7 +205,7 @@ func TestPlugin(t *testing.T) {
 			},
 			expecteds: []expectedCommand{
 				{
-					cmd: []string{"git", "clone", gitUrl},
+					cmd: []string{"git", "clone", "--", gitURL},
 					dir: "",
 				},
 				{
@@ -170,7 +217,21 @@ func TestPlugin(t *testing.T) {
 					dir: "/kubernetes",
 				},
 			},
-			isExpectedFailure: false,
+		},
+		{
+			name:                  "no-target-dir",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   revision,
+						Directory:  "",
+					},
+				},
+			},
+			isExpectedFailure: true,
 		},
 		{
 			name: "current-dir",
@@ -178,7 +239,7 @@ func TestPlugin(t *testing.T) {
 				Name: "vol1",
 				VolumeSource: v1.VolumeSource{
 					GitRepo: &v1.GitRepoVolumeSource{
-						Repository: gitUrl,
+						Repository: gitURL,
 						Revision:   revision,
 						Directory:  ".",
 					},
@@ -186,7 +247,7 @@ func TestPlugin(t *testing.T) {
 			},
 			expecteds: []expectedCommand{
 				{
-					cmd: []string{"git", "clone", gitUrl, "."},
+					cmd: []string{"git", "clone", "--", gitURL, "."},
 					dir: "",
 				},
 				{
@@ -198,28 +259,196 @@ func TestPlugin(t *testing.T) {
 					dir: "",
 				},
 			},
-			isExpectedFailure: false,
+		},
+		{
+			name:                  "current-dir",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   revision,
+						Directory:  ".",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name: "current-dir-mess",
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   revision,
+						Directory:  "./.",
+					},
+				},
+			},
+			expecteds: []expectedCommand{
+				{
+					cmd: []string{"git", "clone", "--", gitURL, "./."},
+					dir: "",
+				},
+				{
+					cmd: []string{"git", "checkout", revision},
+					dir: "",
+				},
+				{
+					cmd: []string{"git", "reset", "--hard"},
+					dir: "",
+				},
+			},
+		},
+		{
+			name:                  "current-dir-mess",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   revision,
+						Directory:  "./.",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name: "invalid-repository",
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: "--foo",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name:                  "invalid-repository",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: "--foo",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name: "invalid-revision",
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   "--bar",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name:                  "invalid-revision",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   "--bar",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name: "invalid-directory",
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Directory:  "-b",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name:                  "invalid-directory",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Directory:  "-b",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name: "invalid-revision-directory-combo",
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   "main",
+						Directory:  "foo/bar",
+					},
+				},
+			},
+			isExpectedFailure: true,
+		},
+		{
+			name:                  "invalid-revision-directory-combo",
+			gitRepoPluginDisabled: true,
+			vol: &v1.Volume{
+				Name: "vol1",
+				VolumeSource: v1.VolumeSource{
+					GitRepo: &v1.GitRepoVolumeSource{
+						Repository: gitURL,
+						Revision:   "main",
+						Directory:  "foo/bar",
+					},
+				},
+			},
+			isExpectedFailure: true,
 		},
 	}
 
-	for _, scenario := range scenarios {
-		allErrs := doTestPlugin(scenario, t)
-		if len(allErrs) == 0 && scenario.isExpectedFailure {
-			t.Errorf("Unexpected success for scenario: %s", scenario.name)
-		}
-		if len(allErrs) > 0 && !scenario.isExpectedFailure {
-			t.Errorf("Unexpected failure for scenario: %s - %+v", scenario.name, allErrs)
-		}
+	for _, sc := range scenarios {
+		t.Run(fmt.Sprintf("%s/gitRepoPluginDisabled:%v", sc.name, sc.gitRepoPluginDisabled), func(t *testing.T) {
+
+			if !sc.gitRepoPluginDisabled {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
+			}
+
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.GitRepoVolumeDriver, !sc.gitRepoPluginDisabled)
+			allErrs := doTestPlugin(t, sc)
+			if len(allErrs) == 0 && sc.isExpectedFailure {
+				t.Errorf("Unexpected success for scenario: %s", sc.name)
+			}
+			if len(allErrs) > 0 && !sc.isExpectedFailure {
+				t.Errorf("Unexpected failure for scenario: %s - %+v", sc.name, allErrs)
+			}
+		})
+
 	}
 
 }
 
-func doTestPlugin(scenario struct {
-	name              string
-	vol               *v1.Volume
-	expecteds         []expectedCommand
-	isExpectedFailure bool
-}, t *testing.T) []error {
+func doTestPlugin(t *testing.T, sc scenario) []error {
 	allErrs := []error{}
 
 	plugMgr := volume.VolumePluginMgr{}
@@ -230,33 +459,33 @@ func doTestPlugin(scenario struct {
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/git-repo")
 	if err != nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Can't find the plugin by name"))
+			fmt.Errorf("can't find the plugin by name"))
 		return allErrs
 	}
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID("poduid")}}
-	mounter, err := plug.NewMounter(volume.NewSpecFromVolume(scenario.vol), pod, volume.VolumeOptions{})
+	mounter, err := plug.NewMounter(volume.NewSpecFromVolume(sc.vol), pod)
 
 	if err != nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Failed to make a new Mounter: %v", err))
+			fmt.Errorf("failed to make a new Mounter: %w", err))
 		return allErrs
 	}
 	if mounter == nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Got a nil Mounter"))
+			fmt.Errorf("got a nil Mounter"))
 		return allErrs
 	}
 
 	path := mounter.GetPath()
-	suffix := fmt.Sprintf("pods/poduid/volumes/kubernetes.io~git-repo/%v", scenario.vol.Name)
+	suffix := filepath.Join("pods/poduid/volumes/kubernetes.io~git-repo", sc.vol.Name)
 	if !strings.HasSuffix(path, suffix) {
 		allErrs = append(allErrs,
-			fmt.Errorf("Got unexpected path: %s", path))
+			fmt.Errorf("got unexpected path: %s", path))
 		return allErrs
 	}
 
 	// Test setUp()
-	setUpErrs := doTestSetUp(scenario, mounter)
+	setUpErrs := doTestSetUp(sc, mounter)
 	allErrs = append(allErrs, setUpErrs...)
 
 	if _, err := os.Stat(path); err != nil {
@@ -264,15 +493,15 @@ func doTestPlugin(scenario struct {
 			allErrs = append(allErrs,
 				fmt.Errorf("SetUp() failed, volume path not created: %s", path))
 			return allErrs
-		} else {
-			allErrs = append(allErrs,
-				fmt.Errorf("SetUp() failed: %v", err))
-			return allErrs
 		}
+		allErrs = append(allErrs,
+			fmt.Errorf("SetUp() failed: %v", err))
+		return allErrs
+
 	}
 
 	// gitRepo volume should create its own empty wrapper path
-	podWrapperMetadataDir := fmt.Sprintf("%v/pods/poduid/plugins/kubernetes.io~empty-dir/wrapped_%v", rootDir, scenario.vol.Name)
+	podWrapperMetadataDir := fmt.Sprintf("%v/pods/poduid/plugins/kubernetes.io~empty-dir/wrapped_%v", rootDir, sc.vol.Name)
 
 	if _, err := os.Stat(podWrapperMetadataDir); err != nil {
 		if os.IsNotExist(err) {
@@ -287,18 +516,18 @@ func doTestPlugin(scenario struct {
 	unmounter, err := plug.NewUnmounter("vol1", types.UID("poduid"))
 	if err != nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Failed to make a new Unmounter: %v", err))
+			fmt.Errorf("failed to make a new Unmounter: %w", err))
 		return allErrs
 	}
 	if unmounter == nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Got a nil Unmounter"))
+			fmt.Errorf("got a nil Unmounter"))
 		return allErrs
 	}
 
 	if err := unmounter.TearDown(); err != nil {
 		allErrs = append(allErrs,
-			fmt.Errorf("Expected success, got: %v", err))
+			fmt.Errorf("expected success, got: %w", err))
 		return allErrs
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -306,34 +535,38 @@ func doTestPlugin(scenario struct {
 			fmt.Errorf("TearDown() failed, volume path still exists: %s", path))
 	} else if !os.IsNotExist(err) {
 		allErrs = append(allErrs,
-			fmt.Errorf("TearDown() failed: %v", err))
+			fmt.Errorf("TearDown() failed: %w", err))
 	}
 	return allErrs
 }
 
-func doTestSetUp(scenario struct {
-	name              string
-	vol               *v1.Volume
-	expecteds         []expectedCommand
-	isExpectedFailure bool
-}, mounter volume.Mounter) []error {
-	expecteds := scenario.expecteds
+func doTestSetUp(sc scenario, mounter volume.Mounter) []error {
+	expecteds := sc.expecteds
 	allErrs := []error{}
 
 	// Construct combined outputs from expected commands
-	var fakeOutputs []fakeexec.FakeCombinedOutputAction
+	var fakeOutputs []fakeexec.FakeAction
 	var fcmd fakeexec.FakeCmd
 	for _, expected := range expecteds {
 		if expected.cmd[1] == "clone" {
-			fakeOutputs = append(fakeOutputs, func() ([]byte, error) {
+			// Calculate the subdirectory clone would create (if any)
+			// git clone -- https://github.com/kubernetes/kubernetes.git target_dir --> target_dir
+			// git clone -- https://github.com/kubernetes/kubernetes.git            --> kubernetes
+			// git clone -- https://github.com/kubernetes/kubernetes.git .          --> .
+			// git clone -- https://github.com/kubernetes/kubernetes.git ./.        --> .
+			cloneSubdir := path.Base(expected.cmd[len(expected.cmd)-1])
+			if cloneSubdir == "kubernetes.git" {
+				cloneSubdir = "kubernetes"
+			}
+			fakeOutputs = append(fakeOutputs, func() ([]byte, []byte, error) {
 				// git clone, it creates new dir/files
-				os.MkdirAll(path.Join(fcmd.Dirs[0], expected.dir), 0750)
-				return []byte{}, nil
+				os.MkdirAll(filepath.Join(fcmd.Dirs[0], expected.dir, cloneSubdir), 0750)
+				return []byte{}, nil, nil
 			})
 		} else {
 			// git checkout || git reset, they create nothing
-			fakeOutputs = append(fakeOutputs, func() ([]byte, error) {
-				return []byte{}, nil
+			fakeOutputs = append(fakeOutputs, func() ([]byte, []byte, error) {
+				return []byte{}, nil, nil
 			})
 		}
 	}
@@ -349,14 +582,17 @@ func doTestSetUp(scenario struct {
 		})
 
 	}
-	fake := fakeexec.FakeExec{
+	fake := &fakeexec.FakeExec{
 		CommandScript: fakeAction,
 	}
 
 	g := mounter.(*gitRepoVolumeMounter)
-	g.exec = &fake
+	g.exec = fake
 
-	g.SetUp(nil)
+	err := g.SetUp(volume.MounterArgs{})
+	if err != nil {
+		allErrs = append(allErrs, err)
+	}
 
 	if fake.CommandCalls != len(expecteds) {
 		allErrs = append(allErrs,
@@ -373,7 +609,7 @@ func doTestSetUp(scenario struct {
 
 	var expectedPaths []string
 	for _, expected := range expecteds {
-		expectedPaths = append(expectedPaths, g.GetPath()+expected.dir)
+		expectedPaths = append(expectedPaths, filepath.Join(g.GetPath(), expected.dir))
 	}
 	if len(fcmd.Dirs) != len(expectedPaths) || !reflect.DeepEqual(expectedPaths, fcmd.Dirs) {
 		allErrs = append(allErrs,

@@ -19,109 +19,173 @@ limitations under the License.
 package framework
 
 import (
-	"io/ioutil"
-	"net/http/httptest"
-	"strings"
+	"context"
+	"fmt"
+	"os"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/kubectl"
+	"k8s.io/klog/v2"
+	nodectlr "k8s.io/kubernetes/pkg/controller/nodelifecycle"
+	testutils "k8s.io/kubernetes/test/utils"
 )
 
-const (
-	// When these values are updated, also update cmd/kubelet/app/options/container_runtime.go
-	// A copy of these values exist in test/utils/image/manifest.go
-	currentPodInfraContainerImageName    = "gcr.io/google_containers/pause"
-	currentPodInfraContainerImageVersion = "3.1"
-)
-
-// GetServerArchitecture fetches the architecture of the cluster's apiserver.
-func GetServerArchitecture(c clientset.Interface) string {
-	arch := ""
-	sVer, err := c.Discovery().ServerVersion()
-	if err != nil || sVer.Platform == "" {
-		// If we failed to get the server version for some reason, default to amd64.
-		arch = "amd64"
-	} else {
-		// Split the platform string into OS and Arch separately.
-		// The platform string may for example be "linux/amd64", "linux/arm" or "windows/amd64".
-		osArchArray := strings.Split(sVer.Platform, "/")
-		arch = osArchArray[1]
-	}
-	return arch
-}
-
-// GetPauseImageName fetches the pause image name for the same architecture as the apiserver.
-func GetPauseImageName(c clientset.Interface) string {
-	return currentPodInfraContainerImageName + "-" + GetServerArchitecture(c) + ":" + currentPodInfraContainerImageVersion
-}
-
-func CreateTestingNamespace(baseName string, apiserver *httptest.Server, t *testing.T) *v1.Namespace {
-	// TODO: Create a namespace with a given basename.
-	// Currently we neither create the namespace nor delete all of its contents at the end.
-	// But as long as tests are not using the same namespaces, this should work fine.
-	return &v1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			// TODO: Once we start creating namespaces, switch to GenerateName.
-			Name: baseName,
-		},
-	}
-}
-
-func DeleteTestingNamespace(ns *v1.Namespace, apiserver *httptest.Server, t *testing.T) {
-	// TODO: Remove all resources from a given namespace once we implement CreateTestingNamespace.
-}
-
-// RCFromManifest reads a .json file and returns the rc in it.
-func RCFromManifest(fileName string) *v1.ReplicationController {
-	data, err := ioutil.ReadFile(fileName)
+// CreateNamespaceOrDie creates a namespace.
+func CreateNamespaceOrDie(c clientset.Interface, baseName string, t testutils.TB) *v1.Namespace {
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: baseName}}
+	result, err := c.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
 	if err != nil {
-		glog.Fatalf("Unexpected error reading rc manifest %v", err)
+		t.Fatalf("Failed to create namespace: %v", err)
 	}
-	var controller v1.ReplicationController
-	if err := runtime.DecodeInto(testapi.Default.Codec(), data, &controller); err != nil {
-		glog.Fatalf("Unexpected error reading rc manifest %v", err)
-	}
-	return &controller
+	return result
 }
 
-// StopRC stops the rc via kubectl's stop library
-func StopRC(rc *v1.ReplicationController, clientset internalclientset.Interface) error {
-	reaper, err := kubectl.ReaperFor(api.Kind("ReplicationController"), clientset)
-	if err != nil || reaper == nil {
-		return err
-	}
-	err = reaper.Stop(rc.Namespace, rc.Name, 0, nil)
+// DeleteNamespaceOrDie deletes a namespace.
+func DeleteNamespaceOrDie(c clientset.Interface, ns *v1.Namespace, t testutils.TB) {
+	err := c.CoreV1().Namespaces().Delete(context.TODO(), ns.Name, metav1.DeleteOptions{})
 	if err != nil {
-		return err
+		t.Fatalf("Failed to delete namespace: %v", err)
 	}
-	return nil
 }
 
-// ScaleRC scales the given rc to the given replicas.
-func ScaleRC(name, ns string, replicas int32, clientset internalclientset.Interface) (*api.ReplicationController, error) {
-	scaler, err := kubectl.ScalerFor(api.Kind("ReplicationController"), clientset)
-	if err != nil {
-		return nil, err
+// Filter filters nodes in NodeList in place, removing nodes that do not
+// satisfy the given condition
+func Filter(nodeList *v1.NodeList, fn func(node v1.Node) bool) {
+	var l []v1.Node
+
+	for _, node := range nodeList.Items {
+		if fn(node) {
+			l = append(l, node)
+		}
 	}
-	retry := &kubectl.RetryParams{Interval: 50 * time.Millisecond, Timeout: DefaultTimeout}
-	waitForReplicas := &kubectl.RetryParams{Interval: 50 * time.Millisecond, Timeout: DefaultTimeout}
-	err = scaler.Scale(ns, name, uint(replicas), nil, retry, waitForReplicas)
-	if err != nil {
-		return nil, err
+	nodeList.Items = l
+}
+
+// IsNodeSchedulable returns true if:
+// 1) doesn't have "unschedulable" field set
+// 2) it also returns true from IsNodeReady
+func IsNodeSchedulable(node *v1.Node) bool {
+	if node == nil {
+		return false
 	}
-	scaled, err := clientset.Core().ReplicationControllers(ns).Get(name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
+	return !node.Spec.Unschedulable && IsNodeReady(node)
+}
+
+// IsNodeReady returns true if:
+// 1) it's Ready condition is set to true
+// 2) doesn't have NetworkUnavailable condition set to true
+func IsNodeReady(node *v1.Node) bool {
+	nodeReady := IsConditionSetAsExpected(node, v1.NodeReady, true)
+	networkReady := isConditionUnset(node, v1.NodeNetworkUnavailable) ||
+		IsConditionSetAsExpectedSilent(node, v1.NodeNetworkUnavailable, false)
+	return nodeReady && networkReady
+}
+
+// IsConditionSetAsExpected returns a wantTrue value if the node has a match to the conditionType, otherwise returns an opposite value of the wantTrue with detailed logging.
+func IsConditionSetAsExpected(node *v1.Node, conditionType v1.NodeConditionType, wantTrue bool) bool {
+	return isNodeConditionSetAsExpected(node, conditionType, wantTrue, false)
+}
+
+// IsConditionSetAsExpectedSilent returns a wantTrue value if the node has a match to the conditionType, otherwise returns an opposite value of the wantTrue.
+func IsConditionSetAsExpectedSilent(node *v1.Node, conditionType v1.NodeConditionType, wantTrue bool) bool {
+	return isNodeConditionSetAsExpected(node, conditionType, wantTrue, true)
+}
+
+// isConditionUnset returns true if conditions of the given node do not have a match to the given conditionType, otherwise false.
+func isConditionUnset(node *v1.Node, conditionType v1.NodeConditionType) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == conditionType {
+			return false
+		}
 	}
-	return scaled, nil
+	return true
+}
+
+// isNodeConditionSetAsExpected checks a node for a condition, and returns 'true' if the wanted value is the same as the condition value, useful for polling until a condition on a node is met.
+func isNodeConditionSetAsExpected(node *v1.Node, conditionType v1.NodeConditionType, wantTrue, silent bool) bool {
+	// Check the node readiness condition (logging all).
+	for _, cond := range node.Status.Conditions {
+		// Ensure that the condition type and the status matches as desired.
+		if cond.Type == conditionType {
+			// For NodeReady condition we need to check Taints as well
+			if cond.Type == v1.NodeReady {
+				hasNodeControllerTaints := false
+				// For NodeReady we need to check if Taints are gone as well
+				taints := node.Spec.Taints
+				for _, taint := range taints {
+					if taint.MatchTaint(nodectlr.UnreachableTaintTemplate) || taint.MatchTaint(nodectlr.NotReadyTaintTemplate) {
+						hasNodeControllerTaints = true
+						break
+					}
+				}
+				if wantTrue {
+					if (cond.Status == v1.ConditionTrue) && !hasNodeControllerTaints {
+						return true
+					}
+					msg := ""
+					if !hasNodeControllerTaints {
+						msg = fmt.Sprintf("Condition %s of node %s is %v instead of %t. Reason: %v, message: %v",
+							conditionType, node.Name, cond.Status == v1.ConditionTrue, wantTrue, cond.Reason, cond.Message)
+					} else {
+						msg = fmt.Sprintf("Condition %s of node %s is %v, but Node is tainted by NodeController with %v. Failure",
+							conditionType, node.Name, cond.Status == v1.ConditionTrue, taints)
+					}
+					if !silent {
+						klog.Info(msg)
+					}
+					return false
+				}
+				// TODO: check if the Node is tainted once we enable NC notReady/unreachable taints by default
+				if cond.Status != v1.ConditionTrue {
+					return true
+				}
+				if !silent {
+					klog.Infof("Condition %s of node %s is %v instead of %t. Reason: %v, message: %v",
+						conditionType, node.Name, cond.Status == v1.ConditionTrue, wantTrue, cond.Reason, cond.Message)
+				}
+				return false
+			}
+			if (wantTrue && (cond.Status == v1.ConditionTrue)) || (!wantTrue && (cond.Status != v1.ConditionTrue)) {
+				return true
+			}
+			if !silent {
+				klog.Infof("Condition %s of node %s is %v instead of %t. Reason: %v, message: %v",
+					conditionType, node.Name, cond.Status == v1.ConditionTrue, wantTrue, cond.Reason, cond.Message)
+			}
+			return false
+		}
+
+	}
+	if !silent {
+		klog.Infof("Couldn't find condition %v on node %v", conditionType, node.Name)
+	}
+	return false
+}
+
+// FixBenchmarkJSONOutput works around Go not emitting a "pass" action for
+// sub-benchmarks
+// (https://github.com/golang/go/issues/66825#issuecomment-2343229005), which
+// causes gotestsum to report a successful benchmark run as failed
+// (https://github.com/gotestyourself/gotestsum/issues/413#issuecomment-2343206787).
+//
+// It does this by printing the missing "PASS" output line that test2json
+// then converts into the "pass" action.
+func FixBenchmarkJSONOutput(b *testing.B) {
+	if !slices.Contains(os.Args, "-test.v=test2json") {
+		return
+	}
+
+	start := time.Now()
+	b.Cleanup(func() {
+		if b.Failed() {
+			return
+		}
+		// SYN gets injected when using -test.v=test2json, see
+		// https://cs.opensource.google/go/go/+/refs/tags/go1.23.3:src/testing/testing.go;drc=87ec2c959c73e62bfae230ef7efca11ec2a90804;l=527
+		fmt.Fprintf(os.Stderr, "%c--- PASS: %s (%.2fs)\n", 22 /* SYN */, b.Name(), time.Since(start).Seconds())
+	})
 }
